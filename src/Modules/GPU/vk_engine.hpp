@@ -78,16 +78,16 @@ public:
     void endStep();
     void waitStep();
 
-    // ---- step replay: 记录一次、之后每步重提交（命令图形状/标量必须静态）----
-    // 要求：每步的 dispatch 序列与所有 push 常量逐字节相同（变化的标量须走设备缓冲）；
-    // NaN 恢复等中断场景调用 invalidateReplay() 强制重录。
+    // ---- step replay: record once, resubmit every step (command graph shapes/scalars must be static) ----
+    // requirement: the dispatch sequence and all push constants must be byte-identical every step (varying scalars go through device buffers);
+    // call invalidateReplay() to force re-recording after interruptions such as NaN recovery.
     void enableStepReplay(bool on) { replayEnabled_ = on; }
     void invalidateReplay();
     bool replayActive() const { return replayMode_; }
-    uint64_t lastCmdCount() const { return lastCmds_; }  // 最近一次录制图内的命令数
+    uint64_t lastCmdCount() const { return lastCmds_; }  // command count inside the most recently recorded graph
     const std::unordered_map<std::string, uint64_t>& cmdHist() const { return hist_; }
 
-    // GPU 阶段计时（OFC_TIMESTAMPS=1）：步内 mark() 打点，waitStep 后可读
+    // GPU phase timing (OFC_TIMESTAMPS=1): mark() inside the step, readable after waitStep
     void mark(const char* label);
     bool phaseTimes(std::vector<std::pair<std::string, double>>& out) const;
     void profileDump();  // per-kernel GPU ms table (OFC_KERNEL_PROFILE=1)
@@ -95,7 +95,7 @@ public:
     // upload/download helpers (upload: recorded immediately in own submission,
     // use only outside a step; download: own submission + wait)
     void uploadNow(BufRef dst, const void* src, uint64_t bytes);
-    // 批量上传：写入常驻 staging，累积后一次提交（避免每张量一次全同步）
+    // batched upload: accumulate into the persistent staging ring, one submit for all (avoids a full sync per tensor)
     void stageUpload(BufRef dst, const void* src, uint64_t bytes);
     void flushUploads();
     void downloadNow(BufRef src, void* dst, uint64_t bytes);
@@ -149,14 +149,14 @@ private:
     bool pushDesc_ = false;
 
     VkCommandBuffer stepCmd_ = VK_NULL_HANDLE;
-    VkCommandBuffer cachedCmd_ = VK_NULL_HANDLE;  // 重放缓存（记录一次的命令图）
+    VkCommandBuffer cachedCmd_ = VK_NULL_HANDLE;  // replay cache (command graph recorded once)
     bool replayEnabled_ = false;
     bool replayMode_ = false;
     VkFence stepFence_ = VK_NULL_HANDLE;
     bool inStep_ = false;
     uint64_t lastStepMs_ = 0;
     uint64_t recCmds_ = 0, lastCmds_ = 0;
-    std::unordered_map<std::string, uint64_t> hist_;  // per-kernel 录制命令直方图
+    std::unordered_map<std::string, uint64_t> hist_;  // per-kernel recorded-command histogram
     std::string lastKernel_;
     VkQueryPool tsPool_ = VK_NULL_HANDLE;
     float tsPeriod_ = 1.0f;

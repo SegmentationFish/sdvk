@@ -1,5 +1,5 @@
 #version 450
-// 双目标梯度路由：a (op)= s; b (op)= s（mode 1 为累加）
+// dual-destination gradient routing: a (op)= s; b (op)= s (mode 1 accumulates)
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer A { float a[]; };
 layout(binding = 1) buffer B { float b[]; };

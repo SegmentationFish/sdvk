@@ -1,6 +1,6 @@
 #version 450
-// 2D transpose: in[rows,cols] -> out[cols,rows] (f32, row-major). 用于 MoE 稠密路径
-// 的权重列视图（sparse[rows,G] -> wT[G,rows]，每专家一行连续）。
+// 2D transpose: in[rows,cols] -> out[cols,rows] (f32, row-major). Backs the MoE dense path
+// weight column view (sparse[rows,G] -> wT[G,rows], one contiguous row per expert).
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer X { float x[]; };
 layout(binding = 1) writeonly buffer Y { float y[]; };

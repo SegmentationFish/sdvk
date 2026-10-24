@@ -1,4 +1,4 @@
-// GGUF 读取器实现（格式：magic GGUF / version / counts / KV 元数据 / 张量表 / 对齐数据段）
+// GGUF reader (format: magic GGUF / version / counts / KV metadata / tensor table / aligned data section)
 #include "Gguf.hpp"
 #include <cstring>
 #include <cstdio>
@@ -181,7 +181,7 @@ bool GgufFile::readValue(uint32_t type, GgufMeta& m) const {
             m.f = v;
             return true;
         }
-        default: return false;  // ARRAY 由调用方处理
+        default: return false;  // ARRAY is handled by the caller
     }
 }
 
@@ -379,7 +379,7 @@ bool GgufFile::open(const std::string& path, std::string* err) {
         }
         uint64_t be = ggmlTypeBlockElems(t.type), bb = ggmlTypeBlockBytes(t.type);
         uint64_t ne = t.nElems();
-        t.nbytes = (ne / be) * bb + ((ne % be) ? bb : 0);  // GGUF 要求整除，防御性上取整
+        t.nbytes = (ne / be) * bb + ((ne % be) ? bb : 0);  // GGUF guarantees divisibility; round up defensively
         if (byName_.count(t.name)) {
             if (err) *err = "duplicate tensor " + t.name;
             return false;

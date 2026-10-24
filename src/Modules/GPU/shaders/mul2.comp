@@ -1,5 +1,5 @@
 #version 450
-// gMul 等形状反向：ga += go*y; gb += go*x
+// gMul same-shape backward: ga += go*y; gb += go*x
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer GA { float ga[]; };
 layout(binding = 1) buffer GB { float gb[]; };

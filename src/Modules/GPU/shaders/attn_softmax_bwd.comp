@@ -1,5 +1,5 @@
 #version 450
-// 融合 softmax+mask+scale 反向：dsloc / dsmem
+// fused softmax+mask+scale backward: dsloc / dsmem
 // P = softmax(scale*raw)；dRaw = scale * P * (dP - sum(dP*P))
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer P { float p[]; };

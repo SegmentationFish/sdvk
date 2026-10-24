@@ -1,5 +1,5 @@
 #version 450
-// grid = g*d (b2 列和) + g*rows (w 行点积)
+// grid = g*d (b2 column sums) + g*rows (w row dot products)
 //   idx < g*d:    db2[g,j] += sum_r dY[g,r,j]
 //   else:         dw[g,r]  += sum_j dOut[r,j]*Y[g,r,j]
 layout(local_size_x = 256) in;

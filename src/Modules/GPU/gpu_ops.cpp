@@ -290,7 +290,7 @@ GTPtr gViewShape(const GTPtr& x, const Shape& s) {
 
 // ---------------------------------------------------------------- gemm
 
-// batch>1: grid.z 批量，A/B/C 按 sA/sB/sC（元素）跨批步进；sB=0 表示广播
+// batch>1: batched on grid.z, A/B/C stride across batches by sA/sB/sC (elements); sB=0 means broadcast
 static void gemmCall(const char* kind, const BufRef& A, const BufRef& B, const BufRef& C, uint32_t M, uint32_t N,
                      uint32_t S, uint32_t mode, uint32_t batch = 1, uint32_t sA = 0, uint32_t sB = 0, uint32_t sC = 0,
                      uint32_t lda = 0, uint32_t ldb = 0, uint32_t ldc = 0) {
@@ -402,8 +402,8 @@ GTPtr gMatmulT(const GTPtr& a, const GTPtr& b) {
     return reg(out);
 }
 
-// 稠密 GroupFFN 全批量前向/反向：所有专家合并为批量 GEMM，合并/偏置/GELU 各一次派发。
-// w1 {G,d,fg}  w2 {G,fg,d}  b1 {G,fg}  b2 {G,d}  wT {G,rows}（topk 权重）
+// dense GroupFFN fully-batched forward/backward: all experts folded into batched GEMMs; merge/bias/GELU take one dispatch each.
+// w1 {G,d,fg}  w2 {G,fg,d}  b1 {G,fg}  b2 {G,d}  wT {G,rows} (topk weights)
 GTPtr gMoeOut(const GTPtr& flat, const GTPtr& w1, const GTPtr& b1, const GTPtr& w2, const GTPtr& b2,
               const GTPtr& wSparse, size_t nGroups, size_t fg) {
     size_t rows = flat->shape[0];
@@ -411,12 +411,12 @@ GTPtr gMoeOut(const GTPtr& flat, const GTPtr& w1, const GTPtr& b1, const GTPtr& 
     size_t hc = nGroups * fg;
     bool rg = flat->requiresGrad || w1->requiresGrad || b1->requiresGrad || w2->requiresGrad || b2->requiresGrad ||
               wSparse->requiresGrad;
-    auto pre = makeTensor(Shape{rows, hc}, false, false);  // 原始 gemm 输出 → 原地变 pre-activation
-    auto H = makeTensor(Shape{rows, hc}, false, false);    // gelu 输出
+    auto pre = makeTensor(Shape{rows, hc}, false, false);  // raw gemm output, becomes pre-activation in place
+    auto H = makeTensor(Shape{rows, hc}, false, false);    // gelu output
     auto Y = makeTensor(Shape{nGroups * rows, d}, false, false);
     auto out = makeTensor(Shape{rows, d}, rg, false);
 
-    // Hraw[g] = flat @ w1[g]（A 广播），布局 [rows, nGroups*fg]
+    // Hraw[g] = flat @ w1[g] (A broadcast), layout [rows, nGroups*fg]
     gemmCall("gemm_nn", flat->data, w1->data, pre->data, (uint32_t)rows, (uint32_t)fg, (uint32_t)d, 0,
              (uint32_t)nGroups, 0, (uint32_t)(d * fg), (uint32_t)fg, 0, (uint32_t)fg, (uint32_t)hc);
     {
@@ -470,7 +470,7 @@ GTPtr gMoeOut(const GTPtr& flat, const GTPtr& w1, const GTPtr& b1, const GTPtr& 
                 } pc{(uint32_t)rows, (uint32_t)hc};
                 G.eng.dispatch("gelu_bias_bwd", {dPre, prep->data, b1p->grad}, &pc, (uint32_t)hc, 1, 1);
             }
-            // dFlat[g] = dPre[g] @ w1[g]^T，再跨专家求和
+            // dFlat[g] = dPre[g] @ w1[g]^T, then summed across experts
             gemmCall("gemm_nt", dPre, w1p->data, dFlatTmp, (uint32_t)rows, (uint32_t)d, (uint32_t)fg, 0,
                      (uint32_t)nGroups, (uint32_t)fg, (uint32_t)(d * fg), (uint32_t)(rows * d), (uint32_t)hc,
                      (uint32_t)fg, (uint32_t)d);
@@ -909,7 +909,7 @@ GTPtr gCrossEntropy(const GTPtr& logits, const BufRef& tgt, const BufRef& mask, 
     return reg(out);
 }
 
-// 融合 attention 分数后处理：scale + mask + concat(local,mem) + softmax
+// fused attention score post-processing: scale + mask + concat(local,mem) + softmax
 GTPtr gAttnSoftmax(const GTPtr& sloc, const GTPtr& smem, const BufRef& mask, size_t T, size_t M, float scale,
                    bool hasMask) {
     size_t rows = gNumel(sloc->shape) / T;
@@ -1084,7 +1084,7 @@ GTPtr gConcatSeq(const GTPtr& a, const GTPtr& b) {
     os[r - 2] = sa + sb;
     bool rg = a->requiresGrad || b->requiresGrad;
     auto out = makeTensor(os, rg, false);
-    // 单次 3D strided copy 覆盖所有 outer（原按 outer 循环 → 每层数十次派发）
+    // one 3D strided copy covers all outer indices (the per-outer loop used to cost dozens of dispatches per layer)
     if (outer > 1) {
         uint32_t dstSt[4], srcSt[4];
         Shape dimsA{outer, sa, d}, dimsB{outer, sb, d};

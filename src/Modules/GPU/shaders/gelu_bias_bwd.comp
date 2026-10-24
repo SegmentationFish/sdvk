@@ -1,5 +1,5 @@
 #version 450
-// dpre = dy * gelu'(pre); db[c] += sum_r dpre[r,c]。一个 workgroup 处理一列。
+// dpre = dy * gelu'(pre); db[c] += sum_r dpre[r,c]. One workgroup handles a column.
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer DY { float dy[]; };
 layout(binding = 1) readonly buffer PRE { float pre[]; };

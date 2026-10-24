@@ -1,6 +1,6 @@
 #pragma once
-// GGUF 读取器：llama.cpp 生态的模型容器（兼容层的输入格式）
-// 支持：v2/v3 header、全类型元数据 KV、张量表、F32/F16/BF16/Q4_0/Q8_0 反量化
+// GGUF reader: the llama.cpp-ecosystem model container (input format for the compat layer)
+// supports: v2/v3 headers, all metadata KV types, tensor table, F32/F16/BF16/Q4_0/Q8_0 dequantization
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -29,29 +29,29 @@ enum class GgmlType : uint32_t {
 };
 
 const char* ggmlTypeName(GgmlType t);
-uint64_t ggmlTypeBlockElems(GgmlType t);  // 每块元素数（标量=1）
-uint64_t ggmlTypeBlockBytes(GgmlType t);  // 每块字节数（标量=元素大小）
+uint64_t ggmlTypeBlockElems(GgmlType t);  // elements per block (scalars = 1)
+uint64_t ggmlTypeBlockBytes(GgmlType t);  // bytes per block (scalars = element size)
 
 struct GgufTensor {
     std::string name;
-    std::vector<uint64_t> dims;  // 原始顺序：dims[0]=最快变化维（行内长度，ggml ne[0]）
+    std::vector<uint64_t> dims;  // original order: dims[0] = fastest-varying dim (row length, ggml ne[0])
     GgmlType type = GgmlType::F32;
-    uint64_t offset = 0;  // 相对数据段起点
+    uint64_t offset = 0;  // offset relative to the data section start
     uint64_t nbytes = 0;
 
     uint64_t nElems() const;
-    // 逻辑形状（行优先习惯）：(rows, cols) = (dims[1], dims[0])；一维时 rows=1
+    // logical shape (row-major convention): (rows, cols) = (dims[1], dims[0]); rows = 1 for 1-D
     std::pair<uint64_t, uint64_t> shape() const;
 };
 
-// 元数据值（只保留我们需要的聚合形式）
+// metadata value (only the aggregated forms we need)
 struct GgufMeta {
     uint32_t type = 0;  // GGUF_TYPE_*
-    uint64_t u = 0;     // 所有整型标量
+    uint64_t u = 0;     // all integer scalars
     double f = 0;       // FLOAT32/FLOAT64
     bool b = false;     // BOOL
     std::string s;      // STRING
-    // 数组：
+    // arrays:
     uint32_t arrType = 0;
     std::vector<std::string> strs;
     std::vector<uint64_t> u64s;
@@ -90,7 +90,7 @@ public:
     uint64_t dataOffset() const { return dataOffset_; }
     uint64_t fileSize() const { return fileSize_; }
 
-    // 元数据
+    // metadata
     bool has(const std::string& key) const { return meta_.count(key) != 0; }
     const GgufMeta* meta(const std::string& key) const;
     uint64_t getU64(const std::string& key, uint64_t def = 0) const;
@@ -98,16 +98,16 @@ public:
     double getF64(const std::string& key, double def = 0) const;
     float getF32(const std::string& key, float def = 0) const;
     std::string getStr(const std::string& key, const std::string& def = "") const;
-    // 常见张量超参（按 arch 前缀取）
+    // common tensor hyperparameters (fetched by arch prefix)
     uint64_t archU64(const std::string& arch, const std::string& key, uint64_t def = 0) const;
     float archF32(const std::string& arch, const std::string& key, float def = 0) const;
 
-    // 张量数据
+    // tensor data
     bool readRaw(const GgufTensor& t, std::vector<uint8_t>& out) const;
-    // 反量化为 f32（行优先 (rows, cols)，与 shape() 对应）
+    // dequantize to f32 (row-major (rows, cols), matching shape())
     std::vector<float> readFloat(const std::string& name, std::string* err = nullptr) const;
-    // Q8_0 原始导出：int8 载荷 + fp32 scale（每 32 元素一块），保持文件平坦顺序
-    // （PyTorch 行优先 [N,K]，N=out 通道, K=in*ksize），供 GPU shader 内反量化
+    // raw Q8_0 export: int8 payload + fp32 scale (32 elements per block), file-flat order preserved
+    // (PyTorch row-major [N,K], N = out channels, K = in*ksize) for in-shader dequantization
     bool readQ8(const std::string& name, std::vector<int8_t>& q, std::vector<float>& scales,
                 std::string* err = nullptr) const;
 
@@ -125,7 +125,7 @@ private:
 
     bool readExact(void* dst, size_t n) const;
     bool readString(std::string& s) const;
-    bool readValue(uint32_t type, GgufMeta& m) const;  // 标量（非数组）
+    bool readValue(uint32_t type, GgufMeta& m) const;  // scalars (non-array)
     bool readArrayItems(uint32_t etype, uint64_t count, GgufMeta& m) const;
 };
 

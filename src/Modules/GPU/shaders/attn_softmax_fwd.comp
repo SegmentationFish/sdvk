@@ -1,6 +1,6 @@
 #version 450
-// 融合 scale + mask + concat(local,mem) + softmax：一个 workgroup 处理一行。
-// sloc[rows,T], smem[rows,M] (M 可为 0)，out[rows,T+M]
+// fused scale + mask + concat(local,mem) + softmax: one workgroup handles a row.
+// sloc[rows,T], smem[rows,M] (M may be 0), out[rows,T+M]
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer SLOC { float sloc[]; };
 layout(binding = 1) readonly buffer SMEM { float smem[]; };

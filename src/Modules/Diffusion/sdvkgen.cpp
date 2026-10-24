@@ -1357,7 +1357,7 @@ int main(int argc, char** argv) {
     }
 
     // ---------------- phase A: text encoders (param arena reused afterwards)
-    // text encoders 需要 3.3GB；跳过 TE 时仍需给 UNet 的 Q8_0 payload+scales 留出 ~2.9GB
+    // text encoders need 3.3GB; even when TE is skipped, ~2.9GB must remain for the UNet's Q8_0 payload+scales
     G.paramBytes = embCondFile.empty() ? 3300ull << 20 : 3000ull << 20;
     G.allocGradArena = false;
     G.stepBytes = 96ull << 20;

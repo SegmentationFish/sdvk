@@ -28,10 +28,10 @@ struct GContext {
     Arena paramGradArena;  // persistent weight grads
     Arena scratchArena;    // persistent small buffers (positions, masks, partials...)
     std::vector<GTPtr> tape;
-    BufRef hp;                   // 设备侧超参（lr/b1/b2/eps/wd/invBc1/invBc2/b2t）——重放前提
-    bool stepPreZeroed = false;  // true: 训练驱动已整块清零 step arena（跳过逐张量清零）
+    BufRef hp;                   // device-side hyperparameters (lr/b1/b2/eps/wd/invBc1/invBc2/b2t) — required for replay
+    bool stepPreZeroed = false;  // true: the training driver zeroed the whole step arena (skip per-tensor zeroing)
     uint64_t paramBytes = 0;
-    bool allocGradArena = true;  // 纯推理置 false，省下一份 paramBytes 显存
+    bool allocGradArena = true;  // set false for pure inference to save one paramBytes worth of VRAM
     uint64_t stepBytes = 2048ull << 20;
     uint64_t scratchBytes = 256ull << 20;
 };
@@ -42,7 +42,7 @@ void gResizeScratch(uint64_t bytes);
 void gShutdown();
 uint64_t gNumelOf(const Shape& s);
 
-// 设备侧超参缓冲
+// device-side hyperparameter buffer
 extern uint64_t gStepTensorCount;
 BufRef gHpBuf();
 void gUploadHp(const float* hp, int n);  // n ≤ 8
@@ -108,7 +108,7 @@ BufRef gScratchAlloc(uint64_t bytes);
 void gFillZero(const BufRef& b);
 void gUploadNow(const BufRef& dst, const void* src, uint64_t bytes);
 void gDownloadNow(const BufRef& src, void* dst, uint64_t bytes);
-void gDumpCopyTags(const char* outPath);  // copy_nd 来源直方图（诊断用）
+void gDumpCopyTags(const char* outPath);  // copy_nd source histogram (diagnostics)
 
 }  // namespace gpu
 }  // namespace ofc

@@ -468,8 +468,8 @@ void Engine::stageUpload(BufRef dst, const void* src, uint64_t bytes) {
 
 void Engine::uploadNow(BufRef dst, const void* src, uint64_t bytes) {
     if (inStep_) {
-        // 步内上传：写入 host-visible staging（每步重置后同序分配→偏移确定），
-        // 拷贝指令进入命令图（重放时由缓存指令重复执行，host 每步只更新 staging 内容）
+        // in-step upload: written into host-visible staging (deterministic offsets, same allocation order after the per-step reset);
+        // the copy command goes into the command graph (re-executed from cache on replay; the host only refreshes staging contents each step)
         BufRef slot = stagingArena_.alloc(bytes);
         std::memcpy((char*)stagingArena_.mapPtr() + slot.offset, src, (size_t)bytes);
         copyBuf(dst, slot);
@@ -563,7 +563,7 @@ void Engine::beginStep() {
     stagingArena_.reset();
     stepArena_.reset();
     if (replayEnabled_ && cachedCmd_) {
-        replayMode_ = true;  // 命令图已缓存：本步只跑 host 侧（分配 offsets 保持确定性）
+        replayMode_ = true;  // cached command graph: this step only replays host-side (allocations keep deterministic offsets)
         inStep_ = true;
         static bool announced = false;
         if (!announced) {
@@ -645,7 +645,7 @@ void Engine::beginPass() {
     ai.commandBufferCount = 1;
     VK_CHECK(vkAllocateCommandBuffers(dev_, &ai, &stepCmd_));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    // 重放模式会多次提交同一 buffer —— ONE_TIME_SUBMIT 只允许提交一次，必须去掉
+    // replay resubmits the same buffer; ONE_TIME_SUBMIT allows a single submit and must be dropped
     bi.flags = replayEnabled_ ? 0 : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(stepCmd_, &bi));
     inStep_ = true;
@@ -654,7 +654,7 @@ void Engine::beginPass() {
 
 bool Engine::hazard(const std::vector<BufRef>& bufs, uint32_t writeMask) {
     static const bool noBarriers = std::getenv("OFC_NO_BARRIERS") != nullptr;
-    if (noBarriers) return false;  // 仅供计时实验（结果不可信）
+    if (noBarriers) return false;  // timing experiments only (results are not trustworthy)
     if (safeBarriers_) return true;
     for (size_t i = 0; i < bufs.size(); i++) {
         bool w = ((writeMask >> i) & 1u) != 0;
@@ -673,7 +673,7 @@ void Engine::track(const std::vector<BufRef>& bufs, uint32_t writeMask) {
         pending_.push_back({bufs[i].buf, bufs[i].offset, bufs[i].offset + bufs[i].size, ((writeMask >> i) & 1u) != 0});
 }
 
-// 定向缓冲屏障：只对真正重叠的缓冲发 VkBufferMemoryBarrier（比全局 VkMemoryBarrier 便宜）
+// targeted buffer barriers: emit VkBufferMemoryBarrier only for genuinely overlapping buffers (cheaper than a global VkMemoryBarrier)
 void Engine::barrierFor(const std::vector<BufRef>& bufs, uint32_t writeMask, const char* next) {
     static const bool noBarriers = std::getenv("OFC_NO_BARRIERS") != nullptr;
     if (noBarriers) return;
@@ -696,9 +696,9 @@ void Engine::barrierFor(const std::vector<BufRef>& bufs, uint32_t writeMask, con
             if (t.off < lo) lo = t.off;
             if (t.end > hi) hi = t.end;
             if (t.written) hasW = true;
-            if (w) needR = needW = true;       // write binding: 读改写
+            if (w) needR = needW = true;       // write binding: read-modify-write
             else if (t.written) needR = true;  // RAW
-            // 纯 WAR：只需执行依赖，无内存可见性掩码
+            // pure WAR: execution dependency only, no memory visibility mask
         }
         if (!overlap) continue;
         bool dup = false;
@@ -743,7 +743,7 @@ void Engine::barrierFor(const std::vector<BufRef>& bufs, uint32_t writeMask, con
         bb[k].size = (rEnd[k] - bb[k].offset + 3ull) & ~3ull;
     }
     vkCmdPipelineBarrier(stepCmd_, src, ct, 0, 0, nullptr, nb, bb, 0, nullptr);
-    // 只移除被该范围覆盖的 pending；范围外的保留
+    // drop only the pending entries covered by this range; keep the rest
     std::vector<TouchRegion> keep;
     keep.reserve(pending_.size());
     for (auto& t : pending_) {
@@ -763,7 +763,7 @@ void Engine::barrier() {
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                        VK_ACCESS_TRANSFER_WRITE_BIT;
-    // 仅 compute/transfer 级屏障（ALL_COMMANDS 在 Polaris 上触发完整缓存冲刷，代价巨大）
+    // compute/transfer stages only: ALL_COMMANDS triggers a full cache flush on Polaris, which is very costly
     const VkPipelineStageFlags ct = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkPipelineStageFlags src = srcStages_ ? srcStages_ : ct;
     vkCmdPipelineBarrier(stepCmd_, src, ct, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -773,7 +773,7 @@ void Engine::barrier() {
 
 void Engine::dispatch(const char* kernelName, const std::vector<BufRef>& bufs, const void* push, uint32_t gx,
                       uint32_t gy, uint32_t gz) {
-    if (replayMode_) return;  // 已缓存：跳过录制（hazard/屏障已烘焙）
+    if (replayMode_) return;  // cached: skip recording (hazards/barriers are baked in)
     Kernel& k = kernel(kernelName);
     if (bufs.size() != k.nBindings) {
         std::fprintf(stderr, "kernel %s expects %u bindings, got %zu\n", kernelName, k.nBindings, bufs.size());
@@ -874,7 +874,7 @@ void Engine::copyBuf(BufRef dst, BufRef src) {
 }
 
 void Engine::endStep() {
-    if (replayMode_) return;  // 重放模式：命令图已在缓存中
+    if (replayMode_) return;  // replay: command graph already cached
     lastCmds_ = recCmds_;
     VK_CHECK(vkEndCommandBuffer(stepCmd_));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -882,13 +882,13 @@ void Engine::endStep() {
     si.pCommandBuffers = &stepCmd_;
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, stepFence_));
     inStep_ = false;
-    if (replayEnabled_ && !cachedCmd_) cachedCmd_ = stepCmd_;  // 保留首个命令图用于重放
+    if (replayEnabled_ && !cachedCmd_) cachedCmd_ = stepCmd_;  // keep the first recorded graph for replay
 }
 
 void Engine::waitStep() {
     auto t0 = std::chrono::steady_clock::now();
     if (replayMode_) {
-        // 上一帧的 fence 已在上一 waitStep 复位；提交缓存命令图并等待
+        // the fence was reset in the previous waitStep; submit the cached graph and wait
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cachedCmd_;
@@ -919,7 +919,7 @@ void Engine::waitStep() {
         vkFreeCommandBuffers(dev_, pool_, 1, &stepCmd_);
         stepCmd_ = nullptr;
     } else {
-        stepCmd_ = nullptr;  // 已缓存，保留
+        stepCmd_ = nullptr;  // cached, keep it
     }
     auto t1 = std::chrono::steady_clock::now();
     lastStepMs_ = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();

@@ -11,7 +11,7 @@ void main(){
     float v = x[i];
     if(pc.mode == 0u){
         float t = 0.7978845608028654 * (v + 0.044715*v*v*v);
-        // 稳定 tanh：驱动内建 tanh 在 |t|>~44 时 exp 溢出成 inf/inf=NaN
+        // stable tanh: the driver builtin overflows exp to inf/inf = NaN for |t| > ~44
         float e = exp(-2.0 * abs(t));
         float th = (1.0 - e) / (1.0 + e);
         if(t < 0.0) th = -th;

@@ -20,7 +20,7 @@ void main(){
     for (uint st = 128; st > 0; st >>= 1){ if (tid < st) red[tid] += red[tid + st]; barrier(); }
     float mean = red[0] / float(pc.d);
     barrier();
-    // 两趟法：先均值再算离差平方和，避免 E[x^2]-mean^2 在大激活下溢出/抵消
+    // two-pass: compute the mean first, then the squared deviations, avoiding E[x^2]-mean^2 cancellation/overflow on large activations
     float ss = 0.0;
     for (uint j = tid; j < pc.d; j += 256){ float dv = x[base + j] - mean; ss += dv * dv; }
     red[tid] = ss;
