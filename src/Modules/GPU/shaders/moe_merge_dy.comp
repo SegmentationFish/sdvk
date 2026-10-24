@@ -1,0 +1,16 @@
+#version 450
+// dY[g,r,j] = dOut[r,j] * w[g,r]
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer DOUT { float dout[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) writeonly buffer DY { float dy[]; };
+layout(push_constant) uniform PC { uint rows; uint d; uint g; } pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.g * pc.rows * pc.d) return;
+    uint j = i % pc.d;
+    uint r = (i / pc.d) % pc.rows;
+    uint g = i / (pc.d * pc.rows);
+    dy[i] = dout[r * pc.d + j] * w[r * pc.g + g];
+}

@@ -1,0 +1,32 @@
+#version 450
+// routing balance loss:
+//   q[g] = counts[g] / max(sum(counts),1)
+//   out  = groups * sum_g q[g] * mean_r probs[r,g]
+// one workgroup; thread g handles column g (groups <= 32)
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer PROBS { float p[]; };
+layout(binding = 1) readonly buffer COUNTS { uint cnt[]; };
+layout(binding = 2) writeonly buffer OUT { float outv[]; };
+layout(push_constant) uniform PC { uint rows; uint groups; } pc;
+
+shared float red[64];
+
+void main(){
+    uint tid = gl_LocalInvocationID.x;
+    float contrib = 0.0;
+    if(tid < pc.groups){
+        float s = 0.0;
+        for(uint r=0;r<pc.rows;r++) s += p[r*pc.groups+tid];
+        float tot = 0.0;
+        for(uint g=0;g<pc.groups;g++) tot += float(cnt[g]);
+        float q = float(cnt[tid]) / max(tot, 1.0);
+        contrib = q * (s / float(pc.rows));
+    }
+    red[tid] = contrib;
+    barrier();
+    for(uint step=32;step>0;step>>=1){
+        if(tid < step) red[tid] += red[tid+step];
+        barrier();
+    }
+    if(tid == 0) outv[0] = float(pc.groups) * red[0];
+}

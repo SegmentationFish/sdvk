@@ -1,0 +1,70 @@
+#version 450
+
+// C[M,N] = A[M,K] * B[K,N], all row-major fp32
+// tile: 64x64 output per workgroup, 16x16 threads, 4x4 per thread, BK=16
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
+
+const uint BM = 64;
+const uint BN = 64;
+const uint BK = 16;
+const uint TM = 4;
+const uint TN = 4;
+
+shared float As[BM][BK];
+shared float Bs[BK][BN];
+
+void main(){
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint by = gl_WorkGroupID.y;
+    uint bx = gl_WorkGroupID.x;
+
+    float acc[TM][TN];
+    for(uint i=0;i<TM;i++)
+        for(uint j=0;j<TN;j++) acc[i][j]=0.0;
+
+    uint nTiles = (pc.K + BK - 1) / BK;
+    for(uint t=0;t<nTiles;t++){
+        uint kBase = t * BK;
+        for(uint l=0;l<4;l++){
+            uint e = l*256 + ty*16 + tx;
+            uint r = e / BK;
+            uint c = e % BK;
+            uint gr = by*BM + r;
+            uint gc = kBase + c;
+            As[r][c] = (gr < pc.M && gc < pc.K) ? a[gr*pc.K + gc] : 0.0;
+        }
+        for(uint l=0;l<4;l++){
+            uint e = l*256 + ty*16 + tx;
+            uint r = e / BN;
+            uint c = e % BN;
+            uint gr = kBase + r;
+            uint gc = bx*BN + c;
+            Bs[r][c] = (gr < pc.K && gc < pc.N) ? b[gr*pc.N + gc] : 0.0;
+        }
+        barrier();
+        for(uint k=0;k<BK;k++){
+            float av[TM];
+            float bv[TN];
+            for(uint i=0;i<TM;i++) av[i]=As[ty*TM+i][k];
+            for(uint j=0;j<TN;j++) bv[j]=Bs[k][tx*TN+j];
+            for(uint i=0;i<TM;i++)
+                for(uint j=0;j<TN;j++) acc[i][j]+=av[i]*bv[j];
+        }
+        barrier();
+    }
+
+    for(uint i=0;i<TM;i++)
+        for(uint j=0;j<TN;j++){
+            uint gr = by*BM + ty*TM + i;
+            uint gc = bx*BN + tx*TN + j;
+            if(gr < pc.M && gc < pc.N) c[gr*pc.N + gc] = acc[i][j];
+        }
+}

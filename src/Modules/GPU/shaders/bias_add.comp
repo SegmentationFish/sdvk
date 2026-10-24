@@ -1,0 +1,12 @@
+#version 450
+// per-channel bias add on NCHW (batch=1), in place
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer X { float x[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(push_constant) uniform PC { uint C; uint P; } pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.C * pc.P) return;
+    x[i] += b[i / pc.P];
+}

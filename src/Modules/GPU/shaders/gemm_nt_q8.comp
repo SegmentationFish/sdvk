@@ -1,0 +1,79 @@
+#version 450
+// C[M,N] = A[M,K] * B[N,K]^T ; A fp32 row-major, B = Q8_0 payload (uint32 packed int8, 4/word)
+// + fp32 scales (one per 32 elements). B row stride = K. Batched on z.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer Bq { uint bq[]; };
+layout(binding = 2) writeonly buffer C { float c[]; };
+layout(binding = 3) readonly buffer S { float s[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint mode;
+                                  uint sA; uint sB; uint sC; uint batch;
+                                  uint lda; uint ldb; uint ldc; uint pad; } pc;
+
+const uint BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+shared float As[BM][BK];
+shared float Bs[BN][BK];
+
+float deqB(uint gr, uint gc){
+    uint fl = gr * pc.K + gc;
+    uint w = bq[fl >> 2];
+    int v = int((w >> ((fl & 3u) * 8u)) & 0xFFu);
+    if (v > 127) v -= 256;
+    return float(v) * s[fl >> 5];
+}
+
+void main(){
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint by = gl_WorkGroupID.y;
+    uint bx = gl_WorkGroupID.x;
+    uint zo = gl_WorkGroupID.z;
+    uint ao = zo * pc.sA;
+    uint co = zo * pc.sC;
+    uint lda = pc.lda == 0u ? pc.K : pc.lda;
+    uint ldc = pc.ldc == 0u ? pc.N : pc.ldc;
+
+    float acc[TM][TN];
+    for(uint i=0;i<TM;i++)
+        for(uint j=0;j<TN;j++) acc[i][j]=0.0;
+
+    uint nTiles = (pc.K + BK - 1) / BK;
+    for(uint t=0;t<nTiles;t++){
+        uint kBase = t * BK;
+        for(uint l=0;l<4;l++){
+            uint e = l*256 + ty*16 + tx;
+            uint r = e / BK;
+            uint cc = e % BK;
+            uint gr = by*BM + r;
+            uint gc = kBase + cc;
+            As[r][cc] = (gr < pc.M && gc < pc.K) ? a[ao + gr*lda + gc] : 0.0;
+        }
+        for(uint l=0;l<4;l++){
+            uint e = l*256 + ty*16 + tx;
+            uint r = e / BK;
+            uint cc = e % BK;
+            uint gr = bx*BN + r;
+            uint gc = kBase + cc;
+            Bs[r][cc] = (gr < pc.N && gc < pc.K) ? deqB(gr, gc) : 0.0;
+        }
+        barrier();
+        for(uint k=0;k<BK;k++){
+            float av[TM];
+            float bv[TN];
+            for(uint i=0;i<TM;i++) av[i]=As[ty*TM+i][k];
+            for(uint j=0;j<TN;j++) bv[j]=Bs[tx*TN+j][k];
+            for(uint i=0;i<TM;i++)
+                for(uint j=0;j<TN;j++) acc[i][j]+=av[i]*bv[j];
+        }
+        barrier();
+    }
+    for(uint i=0;i<TM;i++)
+        for(uint j=0;j<TN;j++){
+            uint gr = by*BM + ty*TM + i;
+            uint gc = bx*BN + tx*TN + j;
+            if(gr < pc.M && gc < pc.N){
+                if(pc.mode == 0u) c[co + gr*ldc + gc] = acc[i][j];
+                else c[co + gr*ldc + gc] += acc[i][j];
+            }
+        }
+}

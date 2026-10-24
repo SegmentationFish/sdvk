@@ -1,0 +1,44 @@
+#version 450
+// row-wise top-k selection on probs[rows,g] (g small, k <= g):
+// - sparse[rows,g]: normalized top-k weights placed at their original columns (zeros elsewhere)
+// - idx[rows,k]: selected column ids
+// - srow[rows]: sum of selected probs (clamped at 1e-9)
+// - counts[g]: incremented per selection (caller must zero it first)
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer PROBS { float p[]; };
+layout(binding = 1) writeonly buffer SPARSE { float sp[]; };
+layout(binding = 2) writeonly buffer IDX { uint idx[]; };
+layout(binding = 3) writeonly buffer SROW { float srow[]; };
+layout(binding = 4) buffer COUNTS { uint cnt[]; };
+layout(push_constant) uniform PC { uint rows; uint g; uint k; } pc;
+
+void main(){
+    uint r = gl_GlobalInvocationID.x;
+    if(r >= pc.rows) return;
+
+    // selection by insertion (top-k over g, k small)
+    uint sel[8];
+    for(uint j=0;j<pc.k;j++) sel[j]=0xFFFFFFFFu;
+    for(uint c=0;c<pc.g;c++){
+        float v = p[r*pc.g+c];
+        for(uint j=0;j<pc.k;j++){
+            if(sel[j]==0xFFFFFFFFu){ sel[j]=c; break; }
+            if(v > p[r*pc.g+sel[j]]){
+                for(uint t=pc.k-1;t>j;t--) sel[t]=sel[t-1];
+                sel[j]=c;
+                break;
+            }
+        }
+    }
+    float s = 0.0;
+    for(uint j=0;j<pc.k;j++) s += p[r*pc.g+sel[j]];
+    float inv = 1.0 / max(s, 1e-9);
+    srow[r] = max(s, 1e-9);
+    for(uint c=0;c<pc.g;c++) sp[r*pc.g+c] = 0.0;
+    for(uint j=0;j<pc.k;j++){
+        uint c = sel[j];
+        sp[r*pc.g+c] = p[r*pc.g+c] * inv;
+        idx[r*pc.k+j] = c;
+        atomicAdd(cnt[c], 1u);
+    }
+}

@@ -1,0 +1,58 @@
+#version 450
+// 融合 scale + mask + concat(local,mem) + softmax：一个 workgroup 处理一行。
+// sloc[rows,T], smem[rows,M] (M 可为 0)，out[rows,T+M]
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer SLOC { float sloc[]; };
+layout(binding = 1) readonly buffer SMEM { float smem[]; };
+layout(binding = 2) readonly buffer MASK { uint mask[]; };
+layout(binding = 3) writeonly buffer OUT { float outv[]; };
+layout(push_constant) uniform PC { uint rows; uint T; uint M; uint hasMask; float scale; } pc;
+
+shared float red[256];
+
+void main(){
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    uint t = row % pc.T;
+    uint bl = row * pc.T;
+    uint bm = row * pc.M;
+    uint bo = row * (pc.T + pc.M);
+
+    float m = -3.0e38;
+    for (uint j = tid; j < pc.T; j += 256){
+        if (pc.hasMask != 0u && mask[t * pc.T + j] == 0u) continue;
+        m = max(m, sloc[bl + j] * pc.scale);
+    }
+    for (uint j = tid; j < pc.M; j += 256)
+        m = max(m, smem[bm + j] * pc.scale);
+    red[tid] = m;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1){
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    float mx = red[0];
+
+    float acc = 0.0;
+    for (uint j = tid; j < pc.T; j += 256){
+        if (pc.hasMask != 0u && mask[t * pc.T + j] == 0u) continue;
+        acc += exp(sloc[bl + j] * pc.scale - mx);
+    }
+    for (uint j = tid; j < pc.M; j += 256)
+        acc += exp(smem[bm + j] * pc.scale - mx);
+    red[tid] = acc;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1){
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / max(red[0], 1.0e-30);
+
+    for (uint j = tid; j < pc.T; j += 256){
+        if (pc.hasMask != 0u && mask[t * pc.T + j] == 0u){ outv[bo + j] = 0.0; continue; }
+        outv[bo + j] = exp(sloc[bl + j] * pc.scale - mx) * inv;
+    }
+    for (uint j = tid; j < pc.M; j += 256)
+        outv[bo + pc.T + j] = exp(smem[bm + j] * pc.scale - mx) * inv;
+}

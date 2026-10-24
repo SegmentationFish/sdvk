@@ -1,0 +1,14 @@
+#version 450
+// gw[j] += sum_r x[r,j]   (one invocation per column)
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) buffer GW { float gw[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; } pc;
+
+void main(){
+    uint j = gl_GlobalInvocationID.x;
+    if(j >= pc.cols) return;
+    float acc = 0.0;
+    for(uint r=0;r<pc.rows;r++) acc += x[r*pc.cols+j];
+    gw[j] += acc;
+}

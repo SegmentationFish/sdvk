@@ -1,0 +1,43 @@
+#version 450
+// glogits[r,j] += go * (softmax(logits)[j] - [j==target]) / rows
+// mask[r]==0 rows get no gradient
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer LOGITS { float lg[]; };
+layout(binding = 1) readonly buffer TGT { uint tgt[]; };
+layout(binding = 2) readonly buffer GO { float go[]; };
+layout(binding = 3) buffer GLOG { float gl[]; };
+layout(binding = 4) readonly buffer MASK { uint msk[]; };
+layout(push_constant) uniform PC { uint rows; uint v; float invRows; uint pad; } pc;
+
+shared float red[256];
+
+void main(){
+    uint tid = gl_LocalInvocationID.x;
+    uint r = gl_WorkGroupID.x;
+    if(msk[r] == 0u) return;
+    const float NEG = -3.0e38;
+    float mx = NEG;
+    for(uint j=tid;j<pc.v;j+=256) mx = max(mx, lg[r*pc.v+j]);
+    red[tid] = mx;
+    barrier();
+    for(uint step=128;step>0;step>>=1){
+        if(tid < step) red[tid] = max(red[tid], red[tid+step]);
+        barrier();
+    }
+    float m = red[0];
+    float s = 0.0;
+    for(uint j=tid;j<pc.v;j+=256) s += exp(lg[r*pc.v+j] - m);
+    red[tid] = s;
+    barrier();
+    for(uint step=128;step>0;step>>=1){
+        if(tid < step) red[tid] += red[tid+step];
+        barrier();
+    }
+    float ir = pc.invRows * go[0] / red[0];
+    uint t = tgt[r];
+    for(uint j=tid;j<pc.v;j+=256){
+        float p = exp(lg[r*pc.v+j] - m);
+        float g = p - (j == t ? red[0] : 0.0);
+        gl[r*pc.v+j] += ir * g;
+    }
+}

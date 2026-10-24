@@ -1,0 +1,56 @@
+#version 450
+// Batched optimizer update: Adafactor (factored) and AdamW in one dispatch.
+// Workgroups are laid out by per-parameter wgStart (ceil(n/256) each); binary search
+// finds the owning parameter. tbl stride 8 uints:
+//   [0] mode (0=adafactor, 1=adamw)  [1] n        [2] cols   [3] dataOff
+//   [4] gradOff                      [5] stateBase [6] vOff  [7] wgStart
+// Adafactor state at stateBase: R[rows], C[cols], meta; rows = n/cols.
+layout(local_size_x = 512) in;
+layout(binding = 0) buffer P { float p[]; };
+layout(binding = 1) readonly buffer G { float g[]; };
+layout(binding = 2) buffer S { float st[]; };
+layout(binding = 3) readonly buffer TBL { uint tbl[]; };
+layout(binding = 4) readonly buffer CLIP { float clip[]; };
+layout(binding = 5) readonly buffer HP { float hp[]; };
+layout(push_constant) uniform PC { uint count; uint pad; } pc;
+
+void main(){
+    uint wg = gl_WorkGroupID.x;
+    uint lo = 0, hi = pc.count;
+    while (lo + 1 < hi){
+        uint mid = (lo + hi) >> 1;
+        if (tbl[mid * 8u + 7u] <= wg) lo = mid; else hi = mid;
+    }
+    uint mode = tbl[lo * 8u];
+    uint n    = tbl[lo * 8u + 1u];
+    uint i    = (wg - tbl[lo * 8u + 7u]) * 512u + gl_LocalInvocationID.x;
+    if (i >= n) return;
+    float s = clip[0];
+    if (!(s == s)) s = 0.0;
+    uint go = tbl[lo * 8u + 4u];
+    float gg = g[go + i] * s;
+    if (!(gg == gg) || abs(gg) > 1.0e30) return;
+    uint po = tbl[lo * 8u + 3u];
+    float pi = p[po + i];
+    if (mode == 0u){
+        uint cols = tbl[lo * 8u + 2u];
+        uint base = tbl[lo * 8u + 5u];
+        uint rows = n / max(cols, 1u);
+        uint r = i / max(cols, 1u);
+        uint c = i - r * cols;
+        float meanR = max(st[base + rows + cols], 1.0e-30);
+        float V = st[base + r] * st[base + rows + c] / meanR;
+        float upd = gg / (sqrt(max(V, 0.0)) + hp[3]);
+        p[po + i] = pi - hp[0] * (upd + hp[4] * pi);
+    } else {
+        uint mo = tbl[lo * 8u + 5u];
+        uint vo = tbl[lo * 8u + 6u];
+        float b1 = hp[1], b2 = hp[2];
+        float mi = b1 * st[mo + i] + (1.0 - b1) * gg;
+        float vi = b2 * st[vo + i] + (1.0 - b2) * gg * gg;
+        st[mo + i] = mi;
+        st[vo + i] = vi;
+        float upd = (mi * hp[5]) / (sqrt(vi * hp[6]) + hp[3]);
+        p[po + i] = pi - hp[0] * (upd + hp[4] * pi);
+    }
+}

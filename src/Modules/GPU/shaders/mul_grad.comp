@@ -1,0 +1,25 @@
+#version 450
+// gradient of mul: target[sum(coord*tstr)] += go[i] * other[sum(coord*ostr)]
+// go is contiguous with shape d0..d3
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer T { float t[]; };
+layout(binding = 1) readonly buffer GO { float go[]; };
+layout(binding = 2) readonly buffer OTH { float o[]; };
+layout(push_constant) uniform PC {
+    uint n;
+    uint d0, d1, d2, d3;
+    uint ts0, ts1, ts2, ts3;
+    uint os0, os1, os2, os3;
+} pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if(i >= pc.n) return;
+    uint c0 = i % pc.d0; uint rem = i / pc.d0;
+    uint c1 = rem % pc.d1; rem /= pc.d1;
+    uint c2 = rem % pc.d2; rem /= pc.d2;
+    uint c3 = rem;
+    uint ti = pc.ts0*c0 + pc.ts1*c1 + pc.ts2*c2 + pc.ts3*c3;
+    uint oi = pc.os0*c0 + pc.os1*c1 + pc.os2*c2 + pc.os3*c3;
+    t[ti] += go[i] * o[oi];
+}

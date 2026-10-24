@@ -1,0 +1,25 @@
+#version 450
+// per-group token compaction.
+// for each row r with a selected idx[r,*]==gid:
+//   pos = atomicAdd(counts[gid])
+//   tIdx[gid*maxRows+pos] = r
+//   wCol[gid*maxRows+pos] = sparse[r*g+gid]
+// caller must zero counts before dispatch
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer IDX { uint idx[]; };
+layout(binding = 1) readonly buffer SPARSE { float sp[]; };
+layout(binding = 2) writeonly buffer TIDX { uint tidx[]; };
+layout(binding = 3) writeonly buffer WCOL { float wcol[]; };
+layout(binding = 4) buffer COUNTS { uint cnt[]; };
+layout(push_constant) uniform PC { uint rows; uint g; uint k; } pc;
+
+void main(){
+    uint r = gl_GlobalInvocationID.x;
+    if(r >= pc.rows) return;
+    for(uint j=0;j<pc.k;j++){
+        uint gid = idx[r*pc.k+j];
+        uint pos = atomicAdd(cnt[gid], 1u);
+        tidx[gid*pc.rows + pos] = r;
+        wcol[gid*pc.rows + pos] = sp[r*pc.g+gid];
+    }
+}

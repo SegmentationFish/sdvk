@@ -1,0 +1,13 @@
+#version 450
+// gx[i] += mask[i % period] != 0 ? go[i] : 0
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer GO { float go[]; };
+layout(binding = 1) readonly buffer MASK { uint mask[]; };
+layout(binding = 2) buffer GX { float gx[]; };
+layout(push_constant) uniform PC { uint n; uint period; } pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if(i >= pc.n) return;
+    if(mask[i % pc.period] != 0u) gx[i] += go[i];
+}

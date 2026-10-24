@@ -1,0 +1,36 @@
+#version 450
+// LayerNorm over the last dim, one workgroup per row
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer GAMMA { float gamma[]; };
+layout(binding = 2) readonly buffer BETA { float beta[]; };
+layout(binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint d; float eps; uint affine; } pc;
+
+shared float red[256];
+
+void main(){
+    uint r = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = r * pc.d;
+    float s = 0.0;
+    for (uint j = tid; j < pc.d; j += 256) s += x[base + j];
+    red[tid] = s;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1){ if (tid < st) red[tid] += red[tid + st]; barrier(); }
+    float mean = red[0] / float(pc.d);
+    barrier();
+    // 两趟法：先均值再算离差平方和，避免 E[x^2]-mean^2 在大激活下溢出/抵消
+    float ss = 0.0;
+    for (uint j = tid; j < pc.d; j += 256){ float dv = x[base + j] - mean; ss += dv * dv; }
+    red[tid] = ss;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1){ if (tid < st) red[tid] += red[tid + st]; barrier(); }
+    float var = red[0] / float(pc.d);
+    float inv = 1.0 / sqrt(var + pc.eps);
+    for (uint j = tid; j < pc.d; j += 256){
+        float v = (x[base + j] - mean) * inv;
+        if (pc.affine != 0u) v = v * gamma[j] + beta[j];
+        y[base + j] = v;
+    }
+}

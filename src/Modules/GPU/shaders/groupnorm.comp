@@ -1,0 +1,36 @@
+#version 450
+// GroupNorm over NCHW (batch=1): one workgroup per group.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer GAMMA { float gamma[]; };
+layout(binding = 2) readonly buffer BETA { float beta[]; };
+layout(binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint C; uint P; uint G; float eps; } pc;
+
+shared float red[256];
+
+void main(){
+    uint g = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint Cg = pc.C / pc.G;
+    uint base = g * Cg * pc.P;
+    uint cnt = Cg * pc.P;
+    float s = 0.0;
+    for (uint i = tid; i < cnt; i += 256) s += x[base + i];
+    red[tid] = s;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1){ if (tid < st) red[tid] += red[tid + st]; barrier(); }
+    float mean = red[0] / float(cnt);
+    barrier();
+    float ss = 0.0;
+    for (uint i = tid; i < cnt; i += 256){ float dv = x[base + i] - mean; ss += dv * dv; }
+    red[tid] = ss;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1){ if (tid < st) red[tid] += red[tid + st]; barrier(); }
+    float var = red[0] / float(cnt);
+    float r = 1.0 / sqrt(var + pc.eps);
+    for (uint i = tid; i < cnt; i += 256){
+        uint ch = g * Cg + i / pc.P;
+        y[base + i] = (x[base + i] - mean) * r * gamma[ch] + beta[ch];
+    }
+}

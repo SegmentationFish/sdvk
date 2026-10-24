@@ -1,0 +1,70 @@
+#version 450
+// Batched Adafactor factored statistics (row + column) in one dispatch.
+// Workgroups [0, rowTotal) update R; [rowTotal, rowTotal+colTotal) update C.
+// tbl[param] = (gradOffsetFloats, rows, cols, stateBase)  state: R[rows], C[cols], meta
+// stateBase: R at base, C at base+rows, meta at base+rows+cols.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer G { float g[]; };
+layout(binding = 1) buffer S { float st[]; };
+layout(binding = 2) readonly buffer TBL { uvec4 tbl[]; };
+layout(binding = 3) readonly buffer ROWPREF { uint rowPref[]; };
+layout(binding = 4) readonly buffer COLPREF { uint colPref[]; };
+layout(binding = 5) readonly buffer HP { float hp[]; };
+layout(push_constant) uniform PC { uint rowTotal; uint count; } pc;
+
+shared float red[256];
+
+void main(){
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+    float b2 = hp[7];
+    float s = 0.0;
+    if (wg < pc.rowTotal){
+        uint p = 0, hi = pc.count;
+        while (p + 1 < hi){
+            uint mid = (p + hi) >> 1;
+            if (rowPref[mid] <= wg) p = mid; else hi = mid;
+        }
+        uvec4 e = tbl[p];
+        uint r = wg - rowPref[p];
+        uint base = e.x + r * e.z;
+        for (uint j = tid; j < e.z; j += 256){
+            float v = g[base + j];
+            s += v * v;
+        }
+        red[tid] = s;
+        barrier();
+        for (uint step = 128; step > 0; step >>= 1){
+            if (tid < step) red[tid] += red[tid + step];
+            barrier();
+        }
+        if (tid == 0){
+            uint o = e.w + r;
+            st[o] = b2 * st[o] + (1.0 - b2) * (red[0] / float(max(e.z, 1u)));
+        }
+    } else {
+        uint wg2 = wg - pc.rowTotal;
+        uint p = 0, hi = pc.count;
+        while (p + 1 < hi){
+            uint mid = (p + hi) >> 1;
+            if (colPref[mid] <= wg2) p = mid; else hi = mid;
+        }
+        uvec4 e = tbl[p];
+        uint c = wg2 - colPref[p];
+        uint base = e.x + c;
+        for (uint i = tid; i < e.y; i += 256){
+            float v = g[base + i * e.z];
+            s += v * v;
+        }
+        red[tid] = s;
+        barrier();
+        for (uint step = 128; step > 0; step >>= 1){
+            if (tid < step) red[tid] += red[tid + step];
+            barrier();
+        }
+        if (tid == 0){
+            uint o = e.w + e.y + c;
+            st[o] = b2 * st[o] + (1.0 - b2) * (red[0] / float(max(e.y, 1u)));
+        }
+    }
+}

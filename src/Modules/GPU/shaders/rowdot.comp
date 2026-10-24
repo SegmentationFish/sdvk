@@ -1,0 +1,15 @@
+#version 450
+// gb[r] += sum_j go[r,j] * x[r,j]   (one invocation per row)
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer GO { float go[]; };
+layout(binding = 1) readonly buffer X { float x[]; };
+layout(binding = 2) buffer GB { float gb[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; } pc;
+
+void main(){
+    uint r = gl_GlobalInvocationID.x;
+    if(r >= pc.rows) return;
+    float acc = 0.0;
+    for(uint j=0;j<pc.cols;j++) acc += go[r*pc.cols+j] * x[r*pc.cols+j];
+    gb[r] += acc;
+}

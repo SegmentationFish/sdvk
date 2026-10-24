@@ -1,0 +1,15 @@
+#version 450
+// out[0] = min(1, maxNorm / sqrt(sum(partials)))
+layout(local_size_x = 1) in;
+layout(binding = 0) readonly buffer PART { float part[]; };
+layout(binding = 1) writeonly buffer OUT { float outv[]; };
+layout(push_constant) uniform PC { uint count; float maxNorm; } pc;
+
+void main(){
+    float s = 0.0;
+    for(uint i=0;i<pc.count;i++) s += part[i];
+    float nrm = sqrt(max(s, 0.0));
+    outv[1] = nrm;                                       // raw grad norm (logging)
+    // non-finite or zero sum -> freeze updates this step (adamw sanitizes too)
+    outv[0] = (s > 0.0 && s == s) ? min(1.0, pc.maxNorm / nrm) : 0.0;
+}

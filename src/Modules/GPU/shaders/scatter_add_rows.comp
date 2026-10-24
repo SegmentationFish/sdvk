@@ -1,0 +1,24 @@
+#version 450
+// dst[idx[i]*d + j] += src[i*d + j], float atomic add via CAS
+// (safe when idx contains duplicates)
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer DST { uint dstBits[]; };
+layout(binding = 1) readonly buffer IDX { uint idx[]; };
+layout(binding = 2) readonly buffer SRC { float src[]; };
+layout(push_constant) uniform PC { uint n; uint d; } pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if(i >= pc.n * pc.d) return;
+    uint r = i / pc.d;
+    uint j = i % pc.d;
+    uint di = idx[r]*pc.d + j;
+    float v = src[i];
+    uint old = dstBits[di];
+    for(;;){
+        float nf = uintBitsToFloat(old) + v;
+        uint prev = atomicCompSwap(dstBits[di], old, floatBitsToUint(nf));
+        if(prev == old) break;
+        old = prev;
+    }
+}

@@ -1,0 +1,17 @@
+#version 450
+// x (raw matmul out) becomes pre-activation x+b; y = gelu(x+b)
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer X { float x[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; } pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows * pc.cols) return;
+    uint c = i % pc.cols;
+    float v = x[i] + b[c];
+    x[i] = v;
+    float t = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+    y[i] = 0.5 * v * (1.0 + tanh(t));
+}

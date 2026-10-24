@@ -1,0 +1,26 @@
+#version 450
+// c[i] = a[ai] + b[bi]  (mode 0)  /  c[i] = a[ai] * b[bi]  (mode 1)
+// c is contiguous; coordinates decompose over d0..d3 (shape of c)
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer C { float c[]; };
+layout(binding = 1) readonly buffer A { float a[]; };
+layout(binding = 2) readonly buffer B { float b[]; };
+layout(push_constant) uniform PC {
+    uint n;
+    uint d0, d1, d2, d3;
+    uint as0, as1, as2, as3;
+    uint bs0, bs1, bs2, bs3;
+    uint mode;
+} pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if(i >= pc.n) return;
+    uint c0 = i % pc.d0; uint t = i / pc.d0;
+    uint c1 = t % pc.d1; t /= pc.d1;
+    uint c2 = t % pc.d2; t /= pc.d2;
+    uint c3 = t;
+    uint ai = pc.as0*c0 + pc.as1*c1 + pc.as2*c2 + pc.as3*c3;
+    uint bi = pc.bs0*c0 + pc.bs1*c1 + pc.bs2*c2 + pc.bs3*c3;
+    c[i] = (pc.mode == 0u) ? (a[ai] + b[bi]) : (a[ai] * b[bi]);
+}

@@ -1,0 +1,42 @@
+#version 450
+// 融合 softmax+mask+scale 反向：dsloc / dsmem
+// P = softmax(scale*raw)；dRaw = scale * P * (dP - sum(dP*P))
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer P { float p[]; };
+layout(binding = 1) readonly buffer DP { float dp[]; };
+layout(binding = 2) readonly buffer MASK { uint mask[]; };
+layout(binding = 3) writeonly buffer DSLOC { float dsloc[]; };
+layout(binding = 4) writeonly buffer DSMEM { float dsmem[]; };
+layout(push_constant) uniform PC { uint rows; uint T; uint M; uint hasMask; float scale; } pc;
+
+shared float red[256];
+
+void main(){
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    uint t = row % pc.T;
+    uint bp = row * (pc.T + pc.M);
+    uint bd = row * (pc.T + pc.M);
+
+    float d = 0.0;
+    for (uint j = tid; j < pc.T + pc.M; j += 256)
+        d += dp[bd + j] * p[bp + j];
+    red[tid] = d;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1){
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float dot = red[0];
+
+    for (uint j = tid; j < pc.T; j += 256){
+        if (pc.hasMask != 0u && mask[t * pc.T + j] == 0u){ dsloc[row * pc.T + j] = 0.0; continue; }
+        float pj = p[bp + j];
+        dsloc[row * pc.T + j] = pc.scale * pj * (dp[bd + j] - dot);
+    }
+    for (uint j = tid; j < pc.M; j += 256){
+        float pj = p[bp + pc.T + j];
+        dsmem[row * pc.M + j] = pc.scale * pj * (dp[bd + pc.T + j] - dot);
+    }
+}

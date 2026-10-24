@@ -1,0 +1,26 @@
+#version 450
+// 3x3 stride1 pad1 im2col (NCHW, batch=1): col[k*P + p], k = c*9 + ky*3 + kx
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer IN { float inx[]; };
+layout(binding = 1) writeonly buffer COL { float col[]; };
+layout(push_constant) uniform PC { uint C; uint H; uint W; uint row0; uint rows; } pc;
+
+void main(){
+    uint P = pc.rows * pc.W;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.C * 9u * P) return;
+    uint k = i / P;
+    uint p = i - k * P;
+    uint c = k / 9u;
+    uint r = k - c * 9u;
+    uint ky = r / 3u;
+    uint kx = r - ky * 3u;
+    uint oh = pc.row0 + p / pc.W;
+    uint ow = p % pc.W;
+    int ih = int(oh) + int(ky) - 1;
+    int iw = int(ow) + int(kx) - 1;
+    float v = 0.0;
+    if (ih >= 0 && ih < int(pc.H) && iw >= 0 && iw < int(pc.W))
+        v = inx[(c * pc.H + uint(ih)) * pc.W + uint(iw)];
+    col[i] = v;
+}

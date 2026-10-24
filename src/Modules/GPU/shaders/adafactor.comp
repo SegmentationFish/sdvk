@@ -1,0 +1,27 @@
+#version 450
+// Adafactor update (factored second moment): V = R[r]*C[c]/meanR
+// p -= lr * (g*clip / sqrt(V + eps) + wd*p)
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer P { float p[]; };
+layout(binding = 1) readonly buffer G { float g[]; };
+layout(binding = 2) readonly buffer R { float rv[]; };
+layout(binding = 3) readonly buffer C { float cv[]; };
+layout(binding = 4) readonly buffer META { float meta[]; };
+layout(binding = 5) readonly buffer CLIP { float clip[]; };
+layout(binding = 6) readonly buffer HP { float hp[]; };
+layout(push_constant) uniform PC { uint n; uint cols; } pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float s = clip[0];
+    if (!(s == s)) s = 0.0;            // NaN clip -> freeze this step
+    float gg = g[i] * s;
+    if (!(gg == gg) || abs(gg) > 1.0e30) return;
+    uint r = i / pc.cols;
+    uint c = i % pc.cols;
+    float meanR = max(meta[0], 1.0e-30);
+    float V = rv[r] * cv[c] / meanR;
+    float upd = gg / (sqrt(max(V, 0.0)) + hp[3]);
+    p[i] = p[i] - hp[0] * (upd + hp[4] * p[i]);
+}

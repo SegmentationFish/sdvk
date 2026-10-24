@@ -1,0 +1,43 @@
+#version 450
+// rowwise RMSNorm backward.
+// gx += ir*(go*w - (dot/d)*x*ir*ir),  dot = sum_j go_j*w_j*x_j
+// gwRow[r,j] = go_j*x_j*ir   (fresh per-row partial, colsum'd later into w.grad)
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) readonly buffer GO { float go[]; };
+layout(binding = 3) buffer GX { float gx[]; };
+layout(binding = 4) writeonly buffer GWR { float gwr[]; };
+layout(push_constant) uniform PC { uint rows; uint d; float eps; uint pad; } pc;
+
+shared float red[256];
+
+void main(){
+    uint tid = gl_LocalInvocationID.x;
+    uint r = gl_WorkGroupID.x;
+    float s = 0.0;
+    for(uint j=tid;j<pc.d;j+=256){ float v=x[r*pc.d+j]; s += v*v; }
+    red[tid] = s;
+    barrier();
+    for(uint step=128;step>0;step>>=1){
+        if(tid < step) red[tid] += red[tid+step];
+        barrier();
+    }
+    float inv = 1.0 / sqrt(red[0] / float(pc.d) + pc.eps);
+    float dot = 0.0;
+    for(uint j=tid;j<pc.d;j+=256)
+        dot += go[r*pc.d+j] * w[j] * x[r*pc.d+j];
+    red[tid] = dot;
+    barrier();
+    for(uint step=128;step>0;step>>=1){
+        if(tid < step) red[tid] += red[tid+step];
+        barrier();
+    }
+    float dotr = red[0];
+    for(uint j=tid;j<pc.d;j+=256){
+        float xv = x[r*pc.d+j];
+        float gv = go[r*pc.d+j];
+        gx[r*pc.d+j] += inv * (gv*w[j] - (dotr/float(pc.d))*xv*inv*inv);
+        gwr[r*pc.d+j] = gv * xv * inv;
+    }
+}

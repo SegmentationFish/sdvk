@@ -1,0 +1,16 @@
+#version 450
+// sparse.grad[r*g+gid] += wcolGrad[pos] for pos < counts[gid]  (single group gid)
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer TIDX { uint tidx[]; };
+layout(binding = 1) readonly buffer GWC { float gwc[]; };
+layout(binding = 2) readonly buffer COUNTS { uint cnt[]; };
+layout(binding = 3) buffer GSPARSE { float gsp[]; };
+layout(push_constant) uniform PC { uint rows; uint g; uint gid; } pc;
+
+void main(){
+    uint pos = gl_GlobalInvocationID.x;
+    if(pos >= pc.rows) return;
+    if(pos >= cnt[pc.gid]) return;
+    uint r = tidx[pos];
+    gsp[r*pc.g + pc.gid] += gwc[pos];
+}

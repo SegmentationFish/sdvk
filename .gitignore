@@ -1,0 +1,21 @@
+# build artifacts
+build/
+cmake-build-*/
+*.spv
+
+# binaries
+*.exe
+*.obj
+*.o
+
+# outputs (images / latents / dumps)
+*.ppm
+*.png
+*.jpg
+*.f32
+*.bin
+
+# editors / logs
+.vscode/
+.idea/
+*.log

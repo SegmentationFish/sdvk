@@ -1,0 +1,26 @@
+#version 450
+// Batched Adafactor row-statistic mean: one workgroup per parameter.
+// meta[stateBase + rows + cols] = mean(R[0..rows))
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer S { float st[]; };
+layout(binding = 1) readonly buffer TBL { uvec4 tbl[]; };
+layout(push_constant) uniform PC { uint count; } pc;
+
+shared float red[256];
+
+void main(){
+    uint p = gl_WorkGroupID.x;
+    if (p >= pc.count) return;
+    uint tid = gl_LocalInvocationID.x;
+    uvec4 e = tbl[p];
+    uint rows = e.y;
+    float s = 0.0;
+    for (uint i = tid; i < rows; i += 256) s += st[e.w + i];
+    red[tid] = s;
+    barrier();
+    for (uint step = 128; step > 0; step >>= 1){
+        if (tid < step) red[tid] += red[tid + step];
+        barrier();
+    }
+    if (tid == 0) st[e.w + rows + e.z] = red[0] / float(max(rows, 1u));
+}

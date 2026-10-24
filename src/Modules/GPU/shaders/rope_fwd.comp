@@ -1,0 +1,28 @@
+#version 450
+// rotary position embedding on [batch, seq, dh] (contiguous, last dim = head dim)
+// one invocation per (b,t,hd): handles the pair (i, i+hd)
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer POS { int pos[]; };
+layout(binding = 2) writeonly buffer OUT { float o[]; };
+layout(push_constant) uniform PC {
+    uint batch; uint seq; uint hd; uint inverse; float base; uint pad;
+} pc;
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;
+    uint total = pc.batch * pc.seq * pc.hd;
+    if(i >= total) return;
+    uint hi = i % pc.hd;
+    uint t = (i / pc.hd) % pc.seq;
+    uint b = i / (pc.hd * pc.seq);
+    float inv = 1.0 / pow(pc.base, float(hi) / float(pc.hd));
+    float ang = float(pos[t]) * inv * (pc.inverse == 1u ? -1.0 : 1.0);
+    float c = cos(ang);
+    float s = sin(ang);
+    uint base_i = (b * pc.seq + t) * (2u * pc.hd);
+    float x1 = x[base_i + hi];
+    float x2 = x[base_i + hi + pc.hd];
+    o[base_i + hi] = x1 * c - x2 * s;
+    o[base_i + hi + pc.hd] = x2 * c + x1 * s;
+}

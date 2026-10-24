@@ -1,0 +1,25 @@
+#version 450
+// gradient of topkSparseWeights: for selected j:
+//   gp[r,gj] += (go[r,gj] - dot) / srow[r],   dot = sum_l go[r,gl]*sel[r,l]
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer SEL { float sel[]; };
+layout(binding = 1) readonly buffer GO { float go[]; };
+layout(binding = 2) readonly buffer IDX { uint idx[]; };
+layout(binding = 3) readonly buffer SROW { float srow[]; };
+layout(binding = 4) buffer GPROBS { float gp[]; };
+layout(push_constant) uniform PC { uint rows; uint g; uint k; } pc;
+
+void main(){
+    uint r = gl_GlobalInvocationID.x;
+    if(r >= pc.rows) return;
+    float dot = 0.0;
+    for(uint j=0;j<pc.k;j++){
+        uint c = idx[r*pc.k+j];
+        dot += sel[r*pc.g+c] * go[r*pc.g+c];
+    }
+    float inv = 1.0 / srow[r];
+    for(uint j=0;j<pc.k;j++){
+        uint c = idx[r*pc.k+j];
+        gp[r*pc.g+c] += (go[r*pc.g+c] - dot) * inv;
+    }
+}
