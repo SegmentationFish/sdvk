@@ -90,13 +90,20 @@ sdvk = 自研纯 Vulkan compute 的 SDXL 文生图引擎（C++/GLSL，无第三�
 - **CFG 机制**：`resv = epsU + cfg·(epsC − epsU)`；词从负向挪到正向 = 差向量贡献符号翻转。
 - **GGUF conv 形状**：存 2D 压缩 dims，真实形状在 `comfy.gguf.orig_shape.<name>`（rows=u64s[0]，cols=其余乘积）；`ggdims()` 优先读它。
 - **OFCL latent**：magic "OFCL" + `3×u32 {4,H,W}` + fp32（采样器空间，解码时 `/0.13025`）。旧版本写过 `{4,h,h}` 的坏头，文件可能比头声明大——以文件大小交叉验证。
-- **VAE 解码显存**：`vStepMB = min(600 + H*W*2600/4096, 2400)`，`--vstep-mb` 覆盖；`vaeResnet` 槽位复用 + `compact()` 把活跃张量压到基址 0（必须是**录制进命令流**的拷贝，见 bug #7）。
+- **VAE 解码显存**：自动 `vStepMB = max(--vstep-mb, 400 + H*W*290/1024 MB)`（封顶 4000；96×128 → 3880MB）；UNet step arena 由启动时的 plan walk 自动定容（峰值×1.05+48MB，`--step-mb` 为下限，`OFC_NO_AUTOSIZE=1` 关闭）。`vaeResnet` 槽位复用 + `compact()` 把活跃张量压到基址 0（必须是**录制进命令流**的拷贝，且 bounce 的两段 copy 之间要 transfer→transfer 屏障）。
 - **引擎命令流**：dispatch/拷贝全录进 `stepCmd_`，`endStep()` 才提交；`inStep_` 期间严禁另开 command buffer 并 `vkQueueWaitIdle`。
 - **内核**：`gemm_nt_q8.comp`（16×16 wg，BM=BN=64，BK=16，TM=TN=4 寄存器块，deqB 内联反量化：uint32 打包 int8 + fp32 scale 每 32 元素）；conv 走行分块 im2col + gemmNnQ8（kColFloats=12M）；VAE resnet 槽位复用。
 - **错误码**：VK -1 = host OOM（RAM 不足）；VK -2 = device OOM。arena OOM 会打印缺口 MB。
 - **配置**：CLI 默认 `steps=20, cfg=7.5, size=512`；模型路径无默认值，必须 `-m` 或显式组件路径。
 - **repo**：`src/Modules/GPU/`（vk_engine + shaders/*.comp）、`src/Modules/Diffusion/`、`src/Modules/Server/`、`webui/`、`tools/`；`.clang-format`（Google 基 + ColumnLimit 120）。
 
-## 7. 安全备注
+## 7. 产品路线（2026-10-31，与用户确认的方向）
+
+- **NodesVkimagine（UI）**：ComfyUI 前端已提取 → `D:/tmp/comfyui/web/comfyui_frontend_package/static`（wheel `comfyui-frontend-package==1.57.6`，98MB，index.html+assets；未改其源码，GPL-3.0 与本仓库兼容，分发时保留其 LICENSE/署名）。前端依赖端点：`/object_info`、`/prompt`、`/view`、`/ws`、`/system_stats`（另有 /queue、/history、/interrupt 等）。下一步：在 `server.cpp` 实现这组协议 + 图执行器，最小节点集 `CheckpointLoaderSimple / CLIPTextEncode / KSampler / VAEDecode / SaveImage` → `run()`；之后可做 desktop 包装（Tauri/WebView2，内存与浏览器标签页相当，不省）。
+- **兼容性**：下一步做 **SD1.5** 适配（单 CLIP-L、无 CLIP-G、VAE scale 0.18215、调度差异）+ ModelSet 架构识别/适配器接口。FLUX/SD3/视频模型是换引擎的量级，且 6GB 显存放不下量化权重（FLUX Q4 仍 >7GB）——需换卡后再启动。
+- **提速**：少步蒸馏是正解（LCM/Lightning/Turbo，4–8 步、cfg 1–2）→ 单图约 10–20s（当前 30 步 × 4.9s ≈ 147s）；引擎侧只需加 LCM 调度 + cfg≤1 跳过 uncond pass。需要权重方案：LoRA（需加权重合并）或 turbo GGUF（需找/量化）——待用户定。
+- 辅助优化余量：gemm_nt_q8 约占 52%（已试 BN=128 负优化回退；下一步 QKV 合一/向量化加载 ~1.3×）、注意力融合 ~3–5%、copy_nd/ew2 再融合。
+
+## 8. 安全备注
 
 - 用户曾发过一个 GitHub PAT 用于建仓推送，**已建议用后撤销**；remote URL 中 token 已擦除（`https://github.com/SegmentationFish/sdvk.git`）。今后不索取凭据、不把凭据写入任何文件或提交。
