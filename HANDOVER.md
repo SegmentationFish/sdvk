@@ -61,6 +61,7 @@ sdvk = 自研纯 Vulkan compute 的 SDXL 文生图引擎（C++/GLSL，无第三�
 12. 调试开关：`OFC_VAE_TRACE=1`（阶段 dump，仅小图）、`OFC_VAE_TRACE_SUB=1` + `OFC_VAE_TRACE_RESNET=<子串>`（指定 resnet 子步）、`OFC_NO_COMPACT=1`。
 13. **`vaeDecode` 的 up_blocks 循环没有在第一个 resnet 后把 `ci = co`**：up2（512→256）与 up3（256→128）的 resnets.1/2 用块入口宽度去归一化/卷积实际已变窄的张量（GN 统计与 conv 读错通道），表现为从 `up_blocks.2.resnets.1` 开始幅度暴涨、最终颜色偏浓/发暗。up0/up1 因 ci==co 未暴露。修复后引擎解码 vs 修正后参考：**mean|diff| 0.46–0.50/255，max 1（纯 fp32 舍入）**，随机 latent 与 768×1024 实图均一致。
 **画质状态：VAE 解码器已与参考逐像素对齐（≤1/255）。** 产物：`output/amiya_v3_engine_fixed3.png`（引擎自解码，30 步 cfg3.0）。
+**自动内存（2026-10-31）**：① UNet step arena 启动时用 plan walk（纯 host 计数，复用 OFC_ARENA_PLAN 的计数器）按画布自动定容 = 峰值×1.05+48MB，`--step-mb` 只当下限（768×1024 自动算出 1899MB，替代此前 1900 差 20MB 就整轮失败的痛点）；② VAE 解码改为 `400 + H*W*290/1024 MB`（封顶 4000），96×128 自动 3880MB（旧公式 2400 上限会 OOM）；`OFC_NO_AUTOSIZE=1` 可关闭两者、完全按用户值。
 **路线说明**：运行时/引擎保持纯 Vulkan + C++（无 torch/diffusers 依赖）；`tools/ref*.py` 仅作离线数值验证参考，不进入产品链路。
 `tools/refunet_probe.py` 仍有脚本 bug（GEGLU 公式、linear 形状崩溃），UNet 逐层对拍待修。
 **画质说明**：8 步 vpred 只能出粗结构；验收用 28~30 步（cfg 3.0、trailing、负向提示）。

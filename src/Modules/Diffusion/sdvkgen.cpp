@@ -69,6 +69,7 @@ static uint32_t ceilDiv(uint64_t a, uint32_t b) { return (uint32_t)((a + b - 1) 
 // Step-by-step arena demand probe: OFC_ARENA_PLAN=1 prints the peak the UNet pass needs before
 // anything is allocated, so a canvas can be sized without trial-and-error OOMs.
 static bool gArenaPlan = false;
+static bool gAutoPlan = false;  // planning walk used to auto-size the arenas; it must not exit
 static uint64_t gPlanUsed = 0, gPlanCap = 1ull << 62, gPlanPeak = 0;
 static void planNote(uint64_t usedBytes) {
     if (usedBytes > gPlanPeak) gPlanPeak = usedBytes;
@@ -1340,9 +1341,11 @@ static BufRef unetForward(const BufRef& lat, const BufRef& temb, const BufRef& c
     x = conv3Raw(x, "out.2.weight", ch, 4, h, w);
     dbg("conv_out", x, 4, h, w);
     if (gArenaPlan) {
-        std::printf("plan: peak %.2f MB at canvas %ux%u\n", gPlanPeak / 1048576.0, w * 8, h * 8);
         gArenaPlan = false;
-        std::exit(0);
+        if (!gAutoPlan) {
+            std::printf("plan: peak %.2f MB at canvas %ux%u\n", gPlanPeak / 1048576.0, w * 8, h * 8);
+            std::exit(0);
+        }
     }
     return x;
 }
@@ -1445,7 +1448,13 @@ static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>
     loadVaeWeights(p);
     // vaeResnet slots rewind after each block, so the step arena holds one live resnet chain,
     // not the sum of all activations; cap the estimate so 96^2 stays under the 6 GiB ceiling
-    uint64_t vStepMB = p.vStepMb ? p.vStepMb : std::min<uint64_t>(600 + (uint64_t)H * Wd * 2600 / 4096, 2400);
+    // Measured need: ~2.65 GB at a 96x96 latent, ~3.25 GB at 96x128 (the old 2600/4096 slope
+    // plus a 2400 cap was short on non-square canvases). Scale by latent area with margin and
+    // keep an explicit --vstep-mb as the floor; OFC_NO_AUTOSIZE restores the caller's value.
+    uint64_t autoVStep = 400 + (uint64_t)H * Wd * 290 / 1024;
+    if (autoVStep > 4000) autoVStep = 4000;
+    if (std::getenv("OFC_NO_AUTOSIZE")) autoVStep = 0;
+    uint64_t vStepMB = std::max<uint64_t>(p.vStepMb, autoVStep);
     G.eng.initArenas(vStepMB << 20, 220ull << 20);
     gResizeScratch(220ull << 20);
     gCol = G.scratchArena.alloc(kColFloats * 4);
@@ -2532,8 +2541,28 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         G.paramBytes = unetParamBytes(p);
         G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
         loadUnet(p);
+        uint32_t Lw = width / 8, Lh = height / 8;
         uint32_t stepMB = p.stepMb ? p.stepMb : (width >= 768 || height >= 768 ? 1500u : 900u);
         uint32_t scratchMB = p.scratchMb ? p.scratchMb : (width >= 768 || height >= 768 ? 900u : 420u);
+        // Auto-size the activation pool from a stubbed allocation walk of the UNet (the counter
+        // OFC_ARENA_PLAN prints). A hard-coded guess was 20 MB short at 768x1024+zsnr once and
+        // killed a 30-step run; the walk costs a few ms and adapts to any canvas. The user's
+        // --step-mb stays a floor; OFC_NO_AUTOSIZE=1 turns the walk off.
+        uint32_t autoStepMB = 0;
+        if (!std::getenv("OFC_NO_AUTOSIZE")) {
+            gAutoPlan = true;
+            gArenaPlan = true;
+            planReset();
+            {
+                BufRef none;
+                BufRef temb = buildTemb(none, none, none);
+                (void)temb;
+                unetForward(none, temb, none, Lh, Lw);
+            }
+            gAutoPlan = false;
+            autoStepMB = (uint32_t)((gPlanPeak + (1ull << 20) - 1) >> 20) * 105 / 100 + 48;
+            if (autoStepMB > stepMB) stepMB = autoStepMB;
+        }
         // The driver pads each allocation and keeps the old one alive until its replacement is
         // bound, so a right-sized arena still loses to its predecessor. Give the activation pools
         // back before taking the new ones.
@@ -2542,7 +2571,8 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         gResizeScratch((uint64_t)scratchMB << 20);
         gCol = G.scratchArena.alloc(kColFloats * 4);
         gSCap = 0;
-        std::printf("arenas: step %u MB scratch %u MB\n", stepMB, scratchMB);
+        std::printf("arenas: step %u MB%s scratch %u MB\n", stepMB, autoStepMB ? " (auto-sized)" : "",
+                    scratchMB);
         if (const char* env = std::getenv("OFC_ARENA_PLAN")) {
             if (env[0] && env[0] != '0') {
                 gArenaPlan = true;
@@ -2552,7 +2582,6 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         }
         res.unetMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tU0).count();
 
-        uint32_t Lw = width / 8, Lh = height / 8;
         uint64_t latFloats = (uint64_t)4 * Lh * Lw;
         static std::unordered_map<std::string, BufRef> sCache;
         sCache.clear();
