@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Adafactor factored second-moment statistics.
 // mode 0: one workgroup per ROW r: sum_j g[r,j]^2 -> R[r] = b2*R[r] + (1-b2)*(sum/cols)

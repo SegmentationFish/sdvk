@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // gradient of topkSparseWeights: for selected j:
 //   gp[r,gj] += (go[r,gj] - dot) / srow[r],   dot = sum_l go[r,gl]*sel[r,l]

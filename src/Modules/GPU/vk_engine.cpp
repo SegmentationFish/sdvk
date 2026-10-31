@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 #include "vk_engine.hpp"
 
@@ -1233,6 +1233,47 @@ void Engine::invalidateReplay() {
         cachedCmd_ = nullptr;
     }
     replayMode_ = false;
+}
+
+std::string Engine::deviceReport() const {
+    VkPhysicalDeviceProperties p{};
+    vkGetPhysicalDeviceProperties(phys_, &p);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+    char line[512];
+    std::string s;
+    std::snprintf(line, sizeof line, "device: %s\n", p.deviceName);
+    s += line;
+    std::snprintf(line, sizeof line, "api: %u.%u.%u  driver: %u.%u.%u  vendor: 0x%04x device: 0x%04x\n",
+                  VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion),
+                  VK_VERSION_MAJOR(p.driverVersion), VK_VERSION_MINOR(p.driverVersion),
+                  VK_VERSION_PATCH(p.driverVersion), p.vendorID, p.deviceID);
+    s += line;
+    std::snprintf(line, sizeof line, "shared memory: %s, unified memory: %s\n",
+                  p.limits.maxComputeSharedMemorySize >= 32 * 1024 ? "ok" : "small",
+                  (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? "yes" : "no");
+    s += line;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+        const VkMemoryHeap& h = mp.memoryHeaps[i];
+        std::string flags;
+        if (h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) flags += "device-local";
+        if (h.flags & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT) flags += flags.empty() ? "multi-instance" : ",multi-instance";
+        std::snprintf(line, sizeof line, "heap %u: %.0f MB%s%s%s\n", i, h.size / 1048576.0,
+                      flags.empty() ? "" : " (", flags.c_str(), flags.empty() ? "" : ")");
+        s += line;
+    }
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        const VkMemoryType& t = mp.memoryTypes[i];
+        std::string f;
+        if (t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) f += "device-local ";
+        if (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) f += "host-visible ";
+        if (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) f += "coherent ";
+        std::snprintf(line, sizeof line, "memtype %u: heap %u %s\n", i, t.heapIndex, f.c_str());
+        s += line;
+    }
+    std::snprintf(line, sizeof line, "device-local budget: %.0f MB\n", deviceLocalMb_);
+    s += line;
+    return s;
 }
 
 }  // namespace gpu

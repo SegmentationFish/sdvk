@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // 3x3 stride1 pad1 im2col (NCHW, batch=1): col[k*P + p], k = c*9 + ky*3 + kx
 layout(local_size_x = 256) in;

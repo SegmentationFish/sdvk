@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // rowLoss[r] = -log softmax(logits[r])[target[r]] ; one workgroup per row
 // mask[r]==0 rows contribute zero loss (used for SFT answer-only masking)

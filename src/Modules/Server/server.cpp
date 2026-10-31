@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // sdvk-server: a tiny blocking HTTP/1.1 front end over the sdvk core.
 // No third-party dependencies, no TLS, no thread pool. One request is served at a time,

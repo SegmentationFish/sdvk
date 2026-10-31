@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // 2D transpose: in[rows,cols] -> out[cols,rows] (f32, row-major). Backs the MoE dense path
 // weight column view (sparse[rows,G] -> wT[G,rows], one contiguous row per expert).

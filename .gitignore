@@ -30,3 +30,6 @@ dbg_*.f32
 
 # agent scratch
 .workbuddy/
+
+# internal handover notes
+HANDOVER.md

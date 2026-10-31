@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Vulkan compute engine for ofc training: device, arenas, kernel dispatch.
 #pragma once
@@ -162,6 +162,8 @@ public:
     const std::string& deviceName() const { return deviceName_; }
     uint64_t deviceLocalMb() const { return deviceLocalMb_; }
     uint64_t lastStepMs() const { return lastStepMs_; }
+    // Human-readable device/heap/API/driver report (one line per fact), used by --check.
+    std::string deviceReport() const;
 
 private:
     Kernel& kernel(const char* name);

@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // C[M,N] = A[M,K] * B[K,N] ; A = Q8_0 payload (uint32 packed int8, 4/word) + fp32 scales
 // (one per 32 elements), B fp32 row-major. Batched on z.

@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // grid = g*d (b2 column sums) + g*rows (w row dot products)
 //   idx < g*d:    db2[g,j] += sum_r dY[g,r,j]

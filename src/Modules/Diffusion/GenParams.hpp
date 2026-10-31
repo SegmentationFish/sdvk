@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Generation parameters: one struct shared by the CLI, the HTTP bridge and the web UI.
 // Every caller builds a GenParams and hands it to Sdvk run/runner(); nothing here touches Vulkan.

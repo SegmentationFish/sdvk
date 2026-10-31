@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // AdamW update with device-side hyperparams (HP) and global grad-norm clip factor (clip[0]).
 // HP layout: [0]=lr [1]=b1 [2]=b2 [3]=eps [4]=wd [5]=invBc1 [6]=invBc2

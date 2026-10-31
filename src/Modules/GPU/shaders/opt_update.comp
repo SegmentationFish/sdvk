@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Batched optimizer update: Adafactor (factored) and AdamW in one dispatch.
 // Workgroups are laid out by per-parameter wgStart (ceil(n/256) each); binary search

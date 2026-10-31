@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // GGUF reader (format: magic GGUF / version / counts / KV metadata / tensor table / aligned data section)
 #include "Gguf.hpp"

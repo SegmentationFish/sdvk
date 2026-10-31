@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Command line front end. Everything here maps argv onto GenParams and prints human output;
 // the image itself is produced by sdxl::run(), the same call the HTTP bridge makes.
@@ -76,6 +76,8 @@ static void usage() {
         "  --param-mb <n>          UNet weight arena in MB (default: from the file size)\n"
         "  --step-mb/--scratch-mb/--vstep-mb <n>   arena sizes in MB\n"
         "  -v, --verbose           print timing detail\n"
+        "  --check                 report device, heaps and canvas suggestions\n"
+        "  --bench                 --check plus bandwidth and GEMM benchmarks\n"
         "  --textcheck/--clipdbg/--unetdbg/--dbgstage/--probe/--probe-x/--probe-t   debug hooks\n"
         "  -h, --help              this text\n"
         "  --version               version\n"
@@ -95,6 +97,7 @@ static bool isFlag(const std::string& a) { return !a.empty() && a[0] == '-'; }
 struct Parsed {
     GenParams p;
     bool help = false, version = false, listModels = false;
+    bool check = false, bench = false;
     std::string listDir;
     std::string decodeIn;
     int verbose = 0;
@@ -123,6 +126,11 @@ static Parsed parseArgs(int argc, char** argv) {
             o.help = true;
         } else if (a == "--version" || a == "-V") {
             o.version = true;
+        } else if (a == "--check") {
+            o.check = true;
+        } else if (a == "--bench") {
+            o.check = true;
+            o.bench = true;
         } else if (a == "-m" || a == "--model-dir") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.modelDir = val();
@@ -351,6 +359,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     GenParams& p = o.p;
+
+    if (o.check) {
+        std::printf("%s", deviceCheck(p.spvDir.empty() ? "shaders" : p.spvDir, o.bench).c_str());
+        return 0;
+    }
 
     if (o.listModels) {
         std::string dir = o.listDir.empty() ? p.models.modelDir : o.listDir;

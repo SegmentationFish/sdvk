@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // rotary position embedding on [batch, seq, dh] (contiguous, last dim = head dim)
 // one invocation per (b,t,hd): handles the pair (i, i+hd)

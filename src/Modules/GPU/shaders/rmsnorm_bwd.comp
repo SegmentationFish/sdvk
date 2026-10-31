@@ -1,6 +1,6 @@
 #version 450
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // rowwise RMSNorm backward.
 // gx += ir*(go*w - (dot/d)*x*ir*ir),  dot = sum_j go_j*w_j*x_j

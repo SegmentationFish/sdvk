@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Runner API: one image in, one image out, plus a model handle that survives between jobs.
 // Both entry points are synchronous and own their GPU work; neither parses a command line.
@@ -72,6 +72,10 @@ RunResult decodeLatentFile(EvalModel& m, const GenParams& p, const std::string& 
 // Standalone PNG writer (also used by the CLI's --decode path and by tests).
 bool writePngFile(const std::string& path, const std::vector<float>& rgbChw, uint32_t w, uint32_t h, int compress,
                   const std::string& info);
+
+// Device diagnostics for the CLI: Vulkan device/heap report plus canvas suggestions; with
+// bench=true it also measures upload/download bandwidth and Q8/fp32 GEMM throughput.
+std::string deviceCheck(const std::string& spvDir, bool bench);
 
 }  // namespace sdxl
 }  // namespace ofc

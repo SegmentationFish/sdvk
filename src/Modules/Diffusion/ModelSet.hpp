@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // Model directory resolution: scan a folder, classify the files, fill in what the user left
 // blank, and refuse combinations that cannot work. Handles diffusers component folders,

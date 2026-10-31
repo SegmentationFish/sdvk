@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 Segmented Fish
+// Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 // SDXL (NoobAI-XL vPred-1.0, Q8_0 GGUF) text-to-image on the ofc Vulkan engine.
 // fp32 activations; Q8_0 weights stay as int8 payload + fp32 scale in VRAM and are
@@ -2898,6 +2898,99 @@ RunResult decodeLatentFile(EvalModel& m, const GenParams& in, const std::string&
         res.totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
         return res;
     }
+}
+
+std::string deviceCheck(const std::string& spvDir, bool bench) {
+    std::string err;
+    if (!ensureDevice(spvDir, err)) {
+        return "device init failed: " + err + "\n(pass --spv <folder with compiled *.spv shaders>)\n";
+    }
+    std::string out = G.eng.deviceReport();
+    const uint64_t mb = G.eng.deviceLocalMb();
+    const uint64_t usable = mb > 1500 ? mb - 1500 : mb;  // the desktop holds part of the heap
+    char mline[128];
+    std::snprintf(mline, sizeof mline, "  estimate: %.0f MB usable after the desktop\n", (double)usable);
+    out += "\ncanvas suggestions:\n";
+    out += mline;
+    out += "  SDXL: 768x768, 28 steps, --cfg 3.0 --spacing trailing --vpred, real negative prompt\n";
+    if (usable < 5500) {
+        out += "  ~6 GB class: close browser/GPU apps while generating; 832x1216 needs --scratch-mb <= 700\n";
+    } else if (usable < 9500) {
+        out += "  ~6-8 GB class: 768x768 solid; 832x1216 tight (close browser tabs, --scratch-mb <= 700)\n";
+    } else {
+        out += "  10 GB+: FLUX-class canvases fit in memory, but that architecture is not implemented yet\n";
+    }
+    out += "  arenas auto-size per canvas (--step-mb/--vstep-mb act as floors); OFC_KERNEL_PROFILE=1 prints kernel times\n";
+    if (!bench) return out;
+
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto msOf = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    // Persistent bench buffers live in the scratch arena: beginStep() resets the step arena.
+    G.eng.initArenas(64ull << 20, 384ull << 20);
+    auto salloc = [](uint64_t bytes) { return G.eng.scratchArena().alloc((bytes + 255) & ~255ull); };
+    char line[256];
+    out += "\nbench:\n";
+
+    const uint64_t bwBytes = 64ull << 20;
+    std::vector<float> host(bwBytes / 4);
+    for (size_t i = 0; i < host.size(); i++) host[i] = (float)(i % 97) * 0.01f;
+    BufRef buf = salloc(bwBytes);
+    G.eng.uploadNow(buf, host.data(), bwBytes);  // warm-up
+    auto t0 = now();
+    G.eng.uploadNow(buf, host.data(), bwBytes);
+    auto t1 = now();
+    std::snprintf(line, sizeof line, "  upload %.0f MB: %.0f MB/s\n", bwBytes / 1048576.0,
+                  bwBytes / 1048576.0 / (msOf(t0, t1) / 1000.0));
+    out += line;
+    std::vector<float> back(host.size());
+    t0 = now();
+    G.eng.downloadNow(buf, back.data(), bwBytes);
+    t1 = now();
+    std::snprintf(line, sizeof line, "  download %.0f MB: %.0f MB/s\n", bwBytes / 1048576.0,
+                  bwBytes / 1048576.0 / (msOf(t0, t1) / 1000.0));
+    out += line;
+
+    const uint32_t M = 1024, N = 1024, K = 1024;
+    std::vector<float> a((size_t)M * K);
+    for (size_t i = 0; i < a.size(); i++) a[i] = (float)((i * 37) % 61) / 61.0f;
+    std::vector<int8_t> q((size_t)N * K);
+    std::vector<float> qs((size_t)N * K / 32);
+    for (size_t i = 0; i < q.size(); i++) q[i] = (int8_t)((int)((i * 13) % 255) - 127);
+    for (size_t i = 0; i < qs.size(); i++) qs[i] = 0.003f + 0.0001f * (float)(i % 7);
+    BufRef bA = salloc((uint64_t)M * K * 4), bB = salloc((uint64_t)N * K * 4);
+    BufRef bC = salloc((uint64_t)M * N * 4);
+    BufRef bQ = salloc((uint64_t)N * K), bS = salloc((uint64_t)N * K / 32 * 4);
+    G.eng.uploadNow(bA, a.data(), a.size() * 4);
+    G.eng.uploadNow(bB, a.data(), a.size() * 4);
+    G.eng.uploadNow(bQ, q.data(), q.size());
+    G.eng.uploadNow(bS, qs.data(), qs.size() * 4);
+    const int iters = 5;
+    auto benchGemm = [&](bool q8) {
+        G.eng.beginStep();
+        for (int i = 0; i < iters; i++) {
+            if (q8) gemmNtQ8(bA, bQ, bC, bS, M, N, K);
+            else gemmNt(bA, bB, bC, M, N, K);
+        }
+        auto s0 = now();
+        G.eng.endStep();
+        G.eng.waitStep();
+        return msOf(s0, now());
+    };
+    benchGemm(true);  // pipeline warm-up
+    const double q8ms = benchGemm(true);
+    const double f32ms = benchGemm(false);
+    const double flops = 2.0 * (double)M * N * K * iters;
+    std::snprintf(line, sizeof line, "  q8 gemm %ux%ux%u x%d: %.1f ms  %.0f GFLOPS\n", M, N, K, iters, q8ms,
+                  flops / (q8ms / 1000.0) / 1e9);
+    out += line;
+    std::snprintf(line, sizeof line, "  fp32 gemm %ux%ux%u x%d: %.1f ms  %.0f GFLOPS\n", M, N, K, iters, f32ms,
+                  flops / (f32ms / 1000.0) / 1e9);
+    out += line;
+    const double q8g = flops / (q8ms / 1000.0) / 1e9;
+    if (q8g < 600) out += "  note: Q8 GEMM is far below this card's peak; check the driver state and OFC_KERNEL_PROFILE\n";
+    return out;
 }
 
 }  // namespace sdxl
