@@ -1,19 +1,30 @@
 # sdvk
 
 **SDXL text-to-image on a self-built Vulkan compute engine.** No deep-learning framework, no external runtime dependencies:
-one `sdvkgen.exe` + 66 GLSL compute shaders + [volk](src/Modules/GPU/volk) (single-file Vulkan loader) run the full SDXL pipeline —
-dual CLIP text encoding and UNet denoising — directly on the GPU.
+one CLI binary + an optional HTTP server + 66 GLSL compute shaders + [volk](src/Modules/GPU/volk) (single-file Vulkan loader)
+run the whole SDXL pipeline — dual CLIP text encoding, UNet denoising and VAE decoding — directly on the GPU.
 
 > Provenance: the inference engine is built from scratch in this project. Model weights come from third parties (see [Weights](#weights));
 > this project does not include, train, or redistribute any weights.
 
+## License
+
+sdvk is free software, released under the **GNU General Public License v3.0** (see [LICENSE](LICENSE)).
+
+That means: use it for anything, study and modify it, redistribute it — but if you ship a modified
+version, you must ship the source under the same license. There is no warranty.
+`src/Modules/GPU/volk` is [volk](https://github.com/zeux/volk) by Arseny Kapoulkine and stays under its own
+MIT license; that notice is kept in `volk.h`.
+
 ## Features
 
 - **Pure Vulkan compute**: no matrix libraries, no model framework; push descriptors, dependency-tracked minimal barriers, cached command-graph replay
-- **Q8_0 GGUF UNet**: the SDXL UNet loads as Q8_0-quantized GGUF, dequantized inside the GEMM shaders (34-byte / 32-weight block layout)
-- **Dual CLIP text encoders**: CLIP-L + OpenCLIP bigG with SDXL-faithful token truncation / BOS / EOS semantics (pooled outputs included)
-- **Sampling recipes**: v-prediction and eps prediction, CFG, DDIM trailing spacing, CFG rescale (mimic scale), dynamic thresholding
-- **Memory planning**: param / step / scratch arenas sized globally, targeting 8 GB consumer cards (6.0 GiB device-local usable in practice)
+- **Bring your own weights**: a model *folder* is scanned and classified by header keys, so a diffusers tree, a single-file checkpoint and a flat export all work
+- **Free VAE**: any SDXL VAE (fp16 / bf16 / fp32 safetensors) can be dropped in independently of the UNet
+- **One command end to end**: prompt in, PNG out (encoding → sampling → decoding → file), no intermediate tooling
+- **Zero-dependency PNG**: hand-written deflate (fixed-Huffman LZ77), CRC32 and a `tEXt` block that embeds the generation parameters
+- **Sampling recipes**: v-prediction and eps prediction, CFG, trailing spacing, CFG rescale (mimic scale), dynamic thresholding, Euler / Euler-ancestral
+- **HTTP API + web UI**: `sdvk-server` exposes the same core, `webui/` is a dependency-free browser front end
 - **Per-kernel GPU profiler**: `OFC_KERNEL_PROFILE=1` prints a GPU-millisecond table for every compute kernel
 
 ## Measured performance (RX 580 8 GB)
@@ -31,33 +42,116 @@ Requirements: CMake ≥ 3.20, a C++20 compiler, and the [Vulkan SDK](https://vul
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target sdvkgen
+cmake --build build
 ```
+
+Targets:
+
+| Target | What it is |
+|---|---|
+| `sdvkcore` | static library: the SDXL pipeline with no CLI and no sockets |
+| `sdvkgen` | command line tool |
+| `sdvk-server` | HTTP API + static file host for `webui/` |
+
+Turn either front end off with `-DSDVK_BUILD_CLI=OFF` / `-DSDVK_BUILD_SERVER=OFF`.
 
 ## Usage
 
-Four weight files are required (paths overridable via CLI flags):
-
-| File | Default path | Notes |
-|---|---|---|
-| UNet GGUF (Q8_0) | `noobaiXLNAIXL_vPred10Version-Q8_0.gguf` | SDXL UNet with ComfyUI key names |
-| CLIP-L | `text_encoder__model.safetensors` | diffusers key names |
-| OpenCLIP bigG | `text_encoder_2__model.safetensors` | native OpenCLIP key names |
-| VAE | `vae.safetensors` | ldm key names (fp16 / fp32 / bf16 all readable) |
-
-Recommended recipe for a v-pred checkpoint at 768:
+Point it at a model folder and nothing else:
 
 ```bash
-build/sdvkgen.exe "your prompt, masterpiece" \
+build/sdvkgen.exe -m /path/to/model "a lighthouse at dusk, oil painting"
+```
+
+A usable folder holds, in any combination:
+
+```
+model/
+  noobaiXLNAIXL_vPred10Version-Q8_0.gguf    UNet (GGUF Q8_0)            <- preferred
+  unet_fp16.safetensors                     UNet (diffusers or flat)   <- fallback
+  text_encoder/model.safetensors            CLIP-L
+  text_encoder_2/model.safetensors          OpenCLIP bigG
+  vae.safetensors                           VAE (fp16 works)
+  tokenizer/{vocab.json,merges.txt}         tokenizer 1
+  tokenizer_2/{...}                         tokenizer 2
+```
+
+`--models <dir>` prints exactly how a folder was classified before anything loads:
+
+```
+$ build/sdvkgen.exe --models -m model
+  unet:    model/noobaiXLNAIXL_vPred10Version-Q8_0.gguf
+  clip-l:  model/text_encoder/model.safetensors
+  clip-g:  model/text_encoder_2/model.safetensors
+  vae:     model/vae.safetensors
+```
+
+Override any single component when the layout is unusual: `--unet`, `--te1`, `--te2`, `--vae`, `--tok`, `--tok2`.
+A full single-file checkpoint (`.safetensors` holding `model.diffusion_model.*`, `conditioner.embedders.*`,
+`first_stage_model.*`) can supply the UNet, both text encoders and the VAE at once.
+
+### Common flags
+
+| Flag | Meaning |
+|---|---|
+| `--neg <text>` | negative prompt |
+| `--steps <n>` / `--cfg <f>` | sampler length and guidance |
+| `--size <n>` / `--width` `--height` | square edge or explicit canvas, multiples of 8 |
+| `--sampler euler\|euler_a` | sampler |
+| `--vpred` / `--zsnr` / `--dynthresh` / `--rescale <f>` | schedule and guidance options |
+| `--seed <n>` | noise seed |
+| `--init <img.png> --denoise <f>` | img2img |
+| `--out <file>` | `.png` (default) or `.ppm` |
+| `--no-vae` | stop after sampling, keep the latent only |
+| `--decode <latent.bin>` | VAE-only: decode a saved latent to an image |
+| `-v` | per-step timing |
+
+Recommended recipe for a v-pred checkpoint at 768 on an 8 GB card:
+
+```bash
+build/sdvkgen.exe -m model "your prompt, masterpiece" \
     --vpred --spacing trailing --steps 28 --cfg 3.0 --size 768 \
-    --no-vae --step-mb 1500 --scratch-mb 500 \
     --neg "nsfw, worst quality, old, early, low quality, lowres"
 ```
 
-- `--no-vae` skips the in-engine VAE decode and writes `sdvkgen_latent.bin` (recommended on 8 GB cards; the in-engine 768 decode currently exceeds the VRAM budget and is being optimized)
-- decode the latent with any SDXL VAE script (e.g. a torch implementation; mind the ×0.13025 scaling factor)
-- `OFC_KERNEL_PROFILE=1 ./sdvkgen.exe ...` prints a per-kernel GPU-time table (stderr)
-- `--textcheck` dumps text-encoder intermediates for parity checks
+`OFC_KERNEL_PROFILE=1` prints a per-kernel GPU-time table.
+
+## HTTP API
+
+```bash
+build/sdvk-server.exe -m model --port 7500
+```
+
+Then open `http://127.0.0.1:7500/`. The server binds loopback only and serves one request at a time —
+a single GPU can only run one job anyway.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | the web UI from `webui/` |
+| `GET /api/info` | version, device, loaded model |
+| `GET /api/models?dir=<folder>` | classification of a model folder |
+| `POST /api/generate` | one image per call (blocking) |
+| `POST /api/generate?async=1` | returns a job id immediately; poll `/api/job` |
+| `POST /api/cancel?id=<id>` | stop an async job at the next sampler step |
+| `GET /api/job?id=<id>` | progress, step, elapsed, output path |
+| `GET /api/image?path=<file.png>` | fetch a generated image from the output folder |
+
+```bash
+curl -s -X POST http://127.0.0.1:7500/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","prompt":"a lighthouse at dusk","width":768,"height":768,
+       "steps":20,"cfg":3,"vpred":true,"spacing":"trailing"}'
+```
+
+Response: `{"ok":true,"outPath":"output/sdvk_xxx.png","seed":1234,"totalMs":...,"width":768,"height":768}`.
+
+The model stays resident between calls, so only the first request pays the load cost. Every field accepted by the
+JSON body maps to a `GenParams` member; unknown keys are ignored, which keeps the API forward compatible.
+
+## Web UI
+
+`webui/` holds three static files (`index.html`, `style.css`, `app.js`) with no build step and no framework.
+`sdvk-server` serves them from the working directory, or from `--web <dir>`.
 
 ## Weights
 
@@ -72,16 +166,57 @@ The weight set used by this project (not bundled; obtain them yourself):
 
 ```
 src/Modules/
+  Diffusion/  sdvkgen.cpp (pipeline), Eval.hpp (library API), GenParams, ModelSet (folder classification),
+              main.cpp (CLI), Safetensors reader
+  Server/     sdvk-server: HTTP + JSON, no dependencies
   GPU/        Vulkan engine (arenas, barrier tracking, kernel table, profiler) + 66 compute shaders + volk
-  Diffusion/  sdvkgen: the SDXL pipeline (CLIP encoding / UNet denoise / VAE decode), safetensors reader
   Model/      GGUF reader (Q8_0)
   Core/       tensor buffer helpers
+webui/        static web front end
 ```
 
 ## Roadmap
 
-- [ ] Direct PNG output (built-in, zero-dependency)
+- [x] Direct PNG output (built-in, zero-dependency)
+- [x] `--decode` mode: load the VAE only and decode a latent
+- [x] Free model / VAE selection
+- [x] HTTP API and web UI
 - [ ] In-engine VAE decode at 768 (step-arena budget / chunked decode)
-- [ ] `--decode` mode: load the VAE only and decode a latent
 - [ ] `--ckpt`: single-file fp checkpoint loading (on-the-fly rank-2 quantization to Q8_0)
-- [ ] Hotspot optimization (driven by the per-kernel profiler: GEMM tiles / fusion / barrier overhead)
+- [ ] Hotspot optimization driven by the per-kernel profiler (GEMM tiles / fusion / barrier overhead)
+
+## Tools
+
+`tools/costmodel.py` is a GPU-free cost model: it parses the GGUF header, recovers the real conv
+shapes from `comfy.gguf.orig_shape.*` and ranks every node by estimated compute or bandwidth time.
+
+```bash
+python tools/costmodel.py model/noobaiXLNAIXL_vPred10Version-Q8_0.gguf --latent 96
+```
+
+```
+total           4172.4 GFLOP    19.76 GB
+bound         compute
+floor             0.76 s/pass  (rx 580 measured 14.1 s/pass)
+```
+
+That is the mathematical floor for one UNet pass; the gap to 14.1 s is where the optimization work is.
+
+`tools/smoke.sh` rebuilds both targets and exercises every path that does not need a GPU: the CLI
+help/version/usage routes, the cost model, and the HTTP endpoints including the path-traversal guard.
+
+
+## Weight licensing
+
+sdvk's own code is GPL-3.0-only, but that says nothing about the weights you generate with. The
+checkpoints the project targets carry their own terms — **NoobAI-XL is under the Fair AI Public
+License (faipl-1.0-sd)**, the SDXL VAE and the CLIP text encoders come from Stability AI's
+open weights, and any LoRA you load may differ again.
+
+Practical consequences:
+
+- The engine's GPL license does **not** grant rights to the weights or to images you produce with them.
+- Read the model card before commercial use; the Fair AI licenses restrict redistribution and require
+  you to pass the license on with the model.
+- The `tEXt` block frozen into every PNG names the checkpoint, so anyone can check which weights a
+  picture came from.

@@ -1,4 +1,9 @@
 /* This file is part of volk library; see volk.h for version/license details */
+/*
+ * Vendored third-party code: volk (https://github.com/zeux/volk), MIT licensed.
+ * This file is NOT covered by the GPL-3.0-only license of sdvk; the MIT notice is
+ * reproduced in volk.h and applies here unchanged.
+ */
 /* clang-format off */
 #include "volk.h"
 

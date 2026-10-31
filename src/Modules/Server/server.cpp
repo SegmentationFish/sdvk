@@ -1,0 +1,888 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
+// sdvk-server: a tiny blocking HTTP/1.1 front end over the sdvk core.
+// No third-party dependencies, no TLS, no thread pool. One request is served at a time,
+// which is what a single GPU can actually do anyway.
+//
+//   GET  /                 web UI (served from webui/)
+//   GET  /api/info         version, device, loaded model
+//   GET  /api/models       classify a model folder (?dir=...)
+//   POST /api/generate     run one job, returns JSON (or ?stream=1 for SSE progress)
+//   GET  /api/image?path=  fetch a generated PNG from the output folder
+//   GET  /api/job?id=      job status
+//   POST /api/cancel       cancel the running job at the next step boundary
+#include "Modules/Diffusion/Eval.hpp"
+#include "Modules/Diffusion/ModelSet.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+namespace fs = std::filesystem;
+using namespace ofc::sdxl;
+
+static const char* kVersion = "0.3.0";
+static const char* kLicense = "GPL-3.0-only";
+
+#ifdef _WIN32
+using Sock = SOCKET;
+static const Sock kBad = INVALID_SOCKET;
+static void closeSock(Sock s) {
+    // graceful close: without the shutdown the client can see the connection reset before the
+    // last bytes are drained, which drops the body on loopback
+    ::shutdown(s, SD_SEND);
+    closesocket(s);
+}
+#else
+using Sock = int;
+static const Sock kBad = -1;
+static void closeSock(Sock s) {
+    ::shutdown(s, SHUT_WR);
+    ::close(s);
+}
+#endif
+
+// ---------------------------------------------------------------- small helpers
+
+static std::string jsonEsc(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':
+                o += "\\\"";
+                break;
+            case '\\':
+                o += "\\\\";
+                break;
+            case '\n':
+                o += "\\n";
+                break;
+            case '\r':
+                o += "\\r";
+                break;
+            case '\t':
+                o += "\\t";
+                break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    o += buf;
+                } else {
+                    o += (char)c;
+                }
+        }
+    }
+    return o;
+}
+
+static std::string jstr(const std::string& s) { return "\"" + jsonEsc(s) + "\""; }
+
+static std::string jnum(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.6g", v);
+    return buf;
+}
+
+static std::string urlDecode(const std::string& s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int a = hex(s[i + 1]), b = hex(s[i + 2]);
+            if (a >= 0 && b >= 0) {
+                o += (char)(a * 16 + b);
+                i += 2;
+                continue;
+            }
+        }
+        o += s[i] == '+' ? ' ' : s[i];
+    }
+    return o;
+}
+
+static std::map<std::string, std::string> parseQuery(const std::string& q) {
+    std::map<std::string, std::string> m;
+    size_t i = 0;
+    while (i < q.size()) {
+        size_t eq = q.find('=', i);
+        size_t amp = q.find('&', i);
+        if (amp == std::string::npos) amp = q.size();
+        if (eq != std::string::npos && eq < amp) {
+            m[urlDecode(q.substr(i, eq - i))] = urlDecode(q.substr(eq + 1, amp - eq - 1));
+        } else {
+            m[urlDecode(q.substr(i, amp - i))] = "";
+        }
+        i = amp + 1;
+    }
+    return m;
+}
+
+// Minimal JSON reader: enough for flat objects with string / number / bool values.
+// A full parser would be nicer; this keeps the dependency list at zero.
+struct FlatJson {
+    std::map<std::string, std::string> s;
+    std::map<std::string, double> n;
+    std::map<std::string, bool> b;
+    std::map<std::string, bool> isStr;
+};
+
+static bool parseFlatJson(const std::string& t, FlatJson& out) {
+    size_t i = 0;
+    auto ws = [&] {
+        while (i < t.size() && (t[i] == ' ' || t[i] == '\n' || t[i] == '\r' || t[i] == '\t')) i++;
+    };
+    auto str = [&](std::string& s) -> bool {
+        if (i >= t.size() || t[i] != '"') return false;
+        i++;
+        s.clear();
+        while (i < t.size() && t[i] != '"') {
+            if (t[i] == '\\' && i + 1 < t.size()) {
+                char c = t[i + 1];
+                i += 2;
+                switch (c) {
+                    case 'n':
+                        s += '\n';
+                        break;
+                    case 't':
+                        s += '\t';
+                        break;
+                    case 'r':
+                        s += '\r';
+                        break;
+                    case 'u': {
+                        if (i + 4 > t.size()) return false;
+                        unsigned v = (unsigned)std::strtoul(t.substr(i, 4).c_str(), nullptr, 16);
+                        i += 4;
+                        // UTF-16 escapes: handle the BMP subset, surrogate pairs fall back to '?'
+                        if (v >= 0xD800 && v < 0xDC00 && i + 6 <= t.size() && t[i] == '\\' && t[i + 1] == 'u') {
+                            unsigned lo = (unsigned)std::strtoul(t.substr(i + 2, 4).c_str(), nullptr, 16);
+                            i += 6;
+                            v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                        }
+                        if (v < 0x80) {
+                            s += (char)v;
+                        } else if (v < 0x800) {
+                            s += (char)(0xC0 | (v >> 6));
+                            s += (char)(0x80 | (v & 0x3F));
+                        } else if (v < 0x10000) {
+                            s += (char)(0xE0 | (v >> 12));
+                            s += (char)(0x80 | ((v >> 6) & 0x3F));
+                            s += (char)(0x80 | (v & 0x3F));
+                        } else {
+                            s += (char)(0xF0 | (v >> 18));
+                            s += (char)(0x80 | ((v >> 12) & 0x3F));
+                            s += (char)(0x80 | ((v >> 6) & 0x3F));
+                            s += (char)(0x80 | (v & 0x3F));
+                        }
+                        break;
+                    }
+                    default:
+                        s += c;
+                }
+                continue;
+            }
+            s += t[i++];
+        }
+        if (i >= t.size()) return false;
+        i++;
+        return true;
+    };
+    ws();
+    if (i >= t.size() || t[i] != '{') return false;
+    i++;
+    while (i < t.size()) {
+        ws();
+        if (i < t.size() && t[i] == '}') {
+            i++;
+            break;
+        }
+        std::string key;
+        if (!str(key)) return false;
+        ws();
+        if (i >= t.size() || t[i] != ':') return false;
+        i++;
+        ws();
+        if (i < t.size() && t[i] == '"') {
+            std::string v;
+            if (!str(v)) return false;
+            out.s[key] = v;
+            out.isStr[key] = true;
+        } else if (i < t.size() && t[i] == '[') {
+            // arrays are not used by this API; skip the balanced region
+            int depth = 0;
+            while (i < t.size()) {
+                if (t[i] == '[') depth++;
+                if (t[i] == ']' && --depth == 0) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+        } else {
+            size_t st = i;
+            while (i < t.size() && t[i] != ',' && t[i] != '}') i++;
+            std::string v = t.substr(st, i - st);
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\n' || v.back() == '\r')) v.pop_back();
+            if (v == "true") {
+                out.b[key] = true;
+                out.n[key] = 1;
+            } else if (v == "false") {
+                out.b[key] = false;
+                out.n[key] = 0;
+            } else if (!v.empty() && v != "null") {
+                out.n[key] = std::atof(v.c_str());
+            }
+        }
+        ws();
+        if (i < t.size() && t[i] == ',') i++;
+    }
+    return true;
+}
+
+static std::string readFile(const std::string& p) {
+    std::FILE* f = std::fopen(p.c_str(), "rb");
+    if (!f) return "";
+    std::string s;
+    char buf[8192];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    std::fclose(f);
+    return s;
+}
+
+static std::string mimeOf(const std::string& p) {
+    std::string e = fs::path(p).extension().string();
+    std::transform(e.begin(), e.end(), e.begin(), ::tolower);
+    if (e == ".html" || e == ".htm") return "text/html; charset=utf-8";
+    if (e == ".js") return "text/javascript; charset=utf-8";
+    if (e == ".css") return "text/css; charset=utf-8";
+    if (e == ".json") return "application/json; charset=utf-8";
+    if (e == ".png") return "image/png";
+    if (e == ".svg") return "image/svg+xml";
+    if (e == ".ico") return "image/x-icon";
+    if (e == ".woff2") return "font/woff2";
+    return "application/octet-stream";
+}
+
+// ---------------------------------------------------------------- job state
+
+struct Job {
+    std::string id;
+    std::atomic<bool> running{false};
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> done{false};
+    std::atomic<int> step{0};
+    int steps = 0;
+    double progress = 0;
+    std::string text, error, outPath;
+    double totalMs = 0, secPerStep = 0;
+    uint32_t seed = 0, w = 0, h = 0;
+    std::mutex mu;
+    std::vector<std::string> log;
+};
+
+static std::mutex gJobMu;
+static std::map<std::string, std::shared_ptr<Job>> gJobs;
+static std::string gLastError;
+static EvalModel gModel;
+static std::string gLoaded;
+static std::mutex gModelMu;
+
+static std::string newId() {
+    static std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%08x", rng());
+    return buf;
+}
+
+// ---------------------------------------------------------------- request handling
+
+struct Request {
+    std::string method, path, query, body;
+    std::map<std::string, std::string> headers;
+};
+
+struct Response {
+    int code = 200;
+    std::string type = "application/json; charset=utf-8";
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> extra;
+};
+
+static void setJson(Response& r, int code, const std::string& body) {
+    r.code = code;
+    r.type = "application/json; charset=utf-8";
+    r.body = body;
+}
+
+static void setErr(Response& r, int code, const std::string& msg) {
+    setJson(r, code, "{\"ok\":false,\"error\":" + jstr(msg) + "}");
+}
+
+static void appendCors(Response& r) {
+    r.extra.push_back({"Access-Control-Allow-Origin", "*"});
+    r.extra.push_back({"Access-Control-Allow-Headers", "Content-Type"});
+    r.extra.push_back({"Access-Control-Allow-Methods", "GET, POST, OPTIONS"});
+}
+
+static std::string gWebRoot = "webui";
+static std::string gOutDir = "output";
+
+// Turns a JSON body into GenParams. Unknown keys are ignored so the API stays forward compatible.
+static bool paramsFromJson(const FlatJson& j, GenParams& p, std::string& err) {
+    auto has = [&](const char* k) { return j.s.count(k) || j.n.count(k) || j.b.count(k); };
+    if (has("prompt")) p.prompt = j.s.count("prompt") ? j.s.at("prompt") : "";
+    if (!j.s.count("prompt") && !has("init")) {
+        err = "missing \"prompt\"";
+        return false;
+    }
+    if (has("negative")) p.negative = j.s.at("negative");
+    if (has("model")) p.models.modelDir = j.s.at("model");
+    if (has("unet")) p.models.unet = j.s.at("unet");
+    if (has("te1")) p.models.te1 = j.s.at("te1");
+    if (has("te2")) p.models.te2 = j.s.at("te2");
+    if (has("vae")) p.models.vae = j.s.at("vae");
+    if (has("tok")) p.models.tok1 = j.s.at("tok");
+    if (has("tok2")) p.models.tok2 = j.s.at("tok2");
+    if (j.n.count("steps")) p.steps = std::max(1, (int)j.n.at("steps"));
+    if (j.n.count("cfg")) p.cfg = (float)j.n.at("cfg");
+    if (j.n.count("rescale")) p.rescale = (float)j.n.at("rescale");
+    if (j.n.count("eta")) p.eta = (float)j.n.at("eta");
+    if (j.n.count("denoise")) p.denoise = (float)j.n.at("denoise");
+    if (j.n.count("width")) p.width = (uint32_t)j.n.at("width");
+    if (j.n.count("height")) p.height = (uint32_t)j.n.at("height");
+    if (j.n.count("seed")) p.seed = (uint32_t)(int)j.n.at("seed");
+    if (j.b.count("vpred")) p.vpred = j.b.at("vpred");
+    if (j.b.count("zsnr")) p.zsnr = j.b.at("zsnr");
+    if (j.b.count("dynthresh")) p.dynthresh = j.b.at("dynthresh");
+    if (j.s.count("sampler") && !samplerFromName(j.s.at("sampler"), p.sampler)) {
+        err = "unknown sampler: " + j.s.at("sampler");
+        return false;
+    }
+    if (j.s.count("spacing")) p.spacing = j.s.at("spacing");
+    if (j.n.count("cropX")) p.cropOffsetX = (uint32_t)j.n.at("cropX");
+    if (j.n.count("cropY")) p.cropOffsetY = (uint32_t)j.n.at("cropY");
+    if (p.height == 0) p.height = p.width;
+    if (p.width % 8 || p.height % 8 || p.width < 64 || p.height < 64) {
+        err = "width/height must be multiples of 8 and at least 64";
+        return false;
+    }
+    if (p.steps < 1 || p.steps > 200) {
+        err = "steps must be in 1..200";
+        return false;
+    }
+    return true;
+}
+
+static void applyDefaults(GenParams& p, const std::string& spv) {
+    p.spvDir = spv;
+    p.outPath = (fs::path(gOutDir) / ("sdvk_" + newId() + ".png")).string();
+    p.saveLatent = false;
+    p.latentOut.clear();
+    p.infoOut = true;
+    p.pngCompress = 1;
+}
+
+static void handleCancel(const std::map<std::string, std::string>& q, Response& r) {
+    std::shared_ptr<Job> job;
+    {
+        std::lock_guard<std::mutex> lk(gJobMu);
+        auto it = q.find("id");
+        if (it == q.end()) {
+            // no id: cancel whatever is running
+            for (auto& kv : gJobs)
+                if (kv.second->running) job = kv.second;
+        } else {
+            auto f = gJobs.find(it->second);
+            if (f != gJobs.end()) job = f->second;
+        }
+    }
+    if (!job) {
+        setErr(r, 404, "no running job");
+        return;
+    }
+    job->cancel = true;
+    setJson(r, 200, "{\"ok\":true,\"id\":" + jstr(job->id) + ",\"cancel\":" + (job->running ? "\"requested\"" : "\"idle\"") +
+                        "}");
+}
+
+static std::string jobJson(const std::shared_ptr<Job>& j) {
+    std::ostringstream o;
+    o << "{\"id\":" << jstr(j->id) << ",\"running\":" << (j->running ? "true" : "false")
+      << ",\"done\":" << (j->done ? "true" : "false") << ",\"cancel\":" << (j->cancel ? "true" : "false")
+      << ",\"step\":" << j->step.load()
+      << ",\"steps\":" << j->steps << ",\"progress\":" << jnum(j->progress) << ",\"text\":" << jstr(j->text)
+      << ",\"error\":" << jstr(j->error) << ",\"outPath\":" << jstr(j->outPath) << ",\"totalMs\":" << jnum(j->totalMs)
+      << ",\"secPerStep\":" << jnum(j->secPerStep) << ",\"seed\":" << j->seed << ",\"width\":" << j->w
+      << ",\"height\":" << j->h << "}";
+    return o.str();
+}
+
+// Runs the job on the calling thread. Progress goes to the Job so a concurrent /api/job can read it.
+static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
+    job->running = true;
+    job->done = false;
+    job->steps = p.steps;
+    // The sampler polls this once per step, so cancel lands at the next step boundary instead of
+    // killing the process mid-dispatch.
+    p.shouldCancel = [job] { return job->cancel.load(); };
+    ProgressFn onProgress = [job](const Progress& pr) {
+        job->progress = pr.progress;
+        job->text = pr.text;
+        if (pr.kind == Progress::Kind::Step) job->step = pr.step;
+        std::lock_guard<std::mutex> lk(job->mu);
+        job->log.push_back(pr.text);
+        if (job->log.size() > 200) job->log.erase(job->log.begin(), job->log.begin() + 100);
+    };
+    try {
+        // The model stays resident between jobs; loading it is the expensive part.
+        if (gLoaded != p.models.modelDir) {
+            unloadModel(gModel);
+            std::string e;
+            if (!loadModel(gModel, p, onProgress, e)) {
+                job->error = e;
+                job->done = true;
+                job->running = false;
+                return;
+            }
+            gLoaded = p.models.modelDir;
+        }
+        RunResult r = run(gModel, p, onProgress);
+        job->error = r.error;
+        job->outPath = r.outPath;
+        job->totalMs = r.totalMs;
+        job->secPerStep = r.secPerStep;
+        job->seed = r.seed;
+        job->w = r.width;
+        job->h = r.height;
+    } catch (const std::exception& e) {
+        job->error = e.what();
+    }
+    job->progress = 1.0;
+    job->done = true;
+    job->running = false;
+}
+
+static void handleInfo(Response& r) {
+    std::ostringstream o;
+    o << "{\"ok\":true,\"name\":\"sdvk\",\"version\":" << jstr(kVersion) << ",\"license\":" << jstr(kLicense)
+      << ",\"device\":"
+      << jstr(gModel.deviceName) << ",\"model\":" << jstr(gModel.modelName) << ",\"loaded\":"
+      << (gModel.loaded ? "true" : "false") << ",\"modelDir\":" << jstr(gLoaded) << ",\"outDir\":" << jstr(gOutDir)
+      << ",\"samplers\":[\"euler\",\"euler_a\"],\"spacings\":[\"leading\",\"trailing\"]}";
+    setJson(r, 200, o.str());
+}
+
+static void handleModels(const std::map<std::string, std::string>& q, Response& r) {
+    GenParams p;
+    auto it = q.find("dir");
+    p.models.modelDir = it == q.end() ? gLoaded : it->second;
+    if (p.models.modelDir.empty()) {
+        setErr(r, 400, "no model folder given (use ?dir=)");
+        return;
+    }
+    ModelSet set;
+    std::string err;
+    p.prompt = "probe";
+    if (!resolveModels(p, set, err)) {
+        setErr(r, 400, err);
+        return;
+    }
+    std::ostringstream o;
+    o << "{\"ok\":true,\"dir\":" << jstr(p.models.modelDir) << ",\"unet\":" << jstr(p.models.unet) << ",\"te1\":"
+      << jstr(p.models.te1) << ",\"te2\":" << jstr(p.models.te2) << ",\"vae\":" << jstr(p.models.vae) << ",\"tok1\":"
+      << jstr(p.models.tok1) << ",\"tok2\":" << jstr(p.models.tok2) << ",\"name\":" << jstr(set.unetName)
+      << ",\"warnings\":[";
+    for (size_t i = 0; i < set.warn.size(); i++) o << (i ? "," : "") << jstr(set.warn[i]);
+    o << "]}";
+    setJson(r, 200, o.str());
+}
+
+static void handleGenerate(const Request& req, Response& r) {
+    FlatJson j;
+    if (!parseFlatJson(req.body, j)) {
+        setErr(r, 400, "body is not a JSON object");
+        return;
+    }
+    GenParams p;
+    std::string err;
+    if (!paramsFromJson(j, p, err)) {
+        setErr(r, 400, err);
+        return;
+    }
+    std::string spv = "shaders";
+    if (j.s.count("spv")) spv = j.s.at("spv");
+    applyDefaults(p, spv);
+
+    auto job = std::make_shared<Job>();
+    job->id = newId();
+    {
+        std::lock_guard<std::mutex> lk(gJobMu);
+        gJobs[job->id] = job;
+        if (gJobs.size() > 64) gJobs.erase(gJobs.begin());
+    }
+
+    auto q = parseQuery(req.query);
+    bool async = q.count("async") != 0;
+    if (async) {
+        // Detached run, caller polls /api/job. The GPU is serial, so a second job queues here.
+        std::thread([job, p] {
+            std::lock_guard<std::mutex> lk(gModelMu);
+            runJob(job, p);
+        }).detach();
+        setJson(r, 202, jobJson(job));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(gModelMu);
+        runJob(job, p);
+    }
+    std::ostringstream o;
+    o << "{\"ok\":" << (job->error.empty() ? "true" : "false") << ",\"error\":" << jstr(job->error)
+      << ",\"id\":" << jstr(job->id) << ",\"outPath\":" << jstr(job->outPath) << ",\"totalMs\":" << jnum(job->totalMs)
+      << ",\"secPerStep\":" << jnum(job->secPerStep) << ",\"seed\":" << job->seed << ",\"width\":" << job->w
+      << ",\"height\":" << job->h << ",\"model\":" << jstr(gModel.modelName) << "}";
+    setJson(r, job->error.empty() ? 200 : 500, o.str());
+}
+
+static void handleJob(const std::map<std::string, std::string>& q, Response& r) {
+    auto it = q.find("id");
+    if (it == q.end()) {
+        setErr(r, 400, "missing id");
+        return;
+    }
+    std::shared_ptr<Job> job;
+    {
+        std::lock_guard<std::mutex> lk(gJobMu);
+        auto f = gJobs.find(it->second);
+        if (f != gJobs.end()) job = f->second;
+    }
+    if (!job) {
+        setErr(r, 404, "no such job");
+        return;
+    }
+    setJson(r, 200, jobJson(job));
+}
+
+static bool safeJoin(const std::string& root, const std::string& rel, std::string& out) {
+    fs::path r = fs::weakly_canonical(root);
+    fs::path f = fs::weakly_canonical(r / rel);
+    std::string rs = r.string(), fs2 = f.string();
+    if (fs2.size() < rs.size()) return false;
+    for (auto& c : rs)
+        if (c == '\\') c = '/';
+    for (auto& c : fs2)
+        if (c == '\\') c = '/';
+    if (fs2.compare(0, rs.size(), rs) != 0) return false;
+    out = f.string();
+    return true;
+}
+
+static bool serveFile(const std::string& path, Response& r, bool inlineOk) {
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec)) return false;
+    r.type = mimeOf(path);
+    r.body = readFile(path);
+    if (r.body.empty()) return false;
+    r.extra.push_back({"Cache-Control", inlineOk ? "no-cache" : "public, max-age=3600"});
+    return true;
+}
+
+static void handleImage(const std::map<std::string, std::string>& q, Response& r) {
+    auto it = q.find("path");
+    if (it == q.end()) {
+        setErr(r, 400, "missing path");
+        return;
+    }
+    std::string full;
+    // Only files under the output folder can be fetched, so the endpoint cannot be used to read the disk.
+    if (!safeJoin(gOutDir, fs::path(it->second).filename().string(), full) || !serveFile(full, r, false)) {
+        setErr(r, 404, "no such image");
+    }
+}
+
+static Response dispatch(const Request& req) {
+    Response r;
+    appendCors(r);
+    if (req.method == "OPTIONS") {
+        r.code = 204;
+        return r;
+    }
+    size_t qm = req.path.find('?');
+    std::string path = qm == std::string::npos ? req.path : req.path.substr(0, qm);
+    std::string query = qm == std::string::npos ? "" : req.path.substr(qm + 1);
+    auto q = parseQuery(query);
+
+    if (path == "/api/info") {
+        handleInfo(r);
+    } else if (path == "/api/models") {
+        handleModels(q, r);
+    } else if (path == "/api/generate" && req.method == "POST") {
+        handleGenerate(req, r);
+    } else if (path == "/api/job") {
+        handleJob(q, r);
+    } else if (path == "/api/cancel") {
+        handleCancel(q, r);
+    } else if (path == "/api/image") {
+        handleImage(q, r);
+    } else if (path == "/api/health") {
+        setJson(r, 200, "{\"ok\":true}");
+    } else if (req.method == "GET") {
+        std::string rel = path == "/" ? "index.html" : path.substr(1);
+        std::string full;
+        if (!safeJoin(gWebRoot, rel, full) || !serveFile(full, r, true)) {
+            setErr(r, 404, "not found: " + path);
+        }
+    } else {
+        setErr(r, 405, "method not allowed");
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------- socket plumbing
+
+static std::string statusText(int c) {
+    switch (c) {
+        case 200:
+            return "OK";
+        case 202:
+            return "Accepted";
+        case 204:
+            return "No Content";
+        case 400:
+            return "Bad Request";
+        case 404:
+            return "Not Found";
+        case 405:
+            return "Method Not Allowed";
+        case 413:
+            return "Payload Too Large";
+        case 500:
+            return "Internal Server Error";
+    }
+    return "OK";
+}
+
+static bool sendAll(Sock s, const char* p, size_t n) {
+    while (n) {
+        int k = (int)::send(s, p, (int)n, 0);
+        if (k <= 0) return false;
+        p += k;
+        n -= (size_t)k;
+    }
+    return true;
+}
+
+// Drain whatever the peer sent before we close, so the last response is not truncated by a RST.
+static void drain(Sock s) {
+#ifdef _WIN32
+    char buf[1024];
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    for (int i = 0; i < 64 && ::recv(s, buf, sizeof(buf), 0) > 0; i++) {
+    }
+#endif
+}
+
+static bool readRequest(Sock s, Request& req) {
+    std::string buf;
+    char tmp[8192];
+    size_t headerEnd = std::string::npos;
+    while (headerEnd == std::string::npos) {
+        int n = (int)::recv(s, tmp, sizeof(tmp), 0);
+        if (n <= 0) return false;
+        buf.append(tmp, (size_t)n);
+        headerEnd = buf.find("\r\n\r\n");
+        if (buf.size() > 1u << 20) return false;
+    }
+    std::string head = buf.substr(0, headerEnd);
+    std::string rest = buf.substr(headerEnd + 4);
+    std::istringstream hs(head);
+    std::string line;
+    std::getline(hs, line);
+    {
+        std::istringstream ls(line);
+        std::string ver;
+        ls >> req.method >> req.path >> ver;
+    }
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t c = line.find(':');
+        if (c == std::string::npos) continue;
+        std::string k = line.substr(0, c), v = line.substr(c + 1);
+        std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+        while (!v.empty() && (v[0] == ' ' || v[0] == '\t')) v.erase(v.begin());
+        req.headers[k] = v;
+    }
+    size_t want = 0;
+    auto cl = req.headers.find("content-length");
+    if (cl != req.headers.end()) want = (size_t)std::strtoul(cl->second.c_str(), nullptr, 10);
+    if (want > (64u << 20)) return false;
+    req.body = rest;
+    while (req.body.size() < want) {
+        int n = (int)::recv(s, tmp, sizeof(tmp), 0);
+        if (n <= 0) return false;
+        req.body.append(tmp, (size_t)n);
+    }
+    if (req.body.size() > want) req.body.resize(want);
+    return true;
+}
+
+static void serveOne(Sock s) {
+    Request req;
+    if (!readRequest(s, req)) {
+        closeSock(s);
+        return;
+    }
+    Response r = dispatch(req);
+    std::ostringstream head;
+    head << "HTTP/1.1 " << r.code << " " << statusText(r.code) << "\r\n";
+    head << "Content-Type: " << r.type << "\r\n";
+    head << "Content-Length: " << r.body.size() << "\r\n";
+    head << "Connection: close\r\n";
+    for (auto& h : r.extra) head << h.first << ": " << h.second << "\r\n";
+    head << "\r\n";
+    std::string h = head.str();
+    if (sendAll(s, h.data(), h.size()) && !r.body.empty()) sendAll(s, r.body.data(), r.body.size());
+    drain(s);
+    closeSock(s);
+}
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    int port = 7500;
+    std::string spv = "shaders";
+    std::string modelDir;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--port" || a == "-p") {
+            port = std::atoi(next().c_str());
+        } else if (a == "--spv") {
+            spv = next();
+        } else if (a == "-m" || a == "--model-dir") {
+            modelDir = next();
+        } else if (a == "--web") {
+            gWebRoot = next();
+        } else if (a == "--out-dir") {
+            gOutDir = next();
+        } else if (a == "--version") {
+            std::printf("sdvk-server %s\nlicense: %s\n", kVersion, kLicense);
+            return 0;
+        } else if (a == "--help" || a == "-h") {
+            std::printf(
+                "sdvk-server %s - HTTP API for the sdvk engine\n\n"
+                "usage: sdvk-server [options]\n\n"
+                "  -p, --port <n>        listen port (default 7500)\n"
+                "  -m, --model-dir <dir>  load this model folder on first request if unset\n"
+                "      --spv <dir>        compiled shader folder (default shaders)\n"
+                "      --web <dir>        web UI folder (default webui)\n"
+                "      --out-dir <dir>    generated images (default output)\n\n"
+                "endpoints:\n"
+                "  POST /api/generate    {\"prompt\":\"...\", ...}  one image per call\n"
+                "  GET  /api/info        engine and model state\n"
+                "  GET  /api/models      ?dir=<folder> classification\n"
+                "  GET  /api/job         ?id=<job> progress of an async job\n"
+                "  POST /api/cancel      ?id=<job> stop at the next sampler step\n"
+                "  GET  /api/image       ?path=<file.png> fetch a generated image\n\n"
+                "license: %s (free software, no warranty)\n",
+                kVersion, kLicense);
+            return 0;
+        } else {
+            std::printf("unknown option: %s\n", a.c_str());
+            return 1;
+        }
+    }
+    std::error_code ec;
+    fs::create_directories(gOutDir, ec);
+
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::printf("error: WSAStartup failed\n");
+        return 1;
+    }
+#endif
+    Sock srv = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (srv == kBad) {
+        std::printf("error: socket() failed (%d)\n", (int)WSAGetLastError());
+        return 1;
+    }
+    int reuse = 1;
+    ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (::bind(srv, (sockaddr*)&addr, sizeof(addr)) != 0) {
+#ifdef _WIN32
+        int e = WSAGetLastError();
+        std::printf("error: bind 127.0.0.1:%d failed (%d)%s\n", port, e,
+                    e == 10013 ? " - port is reserved by the OS, pick another one" : "");
+#else
+        std::printf("error: bind 127.0.0.1:%d failed\n", port);
+#endif
+        return 1;
+    }
+    if (::listen(srv, 8) != 0) {
+        std::printf("error: listen failed\n");
+        return 1;
+    }
+    std::printf("sdvk-server %s listening on http://127.0.0.1:%d\n", kVersion, port);
+    std::printf("  web:    %s\n  models: %s\n  output: %s\n  shaders: %s\n", gWebRoot.c_str(),
+                modelDir.empty() ? "(set per request)" : modelDir.c_str(), gOutDir.c_str(), spv.c_str());
+    if (!modelDir.empty()) {
+        GenParams p;
+        p.models.modelDir = modelDir;
+        p.spvDir = spv;
+        p.prompt = "probe";
+        ModelSet set;
+        std::string e;
+        if (resolveModels(p, set, e)) {
+            std::printf("  model:  %s\n", set.unetName.c_str());
+            gLoaded = modelDir;
+            std::string le;
+            if (!loadModel(gModel, p, nullptr, le)) std::printf("  load:   %s\n", le.c_str());
+            else
+                std::printf("  device: %s\n", gModel.deviceName.c_str());
+        } else {
+            std::printf("  model:  %s\n", e.c_str());
+        }
+    }
+    for (;;) {
+        Sock c = ::accept(srv, nullptr, nullptr);
+        if (c == kBad) continue;
+        serveOne(c);
+    }
+}

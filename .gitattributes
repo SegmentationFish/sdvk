@@ -1,1 +1,19 @@
 * text=auto
+
+# line endings: LF in the repository, native on checkout
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.comp  text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.py    text eol=lf
+*.txt   text eol=lf
+CMakeLists.txt text eol=lf
+LICENSE text eol=lf
+
+# spv files are build output, never diff them
+*.spv binary

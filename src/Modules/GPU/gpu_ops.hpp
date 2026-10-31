@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // GPU tensor ops with host-side autograd tape (mirrors Modules/Core/Ops.hpp).
 #pragma once
 

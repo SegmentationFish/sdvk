@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // Batched Adafactor factored statistics (row + column) in one dispatch.
 // Workgroups [0, rowTotal) update R; [rowTotal, rowTotal+colTotal) update C.
 // tbl[param] = (gradOffsetFloats, rows, cols, stateBase)  state: R[rows], C[cols], meta

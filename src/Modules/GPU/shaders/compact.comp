@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // per-group token compaction.
 // for each row r with a selected idx[r,*]==gid:
 //   pos = atomicAdd(counts[gid])

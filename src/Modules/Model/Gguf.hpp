@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 #pragma once
 // GGUF reader: the llama.cpp-ecosystem model container (input format for the compat layer)
 // supports: v2/v3 headers, all metadata KV types, tensor table, F32/F16/BF16/Q4_0/Q8_0 dequantization
@@ -110,6 +113,9 @@ public:
     // (PyTorch row-major [N,K], N = out channels, K = in*ksize) for in-shader dequantization
     bool readQ8(const std::string& name, std::vector<int8_t>& q, std::vector<float>& scales,
                 std::string* err = nullptr) const;
+    // Same data, straight into the staging map: no intermediate copy, which keeps a 2.5 GB
+    // upload from tripling the process commit (see readQ8 for the layout).
+    bool readQ8Into(const std::string& name, int8_t* qDst, float* scaleDst, std::string* err = nullptr) const;
 
     const std::map<std::string, GgufMeta>& allMeta() const { return meta_; }
 

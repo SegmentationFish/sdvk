@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 #include "gpu_ops.hpp"
 
 #include <algorithm>
@@ -176,6 +179,7 @@ struct P_rb {
 // ---------------------------------------------------------------- init
 
 void gInit(const std::string& spvDir) {
+    if (G.eng.alive()) gShutdown();
     G.eng.init();
     G.eng.loadKernels(spvDir);
     G.eng.initArenas(G.stepBytes, G.scratchBytes);
@@ -202,7 +206,15 @@ BufRef gHpBuf() { return G.hp; }
 
 void gUploadHp(const float* hp, int n) { G.eng.uploadNow(G.hp, hp, (uint64_t)n * 4); }
 
-void gShutdown() { G.eng.destroy(); }
+void gShutdown() {
+    G.eng.destroy();
+    G.paramArena.destroy();
+    G.paramGradArena.destroy();
+    G.scratchArena.destroy();
+    gResetTape();
+    gStepTensorCount = 0;
+    G.stepPreZeroed = false;
+}
 
 void gResetTape() {
     for (auto& t : G.tape) t->backward = nullptr;  // break shared_ptr cycles

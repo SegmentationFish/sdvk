@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // gradient of mul: target[sum(coord*tstr)] += go[i] * other[sum(coord*ostr)]
 // go is contiguous with shape d0..d3
 layout(local_size_x = 256) in;

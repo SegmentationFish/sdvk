@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 #include "Safetensors.hpp"
 
 #include <cstring>
@@ -168,6 +171,10 @@ float fp16ToFp32(uint16_t h) {
 
 bool Safetensors::open(const std::string& path) {
     err_.clear();
+    if (f_.is_open()) f_.close();
+    ts_.clear();
+    idx_.clear();
+    path_ = path;
     f_.open(path, std::ios::binary);
     if (!f_) {
         err_ = "cannot open " + path;
@@ -211,6 +218,11 @@ bool Safetensors::open(const std::string& path) {
         return false;
     }
     return true;
+}
+
+bool Safetensors::ensureOpen(const std::string& path) {
+    if (isOpen() && path_ == path) return true;
+    return open(path);
 }
 
 const STTensor* Safetensors::find(const std::string& name) const {

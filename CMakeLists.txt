@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(sdvk LANGUAGES C CXX)
+project(sdvk LANGUAGES C CXX VERSION 0.3.0)
+
+set(SDVK_LICENSE "GPL-3.0-only")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,12 +9,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# SDXL text-to-image on the ofc Vulkan engine (RX 580 / 6 GiB target).
-#   sdvkgen "<prompt>" --vpred --spacing trailing --steps 28 --cfg 3.0 --size 768
-#     --no-vae --step-mb 1500 --scratch-mb 500 --neg "nsfw, worst quality, old, early, low quality, lowres"
-# Default data paths live in src/Modules/Diffusion/sdvkgen.cpp (E:/ofc-data/noobai).
+option(SDVK_BUILD_CLI "Build the sdvkgen command line tool" ON)
+option(SDVK_BUILD_SERVER "Build the sdvk-server HTTP API" ON)
 
 find_program(GLSLC NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin")
+if(NOT GLSLC)
+    message(FATAL_ERROR "glslc not found; set VULKAN_SDK or add glslc to PATH")
+endif()
 set(VK_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${VK_SHADER_DIR})
 set(VK_SPVS "")
@@ -35,9 +38,12 @@ foreach(SHADER vadd gemm gemm_nn gemm_nt gemm_tn copy_nd ew2 mul_grad rowdot col
     list(APPEND VK_SPVS ${SPV})
 endforeach()
 
-add_executable(sdvkgen
+# ---- core: the SDXL pipeline as a library, no CLI, no sockets ----
+add_library(sdvkcore STATIC
     src/Modules/Diffusion/sdvkgen.cpp
     src/Modules/Diffusion/Safetensors.cpp
+    src/Modules/Diffusion/GenParams.cpp
+    src/Modules/Diffusion/ModelSet.cpp
     src/Modules/Model/Gguf.cpp
     src/Modules/GPU/gpu_ops.cpp
     src/Modules/GPU/vk_engine.cpp
@@ -45,18 +51,56 @@ add_executable(sdvkgen
     src/Modules/Core/Tensor.cpp
     ${VK_SPVS}
 )
-target_include_directories(sdvkgen PRIVATE
+target_include_directories(sdvkcore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Modules/Diffusion
     "$ENV{VULKAN_SDK}/Include"
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Modules/GPU/volk
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Modules/GPU
 )
-target_compile_definitions(sdvkgen PRIVATE VK_NO_PROTOTYPES)
+target_compile_definitions(sdvkcore PUBLIC VK_NO_PROTOTYPES)
 if(MSVC)
-    target_compile_options(sdvkgen PRIVATE /O2 /W3)
+    target_compile_options(sdvkcore PRIVATE /O2 /W3)
 else()
-    target_compile_options(sdvkgen PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(sdvkcore PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
 endif()
 if(WIN32)
-    target_link_libraries(sdvkgen PRIVATE shell32)
+    target_link_libraries(sdvkcore PUBLIC shell32)
 endif()
+
+# ---- licensing ----
+# GPL-3.0-only covers everything in src/ except the vendored volk, which stays MIT.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION share/doc/sdvk)
+set(SDVK_GPL_NOTE "sdvk is free software under the GNU GPL v3.0 or later; see LICENSE. volk (src/Modules/GPU/volk) is MIT-licensed.")
+
+# ---- cli ----
+if(SDVK_BUILD_CLI)
+    add_executable(sdvkgen src/Modules/Diffusion/main.cpp)
+    target_link_libraries(sdvkgen PRIVATE sdvkcore)
+    if(MSVC)
+        target_compile_options(sdvkgen PRIVATE /O2 /W3)
+    else()
+        target_compile_options(sdvkgen PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    endif()
+endif()
+
+# ---- http server: same core, thin socket layer ----
+if(SDVK_BUILD_SERVER)
+    add_executable(sdvk-server src/Modules/Server/server.cpp)
+    target_link_libraries(sdvk-server PRIVATE sdvkcore)
+    if(WIN32)
+        target_link_libraries(sdvk-server PRIVATE ws2_32)
+    endif()
+    if(MSVC)
+        target_compile_options(sdvk-server PRIVATE /O2 /W3)
+    else()
+        target_compile_options(sdvk-server PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    endif()
+endif()
+
+# ---- tools: read-only diagnostics ----
+add_executable(vkbudget tools/vkbudget.cpp)
+target_link_libraries(vkbudget PRIVATE sdvkcore)
+
+add_executable(ggufinfo tools/ggufinfo.cpp)
+target_link_libraries(ggufinfo PRIVATE sdvkcore)

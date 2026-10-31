@@ -19,3 +19,14 @@ cmake-build-*/
 .vscode/
 .idea/
 *.log
+
+# runtime folders
+shaders/
+output/
+
+# debug artifacts
+probe_out.txt
+dbg_*.f32
+
+# agent scratch
+.workbuddy/

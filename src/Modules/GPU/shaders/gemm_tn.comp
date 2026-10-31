@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // C[M,N] = A[K,M]^T * B[K,N] ; A stored [K,M], B stored [K,N], row-major, batched on z.
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(binding = 0) readonly buffer A { float a[]; };

@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // row-wise top-k selection on probs[rows,g] (g small, k <= g):
 // - sparse[rows,g]: normalized top-k weights placed at their original columns (zeros elsewhere)
 // - idx[rows,k]: selected column ids

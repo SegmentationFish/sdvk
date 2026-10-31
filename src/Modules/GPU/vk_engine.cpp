@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 #include "vk_engine.hpp"
 
 #include <algorithm>
@@ -6,16 +9,34 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
+#include <string>
 
 namespace ofc {
 namespace gpu {
+
+static const char* vkResName(VkResult r) {
+    switch (r) {
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "MEMORY_MAP_FAILED";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "FEATURE_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "EXTENSION_NOT_PRESENT";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "FORMAT_NOT_SUPPORTED";
+        default: return "UNKNOWN";
+    }
+}
 
 #define VK_CHECK(x)                                                                      \
     do {                                                                                 \
         VkResult _r = (x);                                                               \
         if (_r != VK_SUCCESS) {                                                          \
             std::fprintf(stderr, "VK error %d at %s:%d\n", (int)_r, __FILE__, __LINE__); \
-            std::exit(1);                                                                \
+            throw std::runtime_error(std::string("vulkan: ") + vkResName(_r) + " at " +  \
+                                     __FILE__ + ":" + std::to_string(__LINE__));         \
         }                                                                                \
     } while (0)
 
@@ -88,7 +109,7 @@ static const KernelDef KERNELS[] = {
     {"im2col_s2", 2, 20, 0x2},
     {"layernorm_fwd", 4, 16, 0x8},
     {"causal_mask", 1, 12, 0x1},
-    {"groupnorm", 4, 16, 0x8},
+    {"groupnorm", 4, 20, 0x8},
     {"upsample2x", 2, 12, 0x2},
     {"bias_add", 2, 8, 0x1},
     {"add2", 3, 4, 0x4},
@@ -118,6 +139,10 @@ void Arena::init(VkDevice dev, VkPhysicalDevice phys, uint64_t bytes, bool devic
     vkGetBufferMemoryRequirements(dev, buffer_, &req);
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    uint64_t localMb = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            localMb = std::max(localMb, (uint64_t)mp.memoryHeaps[i].size >> 20);
     VkMemoryPropertyFlags want = deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0;
     if (hostVisible) want |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     uint32_t idx = UINT32_MAX;
@@ -135,17 +160,87 @@ void Arena::init(VkDevice dev, VkPhysicalDevice phys, uint64_t bytes, bool devic
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = idx;
-    VK_CHECK(vkAllocateMemory(dev, &ai, nullptr, &mem_));
+    VkResult ar = vkAllocateMemory(dev, &ai, nullptr, &mem_);
+    if (ar != VK_SUCCESS) {
+        // VK_ERROR_OUT_OF_HOST_MEMORY here is really "the OS refused the backing store". The
+        // driver mirrors every device-local buffer in system RAM, so on a small-RAM box this is
+        // a system-memory failure, not a VRAM one; say which so the user knows what to shrink.
+        char msg[640];
+        if (hostVisible)
+            std::snprintf(msg, sizeof msg,
+                          "vulkan: cannot allocate %.1f MB host-visible memory (%s); the OS is out of "
+                          "committed RAM. free system memory or lower the arena sizes",
+                          req.size / 1048576.0, vkResName(ar));
+        else
+            std::snprintf(msg, sizeof msg,
+                          "vulkan: cannot allocate %.1f MB device-local memory (%s). the driver also "
+                          "mirrors this in system RAM, so this can be either VRAM pressure or a "
+                          "system-RAM shortage; device has %.0f MB VRAM. lower --param-mb/--step-mb/"
+                          "--scratch-mb or the canvas size",
+                          req.size / 1048576.0, vkResName(ar), localMb + 0.0);
+        vkDestroyBuffer(dev, buffer_, nullptr);
+        buffer_ = VK_NULL_HANDLE;
+        throw OomError(msg);
+    }
     VK_CHECK(vkBindBufferMemory(dev, buffer_, mem_, 0));
     if (hostVisible) VK_CHECK(vkMapMemory(dev, mem_, 0, bytes, 0, &mapped_));
+    // The driver rounds allocations up, so the usable span is req.size, not the requested bytes.
+    // alloc() must fail at the real limit instead of walking past it.
+    cap_ = req.size;
+    deviceLocal_ = deviceLocal;
+    hostVisible_ = hostVisible;
+    phys_ = phys;
+}
+
+void Arena::grow(uint64_t need) {
+    // Growing means a fresh object, so anything already written would be lost. Only allow it at
+    // the bottom of the pool; past that the run genuinely needs a bigger --step-mb and should say
+    // so rather than silently corrupting activations.
+    if (used_ != 0) {
+        char msg[256];
+        std::snprintf(msg, sizeof msg,
+                      "arena out of memory: need %.2f MB at offset %.2f MB, cannot grow a pool that already "
+                      "holds live data (used %.2f of %.2f MB)",
+                      need / 1e6, used_ / 1e6, used_ / 1e6, cap_ / 1e6);
+        throw OomError(msg);
+    }
+    uint64_t want = cap_ + (cap_ >> 1);
+    if (want < need) want = need;
+    want = (want + (1ull << 20) - 1) & ~((1ull << 20) - 1);
+    VkBuffer oldBuf = buffer_;
+    VkDeviceMemory oldMem = mem_;
+    void* oldMap = mapped_;
+    cap_ = 0;
+    buffer_ = VK_NULL_HANDLE;
+    mem_ = VK_NULL_HANDLE;
+    mapped_ = nullptr;
+    try {
+        init(dev_, phys_, want, deviceLocal_, hostVisible_);
+    } catch (...) {
+        buffer_ = oldBuf;
+        mem_ = oldMem;
+        mapped_ = oldMap;
+        throw;
+    }
+    vkDestroyBuffer(dev_, oldBuf, nullptr);
+    vkFreeMemory(dev_, oldMem, nullptr);
+    std::fprintf(stderr, "[vk] arena grown to %.0f MB\n", cap_ / 1048576.0);
+}
+
+BufRef Arena::allocGrow(uint64_t size) {
+    growable_ = true;
+    uint64_t off = (used_ + kAlign - 1) / kAlign * kAlign;
+    if (off + size > cap_) grow(off + size);
+    return alloc(size);
 }
 
 BufRef Arena::alloc(uint64_t size) {
     uint64_t off = (used_ + kAlign - 1) / kAlign * kAlign;
     if (off + size > cap_) {
-        std::fprintf(stderr, "arena OOM: need %.2f MB more (used %.2f of %.2f MB)\n", size / 1e6, used_ / 1e6,
-                     cap_ / 1e6);
-        std::exit(1);
+        char msg[256];
+        std::snprintf(msg, sizeof msg, "arena out of memory: need %.2f MB more (used %.2f of %.2f MB)", size / 1e6,
+                      used_ / 1e6, cap_ / 1e6);
+        throw OomError(msg);
     }
     used_ = off + size;
     return BufRef{buffer_, off, size};
@@ -195,6 +290,18 @@ void Engine::init() {
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(phys_, &p);
     deviceName_ = p.deviceName;
+    {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+        uint64_t best = 0, total = 0;
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+            if (!(mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+            total += mp.memoryHeaps[i].size;
+            best = std::max(best, (uint64_t)mp.memoryHeaps[i].size);
+        }
+        deviceLocalMb_ = best >> 20;
+        std::fprintf(stderr, "device: %s  device-local %.0f MB\n", deviceName_.c_str(), deviceLocalMb_ + 0.0);
+    }
 
     // enable push descriptors if available
     uint32_t en = 0;
@@ -230,6 +337,7 @@ void Engine::init() {
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VK_CHECK(vkCreateFence(dev_, &fi, nullptr, &stepFence_));
     stagingArena_.init(dev_, phys_, 256ull << 20, false, true);
+    upCap_ = upUsed_ = 0;
     safeBarriers_ = std::getenv("OFC_SAFE_BARRIERS") != nullptr;
     if (safeBarriers_) std::fprintf(stderr, "[vk] OFC_SAFE_BARRIERS=1: barrier after every op\n");
     tsEnabled_ = std::getenv("OFC_TIMESTAMPS") != nullptr;
@@ -260,25 +368,191 @@ void Engine::init() {
 }
 
 void Engine::destroy() {
+    if (dev_ == VK_NULL_HANDLE) return;
     if (stepCmd_) vkFreeCommandBuffers(dev_, pool_, 1, &stepCmd_);
     if (cachedCmd_) vkFreeCommandBuffers(dev_, pool_, 1, &cachedCmd_);
+    stepCmd_ = cachedCmd_ = VK_NULL_HANDLE;
     if (stepFence_) vkDestroyFence(dev_, stepFence_, nullptr);
+    stepFence_ = VK_NULL_HANDLE;
     for (auto& kv : kernels_) {
         vkDestroyPipeline(dev_, kv.second.pipe, nullptr);
         vkDestroyPipelineLayout(dev_, kv.second.layout, nullptr);
     }
+    kernels_.clear();
     if (tsPool_) vkDestroyQueryPool(dev_, tsPool_, nullptr);
+    tsPool_ = VK_NULL_HANDLE;
     stepArena_.destroy();
     scratchArena_.destroy();
     stagingArena_.destroy();
+    if (dlBuf_) vkDestroyBuffer(dev_, dlBuf_, nullptr);
+    if (dlMem_) vkFreeMemory(dev_, dlMem_, nullptr);
+    dlBuf_ = VK_NULL_HANDLE;
+    dlMem_ = VK_NULL_HANDLE;
+    dlMap_ = nullptr;
+    dlCap_ = 0;
+    if (upBuf_) vkDestroyBuffer(dev_, upBuf_, nullptr);
+    if (upMem_) vkFreeMemory(dev_, upMem_, nullptr);
+    upBuf_ = VK_NULL_HANDLE;
+    upMem_ = VK_NULL_HANDLE;
+    upMap_ = nullptr;
+    upCap_ = upUsed_ = 0;
+    upDst_.clear();
+    upSrcOff_.clear();
+    upSize_.clear();
+    pending_.clear();
     vkDestroyCommandPool(dev_, pool_, nullptr);
+    pool_ = VK_NULL_HANDLE;
     vkDestroyDevice(dev_, nullptr);
+    dev_ = VK_NULL_HANDLE;
     vkDestroyInstance(instance_, nullptr);
+    instance_ = VK_NULL_HANDLE;
+    phys_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
+    inStep_ = replayMode_ = false;
 }
 
+Engine::~Engine() { destroy(); }
+
 void Engine::initArenas(uint64_t stepBytes, uint64_t scratchBytes) {
-    stepArena_.init(dev_, phys_, stepBytes, true, false);
-    scratchArena_.init(dev_, phys_, scratchBytes, true, false);
+    // A driver can round an allocation up (AMD pads each heap piece by a few percent), and the
+    // padded span still has to fit. Asking exactly what is left next to a loaded param arena
+    // therefore fails even though the numbers add up, so step down on failure instead of dying.
+    for (;;) {
+        try {
+            stepArena_.init(dev_, phys_, stepBytes, true, false);
+            break;
+        } catch (const OomError& e) {
+            uint64_t next = stepBytes > (64ull << 20) ? (stepBytes * 7 / 8) & ~((1ull << 20) - 1) : 0;
+            if (!next) throw;
+            std::fprintf(stderr, "[vk] step arena %.0f MB refused, retrying at %.0f MB\n", stepBytes / 1048576.0,
+                         next / 1048576.0);
+            (void)e;
+            stepBytes = next;
+        }
+    }
+    for (;;) {
+        try {
+            scratchArena_.init(dev_, phys_, scratchBytes, true, false);
+            break;
+        } catch (const OomError&) {
+            uint64_t next = scratchBytes > (64ull << 20) ? (scratchBytes * 7 / 8) & ~((1ull << 20) - 1) : 0;
+            if (!next) throw;
+            std::fprintf(stderr, "[vk] scratch arena %.0f MB refused, retrying at %.0f MB\n",
+                         scratchBytes / 1048576.0, next / 1048576.0);
+            scratchBytes = next;
+        }
+    }
+    stepArena_.setQueue(queue_);
+    stepArena_.setCmdPool(pool_);
+    scratchArena_.setQueue(queue_);
+    scratchArena_.setCmdPool(pool_);
+}
+
+void Arena::moveDown(uint64_t dst, uint64_t off, uint64_t bytes) {
+    if (bytes == 0 || dst == off) return;
+    if (dst > off) throw std::runtime_error("arena moveDown only moves toward the base");
+    if (!queue_ || !cmdPool_ || !buffer_) throw std::runtime_error("arena moveDown without a queue");
+    // The ranges overlap when the tensor is wider than the gap it moves into, and a plain copy
+    // would read what a previous iteration just wrote. Bounce through the top of the pool, which
+    // is free at this point because the caller just rewound past the source.
+    VkDeviceSize bounce = cap_ - ((bytes + 255) & ~255ull);
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbi.commandPool = cmdPool_;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(dev_, &cbi, &cb));
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (off < dst + bytes) {
+        VkBufferCopy c1{off, bounce, bytes};
+        vkCmdCopyBuffer(cb, buffer_, buffer_, 1, &c1);
+        // Transfer commands do not make their writes visible to the following transfer by
+        // themselves; without this barrier the copy back reads stale bounce bytes.
+        VkMemoryBarrier mbc{};
+        mbc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mbc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mbc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mbc, 0,
+                             nullptr, 0, nullptr);
+        VkBufferCopy c2{bounce, dst, bytes};
+        vkCmdCopyBuffer(cb, buffer_, buffer_, 1, &c2);
+    } else {
+        VkBufferCopy c{off, dst, bytes};
+        vkCmdCopyBuffer(cb, buffer_, buffer_, 1, &c);
+    }
+    VkMemoryBarrier mb2{};
+    mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0,
+                         nullptr, 0, nullptr);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue_));
+    vkFreeCommandBuffers(dev_, cmdPool_, 1, &cb);
+}
+
+void Arena::moveDownInCmd(VkCommandBuffer cb, uint64_t dst, uint64_t off, uint64_t bytes) {
+    if (bytes == 0 || dst == off) return;
+    if (dst > off) throw std::runtime_error("arena moveDown only moves toward the base");
+    // Bounce through the first free bytes above the live range: nothing has been handed out past
+    // used_ yet, and every command recorded after this copy executes after it, so reusing that
+    // scratch later in the stream is safe.
+    VkDeviceSize bounce = (used_ + 255) & ~255ull;
+    if (bounce + bytes > cap_) throw OomError("arena moveDown: no room for the bounce copy");
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (off < dst + bytes) {
+        VkBufferCopy c1{off, bounce, bytes};
+        vkCmdCopyBuffer(cb, buffer_, buffer_, 1, &c1);
+        // Transfer commands do not make their writes visible to the following transfer by
+        // themselves; without this barrier the copy back reads stale bounce bytes.
+        VkMemoryBarrier mbc{};
+        mbc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mbc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mbc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mbc, 0,
+                             nullptr, 0, nullptr);
+        VkBufferCopy c2{bounce, dst, bytes};
+        vkCmdCopyBuffer(cb, buffer_, buffer_, 1, &c2);
+    } else {
+        VkBufferCopy c{off, dst, bytes};
+        vkCmdCopyBuffer(cb, buffer_, buffer_, 1, &c);
+    }
+    VkMemoryBarrier mb2{};
+    mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0,
+                         nullptr, 0, nullptr);
+    used_ = dst + bytes;
+}
+
+void Engine::compactStepArena(uint64_t dst, uint64_t off, uint64_t bytes) {
+    if (bytes == 0 || dst == off) return;
+    if (inStep_ && stepCmd_ != VK_NULL_HANDLE) {
+        stepArena_.moveDownInCmd(stepCmd_, dst, off, bytes);
+    } else {
+        stepArena_.moveDown(dst, off, bytes);
+    }
 }
 
 void Engine::loadKernels(const std::string& spvDir) {
@@ -414,8 +688,20 @@ void Engine::flushUploads() {
     upUsed_ = 0;
 }
 
-void Engine::stageUpload(BufRef dst, const void* src, uint64_t bytes) {
-    if (bytes == 0) return;
+void Engine::releaseUploadStaging() {
+    if (!upBuf_) return;
+    flushUploads();
+    if (upMap_) vkUnmapMemory(dev_, upMem_);
+    vkDestroyBuffer(dev_, upBuf_, nullptr);
+    vkFreeMemory(dev_, upMem_, nullptr);
+    upBuf_ = VK_NULL_HANDLE;
+    upMem_ = VK_NULL_HANDLE;
+    upMap_ = nullptr;
+    upCap_ = upUsed_ = 0;
+}
+
+void* Engine::beginUpload(BufRef dst, uint64_t bytes) {
+    if (bytes == 0) return nullptr;
     if (upUsed_ + bytes > upCap_) {
         flushUploads();
         if (bytes > upCap_) {
@@ -459,11 +745,20 @@ void Engine::stageUpload(BufRef dst, const void* src, uint64_t bytes) {
             upCap_ = want;
         }
     }
-    std::memcpy((char*)upMap_ + upUsed_, src, (size_t)bytes);
+    void* slot = (char*)upMap_ + upUsed_;
     upDst_.push_back(dst);
     upSrcOff_.push_back(upUsed_);
     upSize_.push_back(bytes);
     upUsed_ += (bytes + 255) & ~255ull;
+    return slot;
+}
+
+void Engine::endUpload() {}
+
+void Engine::stageUpload(BufRef dst, const void* src, uint64_t bytes) {
+    void* slot = beginUpload(dst, bytes);
+    if (!slot) return;
+    std::memcpy(slot, src, (size_t)bytes);
 }
 
 void Engine::uploadNow(BufRef dst, const void* src, uint64_t bytes) {
@@ -544,6 +839,13 @@ void Engine::ensureDlStaging(uint64_t bytes) {
 void Engine::downloadNow(BufRef src, void* dst, uint64_t bytes) {
     ensureDlStaging(bytes);
     VkBufferCopy cp{src.offset, 0, bytes};
+    oneShot([&](VkCommandBuffer cb) { vkCmdCopyBuffer(cb, src.buf, dlBuf_, 1, &cp); });
+    std::memcpy(dst, dlMap_, (size_t)bytes);
+}
+
+void Engine::downloadNow(BufRef src, void* dst, uint64_t bytes, uint64_t srcOff) {
+    ensureDlStaging(bytes);
+    VkBufferCopy cp{src.offset + srcOff, 0, bytes};
     oneShot([&](VkCommandBuffer cb) { vkCmdCopyBuffer(cb, src.buf, dlBuf_, 1, &cp); });
     std::memcpy(dst, dlMap_, (size_t)bytes);
 }

@@ -1,11 +1,14 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // GroupNorm over NCHW (batch=1): one workgroup per group.
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer X { float x[]; };
 layout(binding = 1) readonly buffer GAMMA { float gamma[]; };
 layout(binding = 2) readonly buffer BETA { float beta[]; };
 layout(binding = 3) writeonly buffer Y { float y[]; };
-layout(push_constant) uniform PC { uint C; uint P; uint G; float eps; } pc;
+layout(push_constant) uniform PC { uint C; uint P; uint G; float eps; uint act; } pc;
 
 shared float red[256];
 
@@ -31,6 +34,8 @@ void main(){
     float r = 1.0 / sqrt(var + pc.eps);
     for (uint i = tid; i < cnt; i += 256){
         uint ch = g * Cg + i / pc.P;
-        y[base + i] = (x[base + i] - mean) * r * gamma[ch] + beta[ch];
+        float v = (x[base + i] - mean) * r * gamma[ch] + beta[ch];
+        if (pc.act == 1u) v = v / (1.0 + exp(-v));  // fused SiLU
+        y[base + i] = v;
     }
 }

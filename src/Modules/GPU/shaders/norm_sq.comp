@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // partial[wg] = sum of squares of g[] (per-workgroup partials, summed later)
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer G { float g[]; };

@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // dual-destination gradient routing: a (op)= s; b (op)= s (mode 1 accumulates)
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer A { float a[]; };

@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // routing balance loss:
 //   q[g] = counts[g] / max(sum(counts),1)
 //   out  = groups * sum_g q[g] * mean_r probs[r,g]

@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // out[r] = sum_j x[r,j]  (one workgroup per row)
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer X { float x[]; };

@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 
 // C[M,N] = A[M,K] * B[K,N], all row-major fp32, batched on z.
 // tile: 64x64 output per workgroup, 16x16 threads, 4x4 per thread, BK=16
@@ -19,8 +22,8 @@ const uint BK = 16;
 const uint TM = 4;
 const uint TN = 4;
 
-shared float As[BM][BK];
-shared float Bs[BK][BN];
+shared float As[BM][BK + 1];
+shared float Bs[BK][BN + 1];
 
 void main(){
     uint tx = gl_LocalInvocationID.x;

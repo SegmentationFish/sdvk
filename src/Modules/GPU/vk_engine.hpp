@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // Vulkan compute engine for ofc training: device, arenas, kernel dispatch.
 #pragma once
 
@@ -5,6 +8,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -22,12 +26,31 @@ struct BufRef {
 
 constexpr uint64_t kAlign = 256;
 
+// raised (instead of exiting) when a resource does not fit; the CLI turns it into an error line
+struct OomError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+
 class Arena {
 public:
     void init(VkDevice dev, VkPhysicalDevice phys, uint64_t bytes, bool deviceLocal, bool hostVisible);
     BufRef alloc(uint64_t size);
+    // Grow in place of failing: a right-sized arena is a guess, and a guess that is 100 MB short
+    // kills a 10-minute sampling run. Offsets stay valid, contents are copied over.
+    BufRef allocGrow(uint64_t size);
+    void setGrowable(bool v) { growable_ = v; }
     void reset();
     void rewind(uint64_t used) { used_ = used; }
+    // Slides [off, off+bytes) down to `dst`, coping with a partial overlap by bouncing through the
+    // top of the pool. The chain decoders use this to keep one live tensor at a fixed base instead
+    // of letting the cursor climb by one tensor per stage.
+    void moveDown(uint64_t dst, uint64_t off, uint64_t bytes);
+    // Same move, but recorded into an in-flight command buffer: the copy has to sit in stream
+    // order between the dispatch that produced the tensor and the one that consumes it.
+    void moveDownInCmd(VkCommandBuffer cb, uint64_t dst, uint64_t off, uint64_t bytes);
+    void setQueue(VkQueue q) { queue_ = q; }
+    void setCmdPool(VkCommandPool p) { cmdPool_ = p; }
     void destroy();
     uint64_t used() const { return used_; }
     uint64_t cap() const { return cap_; }
@@ -36,7 +59,13 @@ public:
     VkDeviceMemory memory() const { return mem_; }
 
 private:
+    void grow(uint64_t need);
+    bool growable_ = false;
+    VkQueue queue_ = VK_NULL_HANDLE;
+    VkCommandPool cmdPool_ = VK_NULL_HANDLE;
+    bool deviceLocal_ = true, hostVisible_ = false;
     VkDevice dev_ = VK_NULL_HANDLE;
+    VkPhysicalDevice phys_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory mem_ = VK_NULL_HANDLE;
     uint64_t cap_ = 0, used_ = 0;
@@ -60,8 +89,14 @@ struct TouchRegion {
 
 class Engine {
 public:
+    Engine() = default;
+    ~Engine();
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+
     void init();
     void destroy();
+    bool alive() const { return instance_ != VK_NULL_HANDLE; }
 
     // loads and compiles all kernels listed in KERNELS (see .cpp) from dir/name.spv
     void loadKernels(const std::string& spvDir);
@@ -97,8 +132,17 @@ public:
     void uploadNow(BufRef dst, const void* src, uint64_t bytes);
     // batched upload: accumulate into the persistent staging ring, one submit for all (avoids a full sync per tensor)
     void stageUpload(BufRef dst, const void* src, uint64_t bytes);
+    // Reserve staging room and hand back a host pointer to write into, so a loader can fill the
+    // map directly instead of materialising the tensor in RAM first. Finish with endUpload().
+    void* beginUpload(BufRef dst, uint64_t bytes);
+    void endUpload();
+    // Drops the host-visible upload ring, e.g. after the weights are in and the RAM is needed
+    // back for the next stage.
+    void releaseUploadStaging();
     void flushUploads();
     void downloadNow(BufRef src, void* dst, uint64_t bytes);
+    // Read back a slice of a buffer; srcOff is a byte offset into src.buf.
+    void downloadNow(BufRef src, void* dst, uint64_t bytes, uint64_t srcOff);
 
     // staging ring used for in-step uploads (host writes before beginStep
     // AFTER the previous waitStep) and readbacks (host reads after waitStep)
@@ -106,6 +150,9 @@ public:
     BufRef stagingReadback(uint64_t bytes);
 
     void barrier();  // full memory barrier between dispatches
+    // Compact a live block in the step arena down to `dst` inside the current recording (or
+    // immediately when no step is open).
+    void compactStepArena(uint64_t dst, uint64_t off, uint64_t bytes);
 
     Arena& stepArena() { return stepArena_; }
     Arena& scratchArena() { return scratchArena_; }
@@ -113,6 +160,7 @@ public:
     VkDevice device() const { return dev_; }
     VkPhysicalDevice physDevice() const { return phys_; }
     const std::string& deviceName() const { return deviceName_; }
+    uint64_t deviceLocalMb() const { return deviceLocalMb_; }
     uint64_t lastStepMs() const { return lastStepMs_; }
 
 private:
@@ -182,6 +230,7 @@ private:
     uint64_t stagingReadbackOff_ = 0;
 
     std::string deviceName_;
+    uint64_t deviceLocalMb_ = 0;
 };
 
 }  // namespace gpu

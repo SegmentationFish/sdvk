@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sdvk - SDXL on Vulkan</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+    <aside class="panel">
+        <header class="brand">
+            <div class="logo">sdvk</div>
+            <div class="meta">
+                <span id="status" class="dot" title="engine state"></span>
+                <span id="device">connecting…</span>
+            </div>
+        </header>
+
+        <section class="field">
+            <label for="model">Model folder</label>
+            <div class="row">
+                <input id="model" spellcheck="false" placeholder="E:/ofc-data/noobai">
+                <button id="probe" class="ghost" title="Inspect folder">Scan</button>
+            </div>
+            <div id="modelInfo" class="hint"></div>
+        </section>
+
+        <section class="field">
+            <label for="prompt">Prompt</label>
+            <textarea id="prompt" rows="4" placeholder="a lighthouse at dusk, oil painting"></textarea>
+        </section>
+
+        <section class="field">
+            <label for="negative">Negative</label>
+            <textarea id="negative" rows="2" placeholder="low quality, blurry, watermark"></textarea>
+        </section>
+
+        <section class="field grid2">
+            <div>
+                <label for="width">Width</label>
+                <input id="width" type="number" value="768" min="64" step="8">
+            </div>
+            <div>
+                <label for="height">Height</label>
+                <input id="height" type="number" value="768" min="64" step="8">
+            </div>
+        </section>
+
+        <section class="field">
+            <div class="labeled">
+                <label for="steps">Steps</label>
+                <output id="stepsOut">20</output>
+            </div>
+            <input id="steps" type="range" min="1" max="60" value="20">
+        </section>
+
+        <section class="field">
+            <div class="labeled">
+                <label for="cfg">CFG</label>
+                <output id="cfgOut">3.0</output>
+            </div>
+            <input id="cfg" type="range" min="1" max="15" step="0.1" value="3">
+        </section>
+
+        <section class="field grid2">
+            <div>
+                <label for="sampler">Sampler</label>
+                <select id="sampler">
+                    <option value="euler">euler</option>
+                    <option value="euler_a">euler a</option>
+                </select>
+            </div>
+            <div>
+                <label for="seed">Seed</label>
+                <input id="seed" type="number" value="1234" min="0">
+            </div>
+        </section>
+
+        <section class="field">
+            <div class="labeled">
+                <label>Options</label>
+            </div>
+            <div class="checks">
+                <label class="check"><input id="vpred" type="checkbox" checked> v-pred</label>
+                <label class="check"><input id="zsnr" type="checkbox"> zero SNR</label>
+                <label class="check"><input id="dynthresh" type="checkbox"> dyn thresh</label>
+                <label class="check"><input id="rescale" type="checkbox"> cfg rescale</label>
+            </div>
+        </section>
+
+        <button id="run" class="primary">Generate</button>
+        <button id="stop" class="ghost stop" hidden>Cancel</button>
+        <div class="hint" id="runHint">The first run loads the model; later runs reuse it.</div>
+        <footer class="foot">
+            <span id="ver">sdvk</span>
+            <span>GPL-3.0-only</span>
+        </footer>
+    </aside>
+
+    <main class="stage">
+        <div id="canvas" class="canvas">
+            <div class="empty">
+                <div class="emptyTitle">No image yet</div>
+                <div class="emptyText">Set a model folder and a prompt, then press Generate.</div>
+            </div>
+            <img id="preview" alt="" hidden>
+        </div>
+        <div class="bar">
+            <div class="prog"><div id="progFill" class="progFill"></div></div>
+            <div class="barText">
+                <span id="progText">idle</span>
+                <span id="progMeta"></span>
+            </div>
+        </div>
+        <div class="log" id="log"></div>
+    </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

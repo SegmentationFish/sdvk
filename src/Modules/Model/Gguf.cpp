@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // GGUF reader (format: magic GGUF / version / counts / KV metadata / tensor table / aligned data section)
 #include "Gguf.hpp"
 #include <cstring>
@@ -286,6 +289,10 @@ bool GgufFile::readArrayItems(uint32_t etype, uint64_t count, GgufMeta& m) const
 
 bool GgufFile::open(const std::string& path, std::string* err) {
     path_ = path;
+    if (f_.is_open()) f_.close();
+    meta_.clear();
+    tensors_.clear();
+    byName_.clear();
     f_.open(path, std::ios::binary);
     if (!f_) {
         if (err) *err = "cannot open " + path;
@@ -541,6 +548,32 @@ bool GgufFile::readQ8(const std::string& name, std::vector<int8_t>& q, std::vect
         const uint8_t* blk = raw.data() + b * 34;
         scales[(size_t)b] = fp16ToFp32(readU16(blk));
         std::memcpy(q.data() + (size_t)b * 32, blk + 2, 32);
+    }
+    return true;
+}
+
+bool GgufFile::readQ8Into(const std::string& name, int8_t* qDst, float* scaleDst, std::string* err) const {
+    const GgufTensor* tp = find(name);
+    if (!tp) {
+        if (err) *err = "tensor not found: " + name;
+        return false;
+    }
+    const GgufTensor& t = *tp;
+    if (t.type != GgmlType::Q8_0) {
+        if (err) *err = "tensor " + name + " is " + ggmlTypeName(t.type) + ", not Q8_0";
+        return false;
+    }
+    uint64_t nb = t.nElems() / 32;
+    f_.clear();
+    f_.seekg((std::streamoff)(dataOffset_ + t.offset));
+    uint8_t block[34];
+    for (uint64_t b = 0; b < nb; b++) {
+        if (!readExact(block, 34)) {
+            if (err) *err = "read failed: " + name;
+            return false;
+        }
+        scaleDst[b] = fp16ToFp32(readU16(block));
+        std::memcpy(qDst + b * 32, block + 2, 32);
     }
     return true;
 }

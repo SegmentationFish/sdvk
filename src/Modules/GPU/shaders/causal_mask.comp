@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // causal mask on attention scores [batch, rows, cols]: s[r,c] = -inf if c > r
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer S { float s[]; };

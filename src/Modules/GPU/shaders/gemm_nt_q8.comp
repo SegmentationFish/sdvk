@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // C[M,N] = A[M,K] * B[N,K]^T ; A fp32 row-major, B = Q8_0 payload (uint32 packed int8, 4/word)
 // + fp32 scales (one per 32 elements). B row stride = K. Batched on z.
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -11,8 +14,10 @@ layout(push_constant) uniform PC { uint M; uint N; uint K; uint mode;
                                   uint lda; uint ldb; uint ldc; uint pad; } pc;
 
 const uint BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
-shared float As[BM][BK];
-shared float Bs[BN][BK];
+// +1 padding: with a 16-float row stride the inner Bs[tx*4+j][k] reads land a warp on two
+// banks (16-way conflict); +1 makes the stride coprime with 32
+shared float As[BM][BK + 1];
+shared float Bs[BN][BK + 1];
 
 float deqB(uint gr, uint gc){
     uint fl = gr * pc.K + gc;

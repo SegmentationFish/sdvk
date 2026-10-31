@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 
 // C[M,N] = A[M,K] * B[K,N], all row-major fp32
 // tile: 64x64 output per workgroup, 16x16 threads, 4x4 per thread, BK=16

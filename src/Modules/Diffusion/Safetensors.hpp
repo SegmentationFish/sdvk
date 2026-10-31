@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Segmented Fish
+// sdvk - see LICENSE at the repository root. No warranty.
 // Minimal safetensors reader (F32/F16/I64/I32 headers; tensor data read on demand).
 #pragma once
 
@@ -19,6 +22,11 @@ struct STTensor {
 class Safetensors {
 public:
     bool open(const std::string& path);
+    // parse only if this file has not been opened yet (lets several views share one handle)
+    bool ensureOpen(const std::string& path);
+    bool isOpen() const { return !ts_.empty(); }
+    const std::string& path() const { return path_; }
+
     const std::vector<STTensor>& tensors() const { return ts_; }
     const STTensor* find(const std::string& name) const;
     bool read(const STTensor& t, void* dst, uint64_t bytes) const;
@@ -29,6 +37,7 @@ public:
 
 private:
     mutable std::ifstream f_;
+    std::string path_;
     std::vector<STTensor> ts_;
     std::unordered_map<std::string, size_t> idx_;
     uint64_t dataStart_ = 0;
