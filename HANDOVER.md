@@ -100,7 +100,11 @@ sdvk = 自研纯 Vulkan compute 的 SDXL 文生图引擎（C++/GLSL，无第三�
 ## 7. 产品路线（2026-10-31，与用户确认的方向）
 
 - **NodesVkimagine（UI）**：ComfyUI 前端已提取 → `D:/tmp/comfyui/web/comfyui_frontend_package/static`（wheel `comfyui-frontend-package==1.57.6`，98MB，index.html+assets；未改其源码，GPL-3.0 与本仓库兼容，分发时保留其 LICENSE/署名）。前端依赖端点：`/object_info`、`/prompt`、`/view`、`/ws`、`/system_stats`（另有 /queue、/history、/interrupt 等）。下一步：在 `server.cpp` 实现这组协议 + 图执行器，最小节点集 `CheckpointLoaderSimple / CLIPTextEncode / KSampler / VAEDecode / SaveImage` → `run()`；之后可做 desktop 包装（Tauri/WebView2，内存与浏览器标签页相当，不省）。
-- **兼容性**：下一步做 **SD1.5** 适配（单 CLIP-L、无 CLIP-G、VAE scale 0.18215、调度差异）+ ModelSet 架构识别/适配器接口。FLUX/SD3/视频模型是换引擎的量级，且 6GB 显存放不下量化权重（FLUX Q4 仍 >7GB）——需换卡后再启动。
+- **兼容性**：下一步做 **SD1.5** 适配 + ModelSet 架构识别/适配器接口。已实测 SD1.5 checkpoint（`E:/ofc-data/sd15/v1-5-pruned-emaonly.safetensors`，1145 张量，**F32**）：
+  - 键：`model.diffusion_model.*`（686）、`cond_stage_model.transformer.*`（197，CLIP-L 768，无 projection → pooled=EOS hidden）、`first_stage_model.*`（VAE decoder 138+post_quant 2）、`alphas_cumprod` 等。
+  - UNet 层序（LDM 命名）：in 0 conv_in(4→320)；1,2=res+attn(320)；3=downsample(320)；4,5=res+attn(640)；6=downsample(640)；7,8=res+attn(1280)；9=downsample(1280)；10,11=res(1280)；middle 0=res,1=attn,2=res(1280)；output 0-2(1280 res+attn)、3-5(640)、6-8(320, 含 upsample)、9-11(320 res+attn)；out.0 norm + out.2 conv。注意力每块 1 层、heads=8、attn2 ctx 维 768。
+  - **无 label_emb/add_embedding** → temb = time_embed(320→1280)；VAE scale 0.18215；默认 eps 预测（非 vpred）；调度 scaled_linear + leading + offset=1。
+  - 待实现：`unetForwardSd15`（新前向）、单文件 checkpoint 同时供给 unet/te1/vae、tokenizer 复用、arch 检测（`--models` 输出架构）、VAE scale 参数化；随后与 torch 参考对拍。FLUX/SD3/视频模型是换引擎的量级，且 6GB 显存放不下量化权重（FLUX Q4 仍 >7GB）——需换卡后再启动。
 - **提速**：少步蒸馏是正解（LCM/Lightning/Turbo，4–8 步、cfg 1–2）→ 单图约 10–20s（当前 30 步 × 4.9s ≈ 147s）；引擎侧只需加 LCM 调度 + cfg≤1 跳过 uncond pass。需要权重方案：LoRA（需加权重合并）或 turbo GGUF（需找/量化）——待用户定。
 - 辅助优化余量：gemm_nt_q8 约占 52%（已试 BN=128 负优化回退；下一步 QKV 合一/向量化加载 ~1.3×）、注意力融合 ~3–5%、copy_nd/ew2 再融合。
 
