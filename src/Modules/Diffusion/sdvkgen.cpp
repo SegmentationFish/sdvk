@@ -1568,11 +1568,7 @@ static BufRef vaeUpConv(const BufRef& x, const std::string& p, uint32_t C, uint3
 static std::vector<float> vaeDecodeChain(const GenParams& p, const std::vector<float>& lat, uint32_t H,
                                          uint32_t Wd) {
     uint64_t latFloats = (uint64_t)4 * H * Wd;
-    clearWeights();
-    // the sampler's step arena is still resident here; drop it first or the VAE cannot get room
-    G.eng.initArenas(128ull << 20, 128ull << 20);
-    G.paramArena.init(G.eng.device(), G.eng.physDevice(), 640ull << 20, true, false);
-    loadVaeWeights(p);
+    // weights are already resident: vaeDecode() loads them once for the full and the tiled paths
     // vaeResnet slots rewind after each block, so the step arena holds one live resnet chain,
     // not the sum of all activations; cap the estimate so 96^2 stays under the 6 GiB ceiling
     // Measured need: ~2.65 GB at a 96x96 latent, ~3.25 GB at 96x128 (the old 2600/4096 slope
@@ -1744,11 +1740,16 @@ static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>
     G.eng.initArenas(128ull << 20, 128ull << 20);
     G.paramArena.init(G.eng.device(), G.eng.physDevice(), 640ull << 20, true, false);
     loadVaeWeights(p);
-    if (p.vaeTile) return vaeDecodeTiled(p, lat, H, Wd, p.vaeTile, p.vaeOverlap);
+    // Large canvases decode in tiles by default: a full 96x96 pass asks for ~3 GB in one
+    // device-local allocation, and this driver kills the process outright (no error return)
+    // when that allocation cannot be satisfied. Tiles keep every pass small; --vae-tile 0
+    // forces the full-image pass back on.
+    uint32_t tile = (H * Wd > 64u * 64u) ? p.vaeTile : 0;
+    if (tile) return vaeDecodeTiled(p, lat, H, Wd, tile, p.vaeOverlap);
     try {
         return vaeDecodeChain(p, lat, H, Wd);
     } catch (const std::exception& e) {
-        if (H * Wd <= 64 * 64) throw;  // small images have nothing to gain
+        if (H * Wd <= 64 * 64 || std::getenv("OFC_NO_AUTOTILE")) throw;
         std::printf("vae: full decode failed (%s), retrying tiled\n", e.what());
         return vaeDecodeTiled(p, lat, H, Wd, 48, 8);
     }
