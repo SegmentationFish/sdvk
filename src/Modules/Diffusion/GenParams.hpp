@@ -104,6 +104,8 @@ struct GenParams {
 
     // ---- runtime
     uint32_t stepMb = 0, scratchMb = 0, vStepMb = 0;
+    uint32_t vaeTile = 0;     // 0 = full-image decode (auto-fallback to 48x48 tiles on OOM); >0 = tile edge
+    uint32_t vaeOverlap = 8;  // latent px of overlap between VAE tiles
     uint32_t paramMb = 0;    // UNet weight arena, 0 = auto from the file size
     uint32_t teParamMb = 0;  // text encoder arena, 0 = auto from the file sizes
     std::string spvDir = "shaders";

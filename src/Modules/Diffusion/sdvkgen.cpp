@@ -1565,7 +1565,8 @@ static BufRef vaeUpConv(const BufRef& x, const std::string& p, uint32_t C, uint3
 
 // Full VAE decode pass: load VAE weights and decode a 4xHxWd latent (sampler space, i.e.
 // still in the x0 scale) into CHW RGB in [-1,1].
-static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>& lat, uint32_t H, uint32_t Wd) {
+static std::vector<float> vaeDecodeChain(const GenParams& p, const std::vector<float>& lat, uint32_t H,
+                                         uint32_t Wd) {
     uint64_t latFloats = (uint64_t)4 * H * Wd;
     clearWeights();
     // the sampler's step arena is still resident here; drop it first or the VAE cannot get room
@@ -1687,6 +1688,70 @@ static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vaeT0).count(),
                 (unsigned long long)vStepMB);
     return img;
+}
+
+// Tiled decode: the full-image pass needs ~2.6-3.3 GB of device-local memory at 768-class
+// canvases, which a 6 GB card cannot always give (the commit charge alone can refuse it).
+// Splitting the latent into overlapping tiles keeps each pass at tile-sized memory; the overlap
+// is blended with complementary linear ramps so the seams average out.
+static std::vector<float> vaeDecodeTiled(const GenParams& p, const std::vector<float>& lat, uint32_t H, uint32_t Wd,
+                                         uint32_t tile, uint32_t ov) {
+    ov = std::max(1u, std::min(ov, tile / 2));
+    const uint32_t step = tile - ov;
+    const uint32_t OH = H * 8, OW = Wd * 8, ovPx = ov * 8;
+    std::vector<float> acc((size_t)3 * OH * OW, 0.0f), wsum((size_t)OH * OW, 0.0f);
+    uint32_t tiles = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t y0 = 0; y0 < H; y0 += step) {
+        uint32_t y1 = std::min(H, y0 + tile);
+        for (uint32_t x0 = 0; x0 < Wd; x0 += step) {
+            uint32_t x1 = std::min(Wd, x0 + tile);
+            uint32_t th = y1 - y0, tw = x1 - x0, th8 = th * 8, tw8 = tw * 8;
+            std::vector<float> sub((size_t)4 * th * tw);
+            for (uint32_t c = 0; c < 4; c++)
+                for (uint32_t y = 0; y < th; y++)
+                    std::memcpy(&sub[((size_t)c * th + y) * tw], &lat[((size_t)c * H + y0 + y) * Wd + x0], tw * 4);
+            std::vector<float> img = vaeDecodeChain(p, sub, th, tw);
+            for (uint32_t c = 0; c < 3; c++)
+                for (uint32_t y = 0; y < th8; y++) {
+                    float wy = 1.0f;
+                    if (y0 > 0) wy = std::min(wy, (y + 0.5f) / (float)ovPx);
+                    if (y1 < H) wy = std::min(wy, (th8 - y - 0.5f) / (float)ovPx);
+                    for (uint32_t x = 0; x < tw8; x++) {
+                        float wx = 1.0f;
+                        if (x0 > 0) wx = std::min(wx, (x + 0.5f) / (float)ovPx);
+                        if (x1 < Wd) wx = std::min(wx, (tw8 - x - 0.5f) / (float)ovPx);
+                        float w = wx * wy;
+                        size_t gi = ((size_t)c * OH + (y0 * 8 + y)) * OW + (x0 * 8 + x);
+                        acc[gi] += img[((size_t)c * th8 + y) * tw8 + x] * w;
+                        if (c == 0) wsum[(size_t)(y0 * 8 + y) * OW + (x0 * 8 + x)] += w;
+                    }
+                }
+            tiles++;
+            if (x1 >= Wd) break;
+        }
+        if (y1 >= H) break;
+    }
+    for (size_t i = 0; i < acc.size(); i++) acc[i] /= std::max(wsum[i / 3], 1e-6f);
+    std::printf("vae tiled decode %ux%u: %u tiles of %u px (+%u overlap), %.0f ms\n", OW, OH, tiles, tile, ov,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return acc;
+}
+
+static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>& lat, uint32_t H, uint32_t Wd) {
+    clearWeights();
+    // the sampler's step arena is still resident here; drop it first or the VAE cannot get room
+    G.eng.initArenas(128ull << 20, 128ull << 20);
+    G.paramArena.init(G.eng.device(), G.eng.physDevice(), 640ull << 20, true, false);
+    loadVaeWeights(p);
+    if (p.vaeTile) return vaeDecodeTiled(p, lat, H, Wd, p.vaeTile, p.vaeOverlap);
+    try {
+        return vaeDecodeChain(p, lat, H, Wd);
+    } catch (const std::exception& e) {
+        if (H * Wd <= 64 * 64) throw;  // small images have nothing to gain
+        std::printf("vae: full decode failed (%s), retrying tiled\n", e.what());
+        return vaeDecodeTiled(p, lat, H, Wd, 48, 8);
+    }
 }
 
 // ================================================================ PNG writer

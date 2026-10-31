@@ -75,6 +75,8 @@ static void usage() {
         "  --spv <dir>             shader (.spv) directory (default shaders)\n"
         "  --param-mb <n>          UNet weight arena in MB (default: from the file size)\n"
         "  --step-mb/--scratch-mb/--vstep-mb <n>   arena sizes in MB\n"
+        "  --vae-tile <n>          decode the VAE in n-latent-px tiles (0 = auto)\n"
+        "  --vae-overlap <n>       tile overlap in latent px (default 8)\n"
         "  -v, --verbose           print timing detail\n"
         "  --check                 report device, heaps and canvas suggestions\n"
         "  --bench                 --check plus bandwidth and GEMM benchmarks\n"
@@ -291,6 +293,14 @@ static Parsed parseArgs(int argc, char** argv) {
         } else if (a == "--vstep-mb") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.vStepMb = (uint32_t)std::strtoul(val().c_str(), nullptr, 10);
+            i++;
+        } else if (a == "--vae-tile") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.vaeTile = (uint32_t)std::strtoul(val().c_str(), nullptr, 10);
+            i++;
+        } else if (a == "--vae-overlap") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.vaeOverlap = (uint32_t)std::strtoul(val().c_str(), nullptr, 10);
             i++;
         } else if (a == "--lat-in") {
             if (!need(i, argc, a.c_str(), o)) break;
