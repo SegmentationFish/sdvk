@@ -23,6 +23,9 @@ void main(){
         barrier();
     }
     float m = red[0];
+    // red[] is reused for the sum below; without this barrier a fast thread can overwrite red[0]
+    // before a lagging thread has read the row max, mixing the max and the sum.
+    barrier();
     float s = 0.0;
     for(uint j=tid;j<pc.cols;j+=256) s += exp(x[r*pc.cols+j] - m);
     red[tid] = s;

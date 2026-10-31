@@ -95,6 +95,9 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     void init();
+    // Pick a Vulkan physical device by index (0-based among compute-capable devices).
+    void setDeviceIndex(int i) { devIndex_ = i; }
+    int deviceIndex() const { return devIndex_; }
     void destroy();
     bool alive() const { return instance_ != VK_NULL_HANDLE; }
 
@@ -180,6 +183,13 @@ private:
     VkDeviceMemory dlMem_ = VK_NULL_HANDLE;
     void* dlMap_ = nullptr;
     uint64_t dlCap_ = 0;
+    // one persistent host-visible buffer for uploadNow calls made outside a step (per-step
+    // latents/embeddings). Allocating and freeing one per call churned the driver allocator
+    // until later small allocations failed after a handful of sampler steps.
+    VkBuffer oneBuf_ = VK_NULL_HANDLE;
+    VkDeviceMemory oneMem_ = VK_NULL_HANDLE;
+    void* oneMap_ = nullptr;
+    uint64_t oneCap_ = 0;
 
     // dependency-aware barrier state
     std::vector<TouchRegion> pending_;
@@ -231,9 +241,13 @@ private:
     uint64_t stagingUploadOff_ = 0;
     uint64_t stagingReadbackOff_ = 0;
 
+    int devIndex_ = 0;
     std::string deviceName_;
     uint64_t deviceLocalMb_ = 0;
 };
+
+// Enumerate compute-capable Vulkan devices as "index|name|vramMB".
+std::vector<std::string> vkListDevices();
 
 }  // namespace gpu
 }  // namespace ofc

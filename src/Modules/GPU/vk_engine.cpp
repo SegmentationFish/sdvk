@@ -256,6 +256,50 @@ void Arena::destroy() {
     dev_ = VK_NULL_HANDLE;
 }
 
+
+std::vector<std::string> vkListDevices() {
+    std::vector<std::string> out;
+    volkInitialize();
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "ofc-vk-list";
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) return out;
+    volkLoadInstance(inst);
+    uint32_t n = 0;
+    if (vkEnumeratePhysicalDevices(inst, &n, nullptr) != VK_SUCCESS || n == 0) {
+        vkDestroyInstance(inst, nullptr);
+        return out;
+    }
+    std::vector<VkPhysicalDevice> devs(n);
+    vkEnumeratePhysicalDevices(inst, &n, devs.data());
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t qn = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, nullptr);
+        std::vector<VkQueueFamilyProperties> qs(qn);
+        vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, qs.data());
+        bool compute = false;
+        for (auto& q : qs) if (q.queueFlags & VK_QUEUE_COMPUTE_BIT) { compute = true; break; }
+        if (!compute) continue;
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(devs[i], &p);
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(devs[i], &mp);
+        uint64_t best = 0;
+        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+            if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                best = std::max(best, (uint64_t)mp.memoryHeaps[h].size);
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "%u|%s|%llu", i, p.deviceName,
+                      (unsigned long long)(best >> 20));
+        out.push_back(buf);
+    }
+    vkDestroyInstance(inst, nullptr);
+    return out;
+}
+
 void Engine::init() {
     VK_CHECK(volkInitialize());
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -270,6 +314,7 @@ void Engine::init() {
     VK_CHECK(vkEnumeratePhysicalDevices(instance_, &n, nullptr));
     std::vector<VkPhysicalDevice> devs(n);
     VK_CHECK(vkEnumeratePhysicalDevices(instance_, &n, devs.data()));
+    std::vector<std::pair<VkPhysicalDevice, uint32_t>> cand;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, nullptr);
@@ -277,12 +322,21 @@ void Engine::init() {
         vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, qs.data());
         for (uint32_t q = 0; q < qn; q++)
             if (qs[q].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                phys_ = devs[i];
-                qfam_ = q;
+                cand.push_back({devs[i], q});
                 break;
             }
-        if (phys_) break;
     }
+    if (cand.empty()) {
+        std::fprintf(stderr, "no compute device\n");
+        std::exit(1);
+    }
+    size_t pick = (size_t)devIndex_;
+    if (pick >= cand.size()) {
+        std::fprintf(stderr, "device index %d out of range (%zu compute devices), using 0\n", devIndex_, cand.size());
+        pick = 0;
+    }
+    phys_ = cand[pick].first;
+    qfam_ = cand[pick].second;
     if (!phys_) {
         std::fprintf(stderr, "no compute device\n");
         std::exit(1);
@@ -369,6 +423,9 @@ void Engine::init() {
 
 void Engine::destroy() {
     if (dev_ == VK_NULL_HANDLE) return;
+    // Draining the device first lets the driver retire queued work in order. Tearing down while
+    // commands are still in flight is what pushes WDDM into a display reset (black screen).
+    vkDeviceWaitIdle(dev_);
     if (stepCmd_) vkFreeCommandBuffers(dev_, pool_, 1, &stepCmd_);
     if (cachedCmd_) vkFreeCommandBuffers(dev_, pool_, 1, &cachedCmd_);
     stepCmd_ = cachedCmd_ = VK_NULL_HANDLE;
@@ -385,11 +442,19 @@ void Engine::destroy() {
     scratchArena_.destroy();
     stagingArena_.destroy();
     if (dlBuf_) vkDestroyBuffer(dev_, dlBuf_, nullptr);
+    if (oneBuf_) {
+        vkDestroyBuffer(dev_, oneBuf_, nullptr);
+        vkFreeMemory(dev_, oneMem_, nullptr);
+    }
     if (dlMem_) vkFreeMemory(dev_, dlMem_, nullptr);
     dlBuf_ = VK_NULL_HANDLE;
     dlMem_ = VK_NULL_HANDLE;
     dlMap_ = nullptr;
     dlCap_ = 0;
+    oneBuf_ = VK_NULL_HANDLE;
+    oneMem_ = VK_NULL_HANDLE;
+    oneMap_ = nullptr;
+    oneCap_ = 0;
     if (upBuf_) vkDestroyBuffer(dev_, upBuf_, nullptr);
     if (upMem_) vkFreeMemory(dev_, upMem_, nullptr);
     upBuf_ = VK_NULL_HANDLE;
@@ -642,7 +707,7 @@ void Engine::oneShot(const std::function<void(VkCommandBuffer)>& fn) {
     vkFreeCommandBuffers(dev_, pool_, 1, &cb);
 }
 
-static VkBuffer createStaging(VkDevice dev, VkPhysicalDevice phys, uint64_t size) {
+static VkBuffer createStaging(VkDevice dev, VkPhysicalDevice phys, uint64_t size, VkDeviceMemory* outMem) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -671,7 +736,8 @@ static VkBuffer createStaging(VkDevice dev, VkPhysicalDevice phys, uint64_t size
     VkDeviceMemory mem = nullptr;
     VK_CHECK(vkAllocateMemory(dev, &ai, nullptr, &mem));
     VK_CHECK(vkBindBufferMemory(dev, buf, mem, 0));
-    return buf;  // memory leaked intentionally: transient, bounded count
+    *outMem = mem;
+    return buf;  // caller owns both; free the buffer and the memory
 }
 
 void Engine::flushUploads() {
@@ -770,34 +836,21 @@ void Engine::uploadNow(BufRef dst, const void* src, uint64_t bytes) {
         copyBuf(dst, slot);
         return;
     }
-    VkBuffer buf = createStaging(dev_, phys_, bytes);
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(dev_, buf, &req);
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
-    uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
-        if (!(req.memoryTypeBits & (1u << i))) continue;
-        VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        if ((mp.memoryTypes[i].propertyFlags & want) == want) {
-            idx = i;
-            break;
+    if (bytes > oneCap_) {
+        if (oneBuf_) {
+            vkDestroyBuffer(dev_, oneBuf_, nullptr);
+            vkFreeMemory(dev_, oneMem_, nullptr);
+            oneBuf_ = VK_NULL_HANDLE;
+            oneMem_ = VK_NULL_HANDLE;
+            oneMap_ = nullptr;
         }
+        oneCap_ = std::max<uint64_t>(bytes, 16ull << 20);
+        oneBuf_ = createStaging(dev_, phys_, oneCap_, &oneMem_);
+        VK_CHECK(vkMapMemory(dev_, oneMem_, 0, VK_WHOLE_SIZE, 0, &oneMap_));
     }
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = idx;
-    VkDeviceMemory mem = nullptr;
-    VK_CHECK(vkAllocateMemory(dev_, &ai, nullptr, &mem));
-    VK_CHECK(vkBindBufferMemory(dev_, buf, mem, 0));
-    void* p = nullptr;
-    VK_CHECK(vkMapMemory(dev_, mem, 0, req.size, 0, &p));
-    std::memcpy(p, src, (size_t)bytes);
-    vkUnmapMemory(dev_, mem);
+    std::memcpy(oneMap_, src, (size_t)bytes);
     VkBufferCopy cp{0, dst.offset, bytes};
-    oneShot([&](VkCommandBuffer cb) { vkCmdCopyBuffer(cb, buf, dst.buf, 1, &cp); });
-    vkDestroyBuffer(dev_, buf, nullptr);
-    vkFreeMemory(dev_, mem, nullptr);
+    oneShot([&](VkCommandBuffer cb) { vkCmdCopyBuffer(cb, oneBuf_, dst.buf, 1, &cp); });
 }
 
 void Engine::ensureDlStaging(uint64_t bytes) {
