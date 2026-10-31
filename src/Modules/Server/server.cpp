@@ -10,18 +10,25 @@
 //   GET  /api/models       classify a model folder (?dir=...)
 //   POST /api/generate     run one job, returns JSON (or ?stream=1 for SSE progress)
 //   GET  /api/image?path=  fetch a generated PNG from the output folder
+//   POST /api/audio/process  run the audio node chain over a WAV in input|output
+//   GET  /api/audio?path=  fetch a rendered WAV
 //   GET  /api/job?id=      job status
 //   POST /api/cancel       cancel the running job at the next step boundary
+#include "Modules/Audio/Dsp.hpp"
+#include "Modules/Audio/Wav.hpp"
 #include "Modules/Diffusion/Eval.hpp"
 #include "Modules/Diffusion/ModelSet.hpp"
+#include "Modules/GPU/vk_engine.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -131,7 +138,10 @@ static std::string urlDecode(const std::string& s) {
     return o;
 }
 
-static std::map<std::string, std::string> parseQuery(const std::string& q) {
+static std::map<std::string, std::string> parseQuery(std::string q) {
+    // req.query still carries the leading '?'; strip it or keys become "?async" and flags like
+    // ?async=1 silently fall back to the blocking synchronous path.
+    if (!q.empty() && q[0] == '?') q.erase(0, 1);
     std::map<std::string, std::string> m;
     size_t i = 0;
     while (i < q.size()) {
@@ -289,6 +299,8 @@ static std::string mimeOf(const std::string& p) {
     if (e == ".css") return "text/css; charset=utf-8";
     if (e == ".json") return "application/json; charset=utf-8";
     if (e == ".png") return "image/png";
+    if (e == ".wav") return "audio/wav";
+    if (e == ".ppm") return "image/x-portable-pixmap";
     if (e == ".svg") return "image/svg+xml";
     if (e == ".ico") return "image/x-icon";
     if (e == ".woff2") return "font/woff2";
@@ -356,8 +368,10 @@ static void appendCors(Response& r) {
     r.extra.push_back({"Access-Control-Allow-Methods", "GET, POST, OPTIONS"});
 }
 
+static int gCurrentDevice = 0;
 static std::string gWebRoot = "webui";
 static std::string gOutDir = "output";
+static std::string gInputDir = "input";
 
 // Turns a JSON body into GenParams. Unknown keys are ignored so the API stays forward compatible.
 static bool paramsFromJson(const FlatJson& j, GenParams& p, std::string& err) {
@@ -375,6 +389,7 @@ static bool paramsFromJson(const FlatJson& j, GenParams& p, std::string& err) {
     if (has("vae")) p.models.vae = j.s.at("vae");
     if (has("tok")) p.models.tok1 = j.s.at("tok");
     if (has("tok2")) p.models.tok2 = j.s.at("tok2");
+    if (j.n.count("device")) p.device = (int)j.n.at("device");
     if (j.n.count("steps")) p.steps = std::max(1, (int)j.n.at("steps"));
     if (j.n.count("cfg")) p.cfg = (float)j.n.at("cfg");
     if (j.n.count("rescale")) p.rescale = (float)j.n.at("rescale");
@@ -391,11 +406,47 @@ static bool paramsFromJson(const FlatJson& j, GenParams& p, std::string& err) {
         return false;
     }
     if (j.s.count("spacing")) p.spacing = j.s.at("spacing");
+    if (j.n.count("hires")) p.hires = (float)j.n.at("hires");
+    if (j.n.count("hiresDenoise")) p.hiresRefine = (float)j.n.at("hiresDenoise");
+    if (j.n.count("vaeTile")) p.vaeTile = (uint32_t)j.n.at("vaeTile");
+    if (j.n.count("vaeOverlap")) p.vaeOverlap = (uint32_t)j.n.at("vaeOverlap");
+    if (j.n.count("vstepMb")) p.vStepMb = (uint32_t)j.n.at("vstepMb");
+    if (j.n.count("paramMb")) p.paramMb = (uint32_t)j.n.at("paramMb");
+    if (j.n.count("stepMb")) p.stepMb = (uint32_t)j.n.at("stepMb");
+    if (j.n.count("scratchMb")) p.scratchMb = (uint32_t)j.n.at("scratchMb");
+    if (j.n.count("pngCompress")) p.pngCompress = (int)j.n.at("pngCompress");
     if (j.n.count("cropX")) p.cropOffsetX = (uint32_t)j.n.at("cropX");
     if (j.n.count("cropY")) p.cropOffsetY = (uint32_t)j.n.at("cropY");
+    // img2img: the reference image is a path on this machine (POST /api/upload stores one and
+    // returns its path). Every earlier version of this function accepted "init" in the has()
+    // guard but never copied it into GenParams, so HTTP img2img silently did txt2img.
+    if (j.s.count("init") && !j.s.at("init").empty()) {
+        p.initImage = j.s.at("init");
+        p.useInit = true;
+    }
+    // inpaint: "mask" is a path from POST /api/upload (white = repaint). Without it the same
+    // request is plain img2img, so the two share every other field.
+    if (j.s.count("mask") && !j.s.at("mask").empty()) {
+        if (p.initImage.empty()) {
+            err = "\"mask\" needs \"init\"";
+            return false;
+        }
+        p.maskImage = j.s.at("mask");
+    }
+    if (j.n.count("maskFeather")) p.maskFeather = (uint32_t)std::max(0.0, j.n.at("maskFeather"));
+    if (j.b.count("maskInvert")) p.maskInvert = j.b.at("maskInvert");
+    if (j.n.count("cropW") && j.n.count("cropH")) {
+        p.crop.x = j.n.count("cropX") ? (uint32_t)j.n.at("cropX") : 0;
+        p.crop.y = j.n.count("cropY") ? (uint32_t)j.n.at("cropY") : 0;
+        p.crop.w = (uint32_t)j.n.at("cropW");
+        p.crop.h = (uint32_t)j.n.at("cropH");
+    }
     if (p.height == 0) p.height = p.width;
-    if (p.width % 8 || p.height % 8 || p.width < 64 || p.height < 64) {
-        err = "width/height must be multiples of 8 and at least 64";
+    // SDXL/SD1.5 downsample the latent three times, so the pixel size must be a multiple of 64
+    // (latent multiple of 8). A 720-wide canvas gives a 90-wide latent whose odd half breaks the
+    // UNet skip shapes and only surfaces later as a confusing arena failure.
+    if (p.width % 64 || p.height % 64 || p.width < 64 || p.height < 64) {
+        err = "width/height must be multiples of 64 and at least 64 (e.g. 832x1216, 768x1024)";
         return false;
     }
     if (p.steps < 1 || p.steps > 200) {
@@ -467,7 +518,7 @@ static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
     };
     try {
         // The model stays resident between jobs; loading it is the expensive part.
-        if (gLoaded != p.models.modelDir) {
+        if (gLoaded != p.models.modelDir || gCurrentDevice != p.device) {
             unloadModel(gModel);
             std::string e;
             if (!loadModel(gModel, p, onProgress, e)) {
@@ -477,6 +528,7 @@ static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
                 return;
             }
             gLoaded = p.models.modelDir;
+            gCurrentDevice = p.device;
         }
         RunResult r = run(gModel, p, onProgress);
         job->error = r.error;
@@ -500,7 +552,24 @@ static void handleInfo(Response& r) {
       << ",\"device\":"
       << jstr(gModel.deviceName) << ",\"model\":" << jstr(gModel.modelName) << ",\"loaded\":"
       << (gModel.loaded ? "true" : "false") << ",\"modelDir\":" << jstr(gLoaded) << ",\"outDir\":" << jstr(gOutDir)
-      << ",\"samplers\":[\"euler\",\"euler_a\"],\"spacings\":[\"leading\",\"trailing\"]}";
+      << ",\"inputDir\":" << jstr(gInputDir)
+      << ",\"caps\":[\"txt2img\",\"img2img\",\"inpaint\",\"upload\",\"vae\",\"hires\",\"batch\"],\"samplers\":["
+         "\"euler\",\"euler_a\"],\"spacings\":[\"leading\",\"trailing\"]}";
+    setJson(r, 200, o.str());
+}
+
+// Drop the resident model and its device memory, then hand the process working set back to the
+// OS. Freeing VkDeviceMemory alone leaves pages resident in the process; on Windows the working
+// set has to be trimmed explicitly for RAM to actually drop.
+static void handleUnload(Response& r) {
+    std::lock_guard<std::mutex> lk(gModelMu);
+    unloadModel(gModel);
+    gLoaded.clear();
+#ifdef _WIN32
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+#endif
+    std::ostringstream o;
+    o << "{\"ok\":true,\"unloaded\":true}";
     setJson(r, 200, o.str());
 }
 
@@ -553,7 +622,10 @@ static void handleGenerate(const Request& req, Response& r) {
         if (gJobs.size() > 64) gJobs.erase(gJobs.begin());
     }
 
-    auto q = parseQuery(req.query);
+    // Request::query is never populated by the HTTP parser; the query string lives in req.path
+    // after the '?'. Reading the empty field made every call take the blocking synchronous path.
+    size_t qm = req.path.find('?');
+    auto q = parseQuery(qm == std::string::npos ? std::string() : req.path.substr(qm + 1));
     bool async = q.count("async") != 0;
     if (async) {
         // Detached run, caller polls /api/job. The GPU is serial, so a second job queues here.
@@ -627,8 +699,265 @@ static void handleImage(const std::map<std::string, std::string>& q, Response& r
     }
     std::string full;
     // Only files under the output folder can be fetched, so the endpoint cannot be used to read the disk.
+    // input/ is added for reads so the UI can show the reference image or mask it just uploaded.
+    const std::string base = fs::path(it->second).filename().string();
+    if (!safeJoin(gOutDir, base, full) || !serveFile(full, r, false)) {
+        if (!safeJoin(gInputDir, base, full) || !serveFile(full, r, false)) setErr(r, 404, "no such image");
+    }
+}
+
+static void handleDevices(Response& r) {
+    std::ostringstream o;
+    o << "[";
+    auto list = ofc::gpu::vkListDevices();
+    // caps tells the front end what a device can actually do. Every Vulkan device runs the full
+    // pipeline; the CPU entry is an offload target for the memory-hungry tail (VAE encode/decode)
+    // so a 6 GiB card does not have to hold the decoder arena on top of the UNet.
+    const char* gpuCaps = "\"caps\":[\"txt2img\",\"img2img\",\"inpaint\",\"vae\",\"decode\"],\"backend\":\"vulkan\","
+                          "\"full\":true";
+    for (size_t i = 0; i < list.size(); i++) {
+        // "index|name|mb"
+        std::string x = list[i];
+        size_t a1 = x.find('|'), a2 = x.find('|', a1 + 1);
+        std::string idx = a1 == std::string::npos ? "0" : x.substr(0, a1);
+        std::string name = a1 == std::string::npos ? x : x.substr(a1 + 1, a2 == std::string::npos ? std::string::npos : a2 - a1 - 1);
+        std::string mb = a2 == std::string::npos ? "0" : x.substr(a2 + 1);
+        if (i) o << ",";
+        o << "{\"index\":" << idx << ",\"name\":" << jstr(name) << ",\"vramMb\":" << mb << "," << gpuCaps << "}";
+    }
+    // host RAM, so the UI can warn before a CPU-side decode
+    double hostMb = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) hostMb = (double)ms.ullTotalPhys / 1048576.0;
+#endif
+    if (!list.empty()) o << ",";
+    o << "{\"index\":-1,\"name\":\"CPU (host RAM)\",\"vramMb\":" << (long long)hostMb
+      << ",\"backend\":\"cpu\",\"full\":false,\"caps\":[\"vae\",\"encode\",\"decode\",\"io\"]}";
+    o << "]";
+    setJson(r, 200, o.str());
+}
+
+// ---------------------------------------------------------------- image upload (img2img / inpaint)
+
+static std::string b64Decode(const std::string& in) {
+    static int8_t tbl[256];
+    static bool built = false;
+    if (!built) {
+        for (int i = 0; i < 256; i++) tbl[i] = -1;
+        const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) tbl[(uint8_t)a[i]] = (int8_t)i;
+        built = true;
+    }
+    std::string out;
+    out.reserve(in.size() * 3 / 4 + 8);
+    int acc = 0, bits = 0;
+    for (unsigned char c : in) {
+        int8_t v = tbl[c];
+        if (v < 0) continue;  // newlines, padding, the data: prefix is stripped by the caller
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char)((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// POST /api/upload {"name":"ref.png","data":"data:image/png;base64,..."}
+// -> {"ok":true,"path":"input/xxx_ref.png"}. The path is what "init" wants on /api/generate.
+static void handleUpload(const Request& req, Response& r) {
+    FlatJson j;
+    if (!parseFlatJson(req.body, j) || !j.s.count("data")) {
+        setErr(r, 400, "expected {\"name\":..., \"data\":\"base64\"}");
+        return;
+    }
+    std::string b64 = j.s.at("data");
+    size_t comma = b64.find(',');
+    if (comma != std::string::npos && b64.compare(0, 5, "data:") == 0) b64 = b64.substr(comma + 1);
+    std::string raw = b64Decode(b64);
+    if (raw.size() < 64) {
+        setErr(r, 400, "empty image payload");
+        return;
+    }
+    std::string name = j.s.count("name") ? j.s.at("name") : "upload.png";
+    for (auto& c : name)
+        if (!isalnum((unsigned char)c) && c != '.' && c != '_' && c != '-') c = '_';
+    if (name.empty() || name[0] == '.') name = "upload.png";
+    std::error_code ec;
+    fs::create_directories(gInputDir, ec);
+    std::string rel = (fs::path(gInputDir) / (newId() + "_" + name)).string();
+    std::ofstream f(rel, std::ios::binary);
+    if (!f) {
+        setErr(r, 500, "cannot write " + rel);
+        return;
+    }
+    f.write(raw.data(), (std::streamsize)raw.size());
+    f.close();
+    std::ostringstream o;
+    o << "{\"ok\":true,\"path\":" << jstr(rel) << ",\"bytes\":" << raw.size() << "}";
+    setJson(r, 200, o.str());
+}
+
+
+// ---------------------------------------------------------------- audio workflow
+
+// The node graph reaches the server as one string because the request parser is deliberately
+// flat: "op:key=value,key=value;op:key=value". Unknown keys are ignored, so the UI can send a
+// superset of what an op reads without breaking older builds.
+static bool parseAudioOps(const std::string& spec, std::vector<std::pair<std::string, std::map<std::string, double>>>& out,
+                          std::string& err) {
+    size_t i = 0;
+    while (i < spec.size()) {
+        size_t semi = spec.find(';', i);
+        std::string item = spec.substr(i, semi == std::string::npos ? std::string::npos : semi - i);
+        i = semi == std::string::npos ? spec.size() : semi + 1;
+        // trim
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.erase(item.begin());
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.pop_back();
+        if (item.empty()) continue;
+        size_t colon = item.find(':');
+        std::pair<std::string, std::map<std::string, double>> op;
+        op.first = item.substr(0, colon == std::string::npos ? std::string::npos : colon);
+        if (colon != std::string::npos) {
+            size_t p = colon + 1;
+            while (p <= item.size()) {
+                size_t comma = item.find(',', p);
+                std::string kv = item.substr(p, comma == std::string::npos ? std::string::npos : comma - p);
+                size_t eq = kv.find('=');
+                if (eq != std::string::npos) {
+                    const std::string k = kv.substr(0, eq);
+                    const std::string v = kv.substr(eq + 1);
+                    try {
+                        op.second[k] = std::stod(v);
+                    } catch (const std::exception&) {
+                        // a non-numeric value is a client bug; leave the default in place
+                    }
+                }
+                if (comma == std::string::npos) break;
+                p = comma + 1;
+            }
+        }
+        if (op.first.empty()) {
+            err = "empty audio op in spec";
+            return false;
+        }
+        out.push_back(op);
+    }
+    return true;
+}
+
+// POST /api/audio/process
+//   {"input":"input/a.wav","ops":"normalize-peak:targetDb=-1;resample:rate=48000",
+//    "bits":24,"spectrogram":true,"specW":1024,"specH":384}
+// -> {"ok":true,"path":"output/a_xxx.wav","seconds":..,"sampleRate":..,"channels":..,"peakDb":..,
+//     "detail":[...],"spectrogram":"output/a_xxx_spec.png"}
+static void handleAudioProcess(const Request& req, Response& r) {
+    FlatJson j;
+    if (!parseFlatJson(req.body, j) || !j.s.count("input")) {
+        setErr(r, 400, "expected {\"input\":\"input/x.wav\",\"ops\":\"...\"}");
+        return;
+    }
+    // Only the two spool folders are readable, same rule as /api/image.
+    const std::string base = fs::path(j.s.at("input")).filename().string();
+    std::string inPath;
+    std::error_code ec;
+    bool found = safeJoin(gInputDir, base, inPath) && fs::is_regular_file(inPath, ec);
+    if (!found) found = safeJoin(gOutDir, base, inPath) && fs::is_regular_file(inPath, ec);
+    if (!found) {
+        setErr(r, 404, "no such audio file: " + base);
+        return;
+    }
+    ofc::audio::Audio a;
+    std::string err;
+    if (!ofc::audio::readWav(inPath, a, err)) {
+        setErr(r, 400, err);
+        return;
+    }
+    std::vector<std::pair<std::string, std::map<std::string, double>>> ops;
+    if (j.s.count("ops") && !parseAudioOps(j.s.at("ops"), ops, err)) {
+        setErr(r, 400, err);
+        return;
+    }
+    std::ostringstream detail;
+    detail << "[";
+    for (size_t i = 0; i < ops.size(); i++) {
+        ofc::audio::OpArgs args;
+        auto get = [&](const char* k, double dflt) {
+            auto it = ops[i].second.find(k);
+            return it == ops[i].second.end() ? dflt : it->second;
+        };
+        args.gainDb = get("gainDb", args.gainDb);
+        args.targetDb = get("targetDb", args.targetDb);
+        args.inSec = get("inSec", args.inSec);
+        args.outSec = get("outSec", args.outSec);
+        args.padSec = get("padSec", args.padSec);
+        args.thresholdDb = get("thresholdDb", args.thresholdDb);
+        args.seconds = get("seconds", args.seconds);
+        args.mix = get("mix", args.mix);
+        args.decay = get("decay", args.decay);
+        args.curve = (int)get("curve", args.curve);
+        args.rate = (uint32_t)std::max(0.0, get("rate", args.rate));
+        args.seed = (uint32_t)std::max(0.0, get("seed", args.seed));
+        std::string what;
+        if (!ofc::audio::applyOp(a, ops[i].first, args, what, err)) {
+            setErr(r, 400, err);
+            return;
+        }
+        if (i) detail << ",";
+        detail << "{\"op\":" << jstr(ops[i].first) << ",\"detail\":" << jstr(what) << "}";
+    }
+    detail << "]";
+    int bits = 24;
+    if (j.n.count("bits")) bits = (int)j.n.at("bits");
+    if (bits != 16 && bits != 24 && bits != 32) bits = 24;
+    fs::create_directories(gOutDir, ec);
+    std::string id = newId();
+    std::string outName = id + "_audio.wav";
+    if (j.s.count("name")) {
+        std::string n = fs::path(j.s.at("name")).stem().string();
+        for (auto& c : n)
+            if (!isalnum((unsigned char)c) && c != '_' && c != '-') c = '_';
+        if (!n.empty()) outName = id + "_" + n + ".wav";
+    }
+    const std::string outPath = (fs::path(gOutDir) / outName).string();
+    if (!ofc::audio::writeWav(outPath, a, bits, err)) {
+        setErr(r, 500, err);
+        return;
+    }
+    std::string specPath;
+    bool wantSpec = j.b.count("spectrogram") ? j.b.at("spectrogram") : false;
+    if (wantSpec) {
+        uint32_t sw = 1024, sh = 384;
+        if (j.n.count("specW")) sw = (uint32_t)std::max(64.0, j.n.at("specW"));
+        if (j.n.count("specH")) sh = (uint32_t)std::max(64.0, j.n.at("specH"));
+        auto s = ofc::audio::spectrogram(a, 2048, 512);
+        auto img = ofc::audio::spectrogramImage(s, sw, sh);
+        specPath = (fs::path(gOutDir) / (id + "_audio_spec.png")).string();
+        if (!writePngFile(specPath, img, sw, sh, 1, "sdvk audio spectrogram")) specPath.clear();
+    }
+    std::ostringstream o;
+    o << "{\"ok\":true,\"path\":" << jstr(outPath) << ",\"bits\":" << bits << ",\"sampleRate\":" << a.sampleRate
+      << ",\"channels\":" << a.channels << ",\"frames\":" << (unsigned long long)a.frames()
+      << ",\"seconds\":" << jnum(a.seconds()) << ",\"peakDb\":" << jnum(ofc::audio::peakDb(a))
+      << ",\"rmsDb\":" << jnum(ofc::audio::rmsDb(a)) << ",\"detail\":" << detail.str();
+    if (!specPath.empty()) o << ",\"spectrogram\":" << jstr(specPath);
+    o << "}";
+    setJson(r, 200, o.str());
+}
+
+// GET /api/audio?path=  — fetch a rendered WAV from the output folder (the UI plays it inline).
+static void handleAudioFile(const std::map<std::string, std::string>& q, Response& r) {
+    auto it = q.find("path");
+    if (it == q.end()) {
+        setErr(r, 400, "missing path");
+        return;
+    }
+    std::string full;
     if (!safeJoin(gOutDir, fs::path(it->second).filename().string(), full) || !serveFile(full, r, false)) {
-        setErr(r, 404, "no such image");
+        setErr(r, 404, "no such audio file");
     }
 }
 
@@ -646,16 +975,26 @@ static Response dispatch(const Request& req) {
 
     if (path == "/api/info") {
         handleInfo(r);
+    } else if (path == "/api/devices") {
+        handleDevices(r);
     } else if (path == "/api/models") {
         handleModels(q, r);
     } else if (path == "/api/generate" && req.method == "POST") {
         handleGenerate(req, r);
+    } else if (path == "/api/upload" && req.method == "POST") {
+        handleUpload(req, r);
+    } else if (path == "/api/unload" && req.method == "POST") {
+        handleUnload(r);
     } else if (path == "/api/job") {
         handleJob(q, r);
     } else if (path == "/api/cancel") {
         handleCancel(q, r);
     } else if (path == "/api/image") {
         handleImage(q, r);
+    } else if (path == "/api/audio/process" && req.method == "POST") {
+        handleAudioProcess(req, r);
+    } else if (path == "/api/audio") {
+        handleAudioFile(q, r);
     } else if (path == "/api/health") {
         setJson(r, 200, "{\"ok\":true}");
     } else if (req.method == "GET") {

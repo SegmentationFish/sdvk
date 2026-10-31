@@ -24,6 +24,12 @@ MIT license; that notice is kept in `volk.h`.
 - **One command end to end**: prompt in, PNG out (encoding → sampling → decoding → file), no intermediate tooling
 - **Zero-dependency PNG**: hand-written deflate (fixed-Huffman LZ77), CRC32 and a `tEXt` block that embeds the generation parameters
 - **Sampling recipes**: v-prediction and eps prediction, CFG, trailing spacing, CFG rescale (mimic scale), dynamic thresholding, Euler / Euler-ancestral
+- **img2img and inpaint on a real VAE encoder**: the encoder half of the VAE is loaded and run
+  (`conv_in → down blocks → mid → conv_out → quant_conv`), so a seed image becomes a latent the
+  sampler understands; `--mask` blends the untouched region back every step
+- **Audio workflow (host CPU)**: WAV read/write at 16/24/32-bit, peak/RMS normalise, fades, silence
+  trim, Kaiser-windowed-sinc resample, FFT convolution reverb, STFT spectrogram → PNG. This is audio
+  *processing*; the engine has no mel-VAE/DiT, so there is nothing to generate from a prompt
 - **HTTP API + web UI**: `sdvk-server` exposes the same core, `webui/` is a dependency-free browser front end
 - **Per-kernel GPU profiler**: `OFC_KERNEL_PROFILE=1` prints a GPU-millisecond table for every compute kernel
 
@@ -100,7 +106,10 @@ A full single-file checkpoint (`.safetensors` holding `model.diffusion_model.*`,
 | `--sampler euler\|euler_a` | sampler |
 | `--vpred` / `--zsnr` / `--dynthresh` / `--rescale <f>` | schedule and guidance options |
 | `--seed <n>` | noise seed |
-| `--init <img.png> --denoise <f>` | img2img |
+| `--init <img.png> --denoise <f>` | img2img (the source is VAE-encoded, not pixel-seeded) |
+| `--mask <mask.png> --mask-feather <n>` | inpaint; white = repaint, needs `--init` |
+| `--mask-invert` | black = repaint |
+| `--roundtrip` | encode then decode the seed image, no sampling; prints PSNR |
 | `--out <file>` | `.png` (default) or `.ppm` |
 | `--no-vae` | stop after sampling, keep the latent only |
 | `--decode <latent.bin>` | VAE-only: decode a saved latent to an image |
@@ -134,13 +143,34 @@ a single GPU can only run one job anyway.
 | `POST /api/generate?async=1` | returns a job id immediately; poll `/api/job` |
 | `POST /api/cancel?id=<id>` | stop an async job at the next sampler step |
 | `GET /api/job?id=<id>` | progress, step, elapsed, output path |
-| `GET /api/image?path=<file.png>` | fetch a generated image from the output folder |
+| `GET /api/image?path=<file.png>` | fetch a generated or uploaded image |
+| `POST /api/audio/process` | run the audio node chain over a WAV in `input/` or `output/` |
+| `GET /api/audio?path=<file.wav>` | fetch a rendered WAV |
+| `GET /api/devices` | Vulkan devices plus the host-RAM entry |
+| `POST /api/upload` | store a PNG/WAV the UI picked, returns its path |
+| `POST /api/unload` | drop the resident model |
 
 ```bash
 curl -s -X POST http://127.0.0.1:7500/api/generate \
   -H 'Content-Type: application/json' \
   -d '{"model":"model","prompt":"a lighthouse at dusk","width":768,"height":768,
        "steps":20,"cfg":3,"vpred":true,"spacing":"trailing"}'
+
+# img2img: init is the path /api/upload returned
+curl -s -X POST http://127.0.0.1:7500/api/generate \
+  -d '{"model":"model","prompt":"same scene, winter","init":"input/xyz_ref.png",
+       "denoise":0.55,"width":832,"height":1216,"steps":20,"cfg":4}'
+
+# inpaint: mask is a second upload, white = repaint
+curl -s -X POST http://127.0.0.1:7500/api/generate \
+  -d '{"model":"model","prompt":"red umbrella","init":"input/xyz_ref.png",
+       "mask":"input/xyz_mask.png","maskFeather":8,"denoise":0.85,
+       "width":832,"height":1216,"steps":20,"cfg":4}'
+
+# audio chain: ops are applied left to right, "op:key=value,key=value" joined by ';'
+curl -s -X POST http://127.0.0.1:7500/api/audio/process \
+  -d '{"input":"input/voice.wav","bits":24,"spectrogram":true,
+       "ops":"trim:thresholdDb=-45,padSec=0.05;normalize-peak:targetDb=-1;resample:rate=48000"}'
 ```
 
 Response: `{"ok":true,"outPath":"output/sdvk_xxx.png","seed":1234,"totalMs":...,"width":768,"height":768}`.
@@ -204,6 +234,18 @@ That is the mathematical floor for one UNet pass; the gap to 14.1 s is where the
 
 `tools/smoke.sh` rebuilds both targets and exercises every path that does not need a GPU: the CLI
 help/version/usage routes, the cost model, and the HTTP endpoints including the path-traversal guard.
+
+`tools/stress.sh` is the GPU matrix for img2img / inpaint (roundtrip PSNR, denoise ladder, mask
+feathers, 20-run step-time drift). It launches real generations, so run it yourself and watch the
+desktop — a device-local request the driver cannot satisfy takes the whole session down:
+
+```bash
+tools/stress.sh -m E:/ofc-data/noobai -i output/yae_miko.png -M input/mask.png
+```
+
+`build/audio_test.exe` is the GPU-free audio check: PCM roundtrips, resample distortion, FFT vs
+direct convolution, fade/normalise/trim values, spectrogram peak. Every line prints PASS/FAIL and
+the exit code is non-zero on a failure.
 
 
 ## Weight licensing

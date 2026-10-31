@@ -290,10 +290,12 @@ static bool wantTensor(const std::string& n, Part part) {
         case Part::Projection:
             return n.rfind("text_projection.", 0) == 0;
         case Part::Vae:
-            // a diffusers export keeps the bare decoder./post_quant_conv. names with no vae. prefix
-            if (n.rfind("first_stage_model.encoder", 0) == 0 || n.rfind("vae.encoder", 0) == 0) return false;
+            // a diffusers export keeps the bare decoder./encoder./post_quant_conv. names with no
+            // vae. prefix. The encoder half used to be dropped here, which capped img2img at a
+            // pixel-seeded sampler; keep it so VAEEncode has weights to run with.
             if (n.rfind("first_stage_model.", 0) == 0 || n.rfind("vae.", 0) == 0) return true;
-            return n.rfind("decoder.", 0) == 0 || n.rfind("post_quant_conv.", 0) == 0 || n.rfind("quant_conv.", 0) == 0;
+            return n.rfind("decoder.", 0) == 0 || n.rfind("encoder.", 0) == 0 ||
+                   n.rfind("post_quant_conv.", 0) == 0 || n.rfind("quant_conv.", 0) == 0;
     }
     return false;
 }
@@ -666,7 +668,9 @@ static BufRef conv3Raw(const BufRef& in, const std::string& wt, uint32_t cin, ui
     return conv3RawInto(in, wt, cin, cout, H, Wd, allocN((uint64_t)cout * H * Wd));
 }
 
-static BufRef conv3s2(const BufRef& in, const std::string& p, uint32_t H, uint32_t Wd) {
+// off = -1 keeps the symmetric pad-1 ring the LDM downsamplers expect; off = 0 pads only the
+// right/bottom edge, which is what diffusers' AutoencoderKL Downsample2D does for the VAE encoder.
+static BufRef conv3s2(const BufRef& in, const std::string& p, uint32_t H, uint32_t Wd, int off = -1) {
     uint32_t cout, kCols;  // conv weight dims are (cout, cin*k)
     linearDims(p + ".weight", cout, kCols);
     uint32_t cin = kCols / 9;
@@ -674,7 +678,8 @@ static BufRef conv3s2(const BufRef& in, const std::string& p, uint32_t H, uint32
     BufRef out = allocN((uint64_t)cout * P);
     struct {
         uint32_t C, H, W, OH, OW;
-    } pc{cin, H, Wd, OH, OW};
+        int off;
+    } pc{cin, H, Wd, OH, OW, off};
     BufRef col{gCol.buf, gCol.offset, (uint64_t)K * P * 4};
     gDisp("im2col_s2", {in, col}, &pc, ceilDiv((uint64_t)K * P, 256), 1, 1);
     if (isQ8(p + ".weight")) gemmNnQ8(WQ(p + ".weight"), WS(p + ".weight"), col, out, cout, P, K, P);
@@ -1698,48 +1703,145 @@ static std::vector<float> vaeDecodeTiled(const GenParams& p, const std::vector<f
     std::vector<float> acc((size_t)3 * OH * OW, 0.0f), wsum((size_t)OH * OW, 0.0f);
     uint32_t tiles = 0;
     auto t0 = std::chrono::steady_clock::now();
-    for (uint32_t y0 = 0; y0 < H; y0 += step) {
-        uint32_t y1 = std::min(H, y0 + tile);
-        for (uint32_t x0 = 0; x0 < Wd; x0 += step) {
-            uint32_t x1 = std::min(Wd, x0 + tile);
-            uint32_t th = y1 - y0, tw = x1 - x0, th8 = th * 8, tw8 = tw * 8;
+    for (uint32_t y0 = 0; y0 < H;) {
+        // Align the last row band to the bottom edge instead of letting it shrink: a 96-high
+        // latent cut into 48-px tiles would otherwise leave a 16-px band whose GroupNorm
+        // statistics come from a sliver of the image and tint that strip.
+        uint32_t yy = (H > tile) ? std::min(y0, H - tile) : 0u;
+        uint32_t y1 = std::min(H, yy + tile);
+        for (uint32_t x0 = 0; x0 < Wd;) {
+            if (p.shouldCancel && p.shouldCancel()) fail("cancelled");
+            uint32_t xx = (Wd > tile) ? std::min(x0, Wd - tile) : 0u;
+            uint32_t x1 = std::min(Wd, xx + tile);
+            uint32_t th = y1 - yy, tw = x1 - xx, th8 = th * 8, tw8 = tw * 8;
             std::vector<float> sub((size_t)4 * th * tw);
             for (uint32_t c = 0; c < 4; c++)
                 for (uint32_t y = 0; y < th; y++)
-                    std::memcpy(&sub[((size_t)c * th + y) * tw], &lat[((size_t)c * H + y0 + y) * Wd + x0], tw * 4);
+                    std::memcpy(&sub[((size_t)c * th + y) * tw], &lat[((size_t)c * H + yy + y) * Wd + xx], tw * 4);
             std::vector<float> img = vaeDecodeChain(p, sub, th, tw);
             for (uint32_t c = 0; c < 3; c++)
                 for (uint32_t y = 0; y < th8; y++) {
                     float wy = 1.0f;
-                    if (y0 > 0) wy = std::min(wy, (y + 0.5f) / (float)ovPx);
+                    if (yy > 0) wy = std::min(wy, (y + 0.5f) / (float)ovPx);
                     if (y1 < H) wy = std::min(wy, (th8 - y - 0.5f) / (float)ovPx);
                     for (uint32_t x = 0; x < tw8; x++) {
                         float wx = 1.0f;
-                        if (x0 > 0) wx = std::min(wx, (x + 0.5f) / (float)ovPx);
+                        if (xx > 0) wx = std::min(wx, (x + 0.5f) / (float)ovPx);
                         if (x1 < Wd) wx = std::min(wx, (tw8 - x - 0.5f) / (float)ovPx);
                         float w = wx * wy;
-                        size_t gi = ((size_t)c * OH + (y0 * 8 + y)) * OW + (x0 * 8 + x);
+                        size_t gi = ((size_t)c * OH + (yy * 8 + y)) * OW + (xx * 8 + x);
                         acc[gi] += img[((size_t)c * th8 + y) * tw8 + x] * w;
-                        if (c == 0) wsum[(size_t)(y0 * 8 + y) * OW + (x0 * 8 + x)] += w;
+                        if (c == 0) wsum[(size_t)(yy * 8 + y) * OW + (xx * 8 + x)] += w;
                     }
                 }
             tiles++;
             if (x1 >= Wd) break;
+            x0 = xx + step;
         }
         if (y1 >= H) break;
+        y0 = yy + step;
     }
-    for (size_t i = 0; i < acc.size(); i++) acc[i] /= std::max(wsum[i / 3], 1e-6f);
+    // acc is planar [c][y][x], so the weight lookup must follow the same layout; indexing it as
+    // wsum[i / 3] assumed an interleaved [y][x][c] buffer and normalized every pixel with the
+    // weight of a different pixel, which showed up as horizontal scan lines in every tiled decode.
+    for (uint32_t c = 0; c < 3; c++)
+        for (uint32_t y = 0; y < OH; y++)
+            for (uint32_t x = 0; x < OW; x++) {
+                size_t i = ((size_t)c * OH + y) * OW + x;
+                acc[i] /= std::max(wsum[(size_t)y * OW + x], 1e-6f);
+            }
     std::printf("vae tiled decode %ux%u: %u tiles of %u px (+%u overlap), %.0f ms\n", OW, OH, tiles, tile, ov,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return acc;
 }
 
-static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>& lat, uint32_t H, uint32_t Wd) {
+// Bilinear latent resample for the hires refine stage (the VAE never sees this directly).
+static std::vector<float> upscaleLatentBilinear(const std::vector<float>& in, uint32_t H, uint32_t W,
+                                                uint32_t nh, uint32_t nw) {
+    std::vector<float> out((size_t)4 * nh * nw);
+    const float sy = (float)H / (float)nh, sx = (float)W / (float)nw;
+    for (uint32_t c = 0; c < 4; c++) {
+        const float* src = &in[(size_t)c * H * W];
+        float* dst = &out[(size_t)c * nh * nw];
+        for (uint32_t y = 0; y < nh; y++) {
+            float fy = (y + 0.5f) * sy - 0.5f;
+            int y0 = (int)std::floor(fy);
+            float ty = fy - (float)y0;
+            int ya = std::min<int>(std::max(y0, 0), (int)H - 1);
+            int yb = std::min<int>(std::max(y0 + 1, 0), (int)H - 1);
+            for (uint32_t x = 0; x < nw; x++) {
+                float fx = (x + 0.5f) * sx - 0.5f;
+                int x0 = (int)std::floor(fx);
+                float tx = fx - (float)x0;
+                int xa = std::min<int>(std::max(x0, 0), (int)W - 1);
+                int xb = std::min<int>(std::max(x0 + 1, 0), (int)W - 1);
+                float a = src[(size_t)ya * W + xa] * (1.0f - tx) + src[(size_t)ya * W + xb] * tx;
+                float b = src[(size_t)yb * W + xa] * (1.0f - tx) + src[(size_t)yb * W + xb] * tx;
+                dst[(size_t)y * nw + x] = a * (1.0f - ty) + b * ty;
+            }
+        }
+    }
+    return out;
+}
+
+// Bicubic (Catmull-Rom) RGB upscale on the decoded image. Upscaling the latent and running the
+// VAE on it looks tempting but the decoder turns the interpolated latent into a hard 8-px grid,
+// so the plain hires stage works on pixels instead.
+static void upscaleImageBicubic(std::vector<float>& img, uint32_t& w, uint32_t& h, float f) {
+    uint32_t nw = std::max(8u, (uint32_t)std::lround((double)w * f));
+    uint32_t nh = std::max(8u, (uint32_t)std::lround((double)h * f));
+    std::vector<float> out((size_t)3 * nw * nh);
+    auto wk = [](float x) {
+        float a = -0.5f, ax = std::fabs(x);
+        if (ax <= 1.0f) return (a + 2.0f) * ax * ax * ax - (a + 3.0f) * ax * ax + 1.0f;
+        if (ax < 2.0f) return a * ax * ax * ax - 5.0f * a * ax * ax + 8.0f * a * ax - 4.0f * a;
+        return 0.0f;
+    };
+    const float sx = (float)w / (float)nw, sy = (float)h / (float)nh;
+    for (uint32_t c = 0; c < 3; c++) {
+        const float* src = &img[(size_t)c * w * h];
+        float* dst = &out[(size_t)c * nw * nh];
+        for (uint32_t y = 0; y < nh; y++) {
+            float fy = (y + 0.5f) * sy - 0.5f;
+            int y0 = (int)std::floor(fy);
+            float ty = fy - (float)y0;
+            for (uint32_t x = 0; x < nw; x++) {
+                float fx = (x + 0.5f) * sx - 0.5f;
+                int x0 = (int)std::floor(fx);
+                float tx = fx - (float)x0;
+                float acc = 0.0f, wsum = 0.0f;
+                for (int j = -1; j <= 2; j++) {
+                    float wy = wk((float)j - ty);
+                    int yy = std::min<int>(std::max(y0 + j, 0), (int)h - 1);
+                    for (int i = -1; i <= 2; i++) {
+                        float wx = wk((float)i - tx);
+                        int xx = std::min<int>(std::max(x0 + i, 0), (int)w - 1);
+                        acc += src[(size_t)yy * w + xx] * wx * wy;
+                        wsum += wx * wy;
+                    }
+                }
+                dst[(size_t)y * nw + x] = acc / std::max(wsum, 1e-6f);
+            }
+        }
+    }
+    img.swap(out);
+    std::printf("hires: %ux%u -> %ux%u (bicubic)\n", w, h, nw, nh);
+    w = nw;
+    h = nh;
+}
+
+// The VAE cannot live beside the UNet in the weight arena, so both the encode and the decode pass
+// hand the text-encoder/UNet arena back before loading it.
+static void prepareVaeArena(const GenParams& p) {
     clearWeights();
     // the sampler's step arena is still resident here; drop it first or the VAE cannot get room
     G.eng.initArenas(128ull << 20, 128ull << 20);
     G.paramArena.init(G.eng.device(), G.eng.physDevice(), 640ull << 20, true, false);
     loadVaeWeights(p);
+}
+
+static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>& lat, uint32_t H, uint32_t Wd) {
+    prepareVaeArena(p);
     // Large canvases decode in tiles by default: a full 96x96 pass asks for ~3 GB in one
     // device-local allocation, and this driver kills the process outright (no error return)
     // when that allocation cannot be satisfied. Tiles keep every pass small; --vae-tile 0
@@ -1753,6 +1855,93 @@ static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>
         std::printf("vae: full decode failed (%s), retrying tiled\n", e.what());
         return vaeDecodeTiled(p, lat, H, Wd, 48, 8);
     }
+}
+
+// ================================================================ VAE encoder
+
+// The decoder walked backwards: conv_in -> 4x (2 resnets [+ stride-2 downsample]) -> mid
+// (resnet / attention / resnet) -> conv_norm_out -> conv_out (8 ch) -> quant_conv, and the first
+// four channels of the result are the latent mean. Every VAE file carries these weights; the
+// loader used to filter encoder.* out, which is why img2img could only seed the sampler with
+// pixels * scaling_factor. It runs on the same ops as the decode path, in sampler scale.
+static std::vector<float> vaeEncodeChain(const GenParams& p, const std::vector<float>& img, uint32_t H,
+                                         uint32_t Wd) {
+    if (H < 8 || Wd < 8) fail("init image too small: need at least 8x8 px after resampling");
+    uint64_t srcFloats = (uint64_t)3 * H * Wd;
+    if (img.size() < srcFloats) fail("vae encode: pixel buffer is smaller than the canvas");
+    // The peak sits in down_blocks.0 at full resolution: the live tensor, its result slot and the
+    // two ping-pong buffers the resnet needs, all 128 channels. Refuse up front rather than let
+    // the driver kill the process on a canvas that cannot fit.
+    uint64_t need = (uint64_t)4 * 128 * H * Wd * 4;
+    uint64_t autoVStep = (need >> 20) * 115 / 100 + 96;
+    if (std::getenv("OFC_NO_AUTOSIZE")) autoVStep = 0;
+    uint64_t vStepMB = std::max<uint64_t>(p.vStepMb, autoVStep);
+    if (vStepMB > 4200) {
+        char msg[288];
+        std::snprintf(msg, sizeof msg,
+                      "init image at %ux%u needs ~%.0f MB of activations; use a canvas of 1280 px or less",
+                      Wd, H, need / 1048576.0);
+        fail(msg);
+    }
+    G.eng.initArenas(vStepMB << 20, 220ull << 20);
+    gResizeScratch(220ull << 20);
+    gCol = G.scratchArena.alloc(kColFloats * 4);
+    gSCap = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    G.eng.beginStep();
+    BufRef x = allocN(srcFloats);
+    G.eng.uploadNow(x, img.data(), srcFloats * 4);
+    auto compact = [&]() {
+        if (std::getenv("OFC_NO_COMPACT")) return;
+        if (x.offset != 0) G.eng.compactStepArena(0, x.offset, x.size);
+        x.offset = 0;
+    };
+    x = conv3Raw(x, "encoder.conv_in.weight", 3, 128, H, Wd);
+    compact();
+    uint32_t cin = 128;
+    char pfx[96];
+    for (int b = 0; b < 4; b++) {
+        uint32_t cout = (b == 0) ? 128u : (b == 1 ? 256u : 512u);
+        for (int i = 0; i < 2; i++) {
+            std::snprintf(pfx, sizeof pfx, "encoder.down_blocks.%d.resnets.%d", b, i);
+            x = vaeResnet(x, pfx, cin, cout, H, Wd, i == 0 && cin != cout);
+            cin = cout;
+            compact();
+        }
+        if (b < 3) {
+            std::snprintf(pfx, sizeof pfx, "encoder.down_blocks.%d.downsamplers.0.conv", b);
+            x = conv3s2(x, pfx, H, Wd, 0);  // diffusers pads right/bottom, not both sides
+            H /= 2;
+            Wd /= 2;
+            compact();
+        }
+    }
+    uint32_t P = H * Wd;
+    x = vaeResnet(x, "encoder.mid_block.resnets.0", 512, 512, H, Wd, false);
+    compact();
+    x = vaeAttn(x, "encoder.mid_block.attentions.0", 512, H, Wd);
+    compact();
+    x = vaeResnet(x, "encoder.mid_block.resnets.1", 512, 512, H, Wd, false);
+    compact();
+    x = gnSilu(x, "encoder.conv_norm_out", 512, P, 32, 1e-6f);
+    compact();
+    x = conv3Raw(x, "encoder.conv_out.weight", 512, 8, H, Wd);
+    compact();
+    x = conv1(x, "quant_conv", 8, 8, P);
+    G.eng.endStep();
+    G.eng.waitStep();
+    std::vector<float> raw((size_t)8 * P);
+    G.eng.downloadNow(x, raw.data(), raw.size() * 4);
+    // encoder output lives in VAE space; vaeDecodeChain divides the sampler latent by this same
+    // factor, so multiply here and the two paths agree.
+    const float vaeScale = (gArch == 1) ? 0.18215f : 0.13025f;
+    std::vector<float> mean((size_t)4 * P);
+    for (uint32_t c = 0; c < 4; c++)
+        for (uint32_t i = 0; i < P; i++) mean[(size_t)c * P + i] = raw[(size_t)c * P + i] * vaeScale;
+    std::printf("vae encode %ux%u -> %ux%u: %.0f ms (step arena %llu MB)\n", Wd * 8, H * 8, Wd, H,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                (unsigned long long)vStepMB);
+    return mean;
 }
 
 // ================================================================ PNG writer
@@ -2179,9 +2368,10 @@ void unloadModel(EvalModel& m) {
     m.impl = nullptr;
 }
 
-bool ensureDevice(const std::string& spvDir, std::string& err) {
+bool ensureDevice(const std::string& spvDir, std::string& err, int device = 0) {
     try {
         if (G.eng.alive()) return true;
+        G.eng.setDeviceIndex(device < 0 ? 0 : device);
         G.paramBytes = 64ull << 20;
         G.allocGradArena = false;
         G.stepBytes = 64ull << 20;
@@ -2201,20 +2391,25 @@ bool ensureDevice(const std::string& spvDir, std::string& err) {
 // share. Size the arena from the file instead: a Q8_0 GGUF lands near its byte size, a
 // safetensors UNet is fp16 on disk and fp32 in the arena, so it needs about twice as much.
 static uint64_t unetParamBytes(const GenParams& p) {
-    uint64_t mb = p.paramMb;
-    if (!mb) {
-        std::error_code ec;
-        uint64_t fileBytes = std::filesystem::file_size(p.models.unet, ec);
-        if (ec) fileBytes = 0;
-        bool gguf = p.models.unet.size() > 5 && p.models.unet.compare(p.models.unet.size() - 5, 5, ".gguf") == 0;
-        // Q8_0 keeps its byte size; fp16 safetensors expands to fp32, and the split Q8 payload /
-        // fp32 scale pairs add a little on top. +192 MB covers alignment and the small side tables.
-        mb = gguf ? ((fileBytes + (288ull << 20)) >> 20) : ((fileBytes / 1048576) * 2 + 640);
-        if (!gguf) mb = std::max<uint64_t>(mb, 512);
-        mb = std::max<uint64_t>(mb, 512);
-        mb = std::min<uint64_t>(mb, 6144);
+    uint64_t mb = 0;
+    std::error_code ec;
+    uint64_t fileBytes = std::filesystem::file_size(p.models.unet, ec);
+    if (ec) fileBytes = 0;
+    bool gguf = p.models.unet.size() > 5 && p.models.unet.compare(p.models.unet.size() - 5, 5, ".gguf") == 0;
+    // Q8_0 keeps its byte size; fp16 safetensors expands to fp32, and the split Q8 payload /
+    // fp32 scale pairs add a little on top. The margin covers alignment and the small side
+    // tables; a 288 MB margin once came up 0.4 MB short, so leave a little more.
+    mb = gguf ? ((fileBytes + (320ull << 20)) >> 20) : ((fileBytes / 1048576) * 2 + 640);
+    if (!gguf) mb = std::max<uint64_t>(mb, 512);
+    mb = std::max<uint64_t>(mb, 512);
+    mb = std::min<uint64_t>(mb, 6144);
+    // --param-mb is a floor, like --step-mb: asking for less than the weights need can only fail
+    // halfway through the upload, so take the larger value and say so.
+    if (p.paramMb && p.paramMb < mb) {
+        std::printf("note: --param-mb %u MB is below the %llu MB this file needs; using %llu MB\n", p.paramMb,
+                    (unsigned long long)mb, (unsigned long long)mb);
     }
-    return mb << 20;
+    return std::max<uint64_t>(p.paramMb, mb) << 20;
 }
 
 // fp32 footprint of CLIP-L + CLIP-G, rounded up. An fp16 safetensors file is half of it; a
@@ -2235,7 +2430,7 @@ bool loadModel(EvalModel& m, const GenParams& in, const ProgressFn& onProgress, 
     if (p.spvDir.empty()) p.spvDir = "shaders";
     ModelSet set;
     if (!ofc::sdxl::resolveModels(p, set, err)) return false;
-    if (!ensureDevice(p.spvDir, err)) return false;
+    if (!ensureDevice(p.spvDir, err, p.device)) return false;
     gS.spvDir = p.spvDir;
     gS.tok.ready = false;
     m.warnings = set.warn;
@@ -2577,6 +2772,80 @@ static std::vector<float> resampleChw(const std::vector<uint8_t>& rgb, uint32_t 
     return out;
 }
 
+// ---------------------------------------------------------------- inpaint mask
+
+// Separable box blur with clamped edges. Two passes approximate a triangular kernel, which is
+// close enough to a gaussian for feathering an inpaint seam and costs O(H*W) per pass.
+static void boxBlurMask(std::vector<float>& m, uint32_t H, uint32_t W, int r) {
+    if (r <= 0 || H == 0 || W == 0) return;
+    std::vector<float> t(m.size());
+    std::vector<double> pre((size_t)std::max(H, W) + 1);
+    for (uint32_t y = 0; y < H; y++) {
+        const float* row = &m[(size_t)y * W];
+        pre[0] = 0;
+        for (uint32_t x = 0; x < W; x++) pre[x + 1] = pre[x] + row[x];
+        for (uint32_t x = 0; x < W; x++) {
+            int a = (int)x - r, b = (int)x + r + 1;
+            int ca = std::max(0, a), cb = std::min((int)W, b);
+            double sum = pre[cb] - pre[ca];
+            int n = cb - ca;
+            sum += (double)row[0] * (ca - a) + (double)row[W - 1] * (b - cb);
+            n += (ca - a) + (b - cb);
+            t[(size_t)y * W + x] = (float)(sum / (double)std::max(1, n));
+        }
+    }
+    for (uint32_t x = 0; x < W; x++) {
+        pre[0] = 0;
+        for (uint32_t y = 0; y < H; y++) pre[y + 1] = pre[y] + t[(size_t)y * W + x];
+        for (uint32_t y = 0; y < H; y++) {
+            int a = (int)y - r, b = (int)y + r + 1;
+            int ca = std::max(0, a), cb = std::min((int)H, b);
+            double sum = pre[cb] - pre[ca];
+            int n = cb - ca;
+            sum += (double)t[x] * (ca - a) + (double)t[(size_t)(H - 1) * W + x] * (b - cb);
+            n += (ca - a) + (b - cb);
+            m[(size_t)y * W + x] = (float)(sum / (double)std::max(1, n));
+        }
+    }
+    for (auto& v : m) v = std::min(1.0f, std::max(0.0f, v));
+}
+
+// White = repaint. The mask is box-averaged down to latent resolution (each latent cell covers
+// 8x8 canvas pixels) so a half-covered cell lands halfway between keep and repaint instead of
+// snapping, then feathered so the boundary does not show as a hard rectangle.
+static std::vector<float> buildLatentMask(const std::string& path, uint32_t cw, uint32_t ch, uint32_t Lh,
+                                          uint32_t Lw, uint32_t feather, bool invert) {
+    std::vector<uint8_t> rgb;
+    uint32_t mw = 0, mh = 0;
+    if (!readPng(path, rgb, mw, mh) && !readPpm(path, rgb, mw, mh))
+        fail("cannot read mask " + path + " (PNG or PPM)");
+    if (!mw || !mh) fail("mask " + path + " is empty");
+    std::vector<float> m((size_t)Lh * Lw, 1.0f);
+    for (uint32_t ly = 0; ly < Lh; ly++) {
+        for (uint32_t lx = 0; lx < Lw; lx++) {
+            double acc = 0;
+            for (uint32_t sy = 0; sy < 8; sy++) {
+                uint32_t py = (uint32_t)std::min<uint64_t>((uint64_t)(ly * 8 + sy) * mh / ch, mh - 1);
+                for (uint32_t sx = 0; sx < 8; sx++) {
+                    uint32_t px = (uint32_t)std::min<uint64_t>((uint64_t)(lx * 8 + sx) * mw / cw, mw - 1);
+                    const uint8_t* q = &rgb[((size_t)py * mw + px) * 3];
+                    acc += (q[0] + q[1] + q[2]) / (3.0 * 255.0);
+                }
+            }
+            float v = (float)(acc / 64.0);
+            m[(size_t)ly * Lw + lx] = invert ? 1.0f - v : v;
+        }
+    }
+    boxBlurMask(m, Lh, Lw, (int)feather);
+    boxBlurMask(m, Lh, Lw, (int)feather);
+    uint64_t painted = 0;
+    for (float v : m)
+        if (v > 0.5f) painted++;
+    std::printf("inpaint mask %s: %ux%u -> %ux%u latent, feather %u, %.1f%% repainted\n", path.c_str(), mw, mh, Lw,
+                Lh, feather, 100.0 * (double)painted / (double)m.size());
+    return m;
+}
+
 // ================================================================ generate
 
 // Peek at the UNet file before any text encoding: the TE stage needs to know whether a CLIP-G
@@ -2738,6 +3007,71 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             return res;
         }
 
+        // ---------------- img2img / inpaint: real VAE encode
+        // The old path wrote pixels * scaling_factor straight into the latent (all four channels a
+        // copy of one image), which is why anything below denoise 0.7 came out washed out and only
+        // a near-full repaint looked right. The encoder weights were always in the file; the
+        // loader filtered them out.
+        std::vector<float> initLat;   // sampler-scale latent of the seed image
+        std::vector<float> initMask;  // 1 = repaint, latent resolution; empty = no inpaint
+        if (p.useInit && !p.initImage.empty()) {
+            std::vector<uint8_t> rgb;
+            uint32_t iw = 0, ih = 0;
+            if (!readPng(p.initImage, rgb, iw, ih) && !readPpm(p.initImage, rgb, iw, ih))
+                fail("cannot read init image " + p.initImage + " (PNG or PPM)");
+            uint32_t cw = p.crop.empty() ? iw : p.crop.w;
+            uint32_t chh = p.crop.empty() ? ih : p.crop.h;
+            std::vector<uint8_t> crop((size_t)cw * chh * 3);
+            for (uint32_t y = 0; y < chh; y++) {
+                for (uint32_t x = 0; x < cw; x++) {
+                    uint32_t sx = (p.crop.empty() ? x : p.crop.x + x);
+                    uint32_t sy = (p.crop.empty() ? y : p.crop.y + y);
+                    sx = std::min(sx, iw - 1);
+                    sy = std::min(sy, ih - 1);
+                    std::memcpy(&crop[((size_t)y * cw + x) * 3], &rgb[((size_t)sy * iw + sx) * 3], 3);
+                }
+            }
+            std::vector<float> img = resampleChw(crop, cw, chh, width, height);
+            report(onProgress, Progress::Kind::Load, 0, 1, 0.12, 0.0, "vae encode");
+            prepareVaeArena(p);
+            initLat = vaeEncodeChain(p, img, height, width);
+            uint32_t Lh0 = height / 8, Lw0 = width / 8;
+            if (!p.maskImage.empty())
+                initMask = buildLatentMask(p.maskImage, width, height, Lh0, Lw0, p.maskFeather, p.maskInvert);
+            if (p.roundtrip) {
+                // encode -> decode with no sampling: the only check that proves the two halves
+                // agree. Report the PSNR against the resampled source instead of eyeballing it.
+                report(onProgress, Progress::Kind::Decode, 1, 1, 0.85, 0.0, "vae decode");
+                std::vector<float> rt = vaeDecode(p, initLat, Lh0, Lw0);
+                double se = 0;
+                uint64_t n = std::min<uint64_t>(rt.size(), img.size());
+                for (uint64_t k = 0; k < n; k++) {
+                    double d = (double)rt[k] - (double)img[k];
+                    se += d * d;
+                }
+                double mse = n ? se / (double)n : 1.0;
+                double psnr = mse > 1e-12 ? 10.0 * std::log10(4.0 / mse) : 99.0;
+                std::printf("roundtrip %ux%u: mse %.6f  psnr %.2f dB\n", width, height, mse, psnr);
+                std::string info = p.infoOut ? ofc::sdxl::infoText(p, m.modelName, gDeviceName) : std::string();
+                if (!writeImageFile(p.outPath, rt, width, height, p.pngCompress, info))
+                    fail("cannot write " + p.outPath);
+                res.outPath = p.outPath;
+                res.width = width;
+                res.height = height;
+                res.image.width = width;
+                res.image.height = height;
+                res.image.rgb.resize((size_t)3 * width * height);
+                for (uint64_t k = 0; k < res.image.rgb.size(); k++) res.image.rgb[k] = rt[k] * 0.5f + 0.5f;
+                res.totalMs =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
+                res.ok = true;
+                report(onProgress, Progress::Kind::Done, 1, 1, 1.0, res.totalMs, "roundtrip done");
+                return res;
+            }
+            std::printf("init image %s (%ux%u) -> vae encode %ux%u, denoise %.2f\n", p.initImage.c_str(), iw, ih,
+                        Lw0, Lh0, p.denoise);
+        }
+
         // ---------------- UNet
         // loadOneTextEncoder() rebound the weight arena for CLIP-G, so the UNet has to go back in
         // before sampling. stageUpload() renames that pass over the old contents, so this is safe.
@@ -2878,34 +3212,15 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         std::vector<float> lat(latFloats);
         for (auto& v : lat) v = nd(rng) * sch.initNoiseSigma;
         bool seededFromImage = false;
-        if (p.useInit && !p.initImage.empty()) {
-            std::vector<uint8_t> rgb;
-            uint32_t iw = 0, ih = 0;
-            bool ok = readPng(p.initImage, rgb, iw, ih) || readPpm(p.initImage, rgb, iw, ih);
-            if (!ok) fail("cannot read init image " + p.initImage + " (PNG or PPM)");
-            uint32_t cw = p.crop.empty() ? iw : p.crop.w;
-            uint32_t chh = p.crop.empty() ? ih : p.crop.h;
-            std::vector<uint8_t> crop((size_t)cw * chh * 3);
-            for (uint32_t y = 0; y < chh; y++) {
-                for (uint32_t x = 0; x < cw; x++) {
-                    uint32_t sx = (p.crop.empty() ? x : p.crop.x + x);
-                    uint32_t sy = (p.crop.empty() ? y : p.crop.y + y);
-                    sx = std::min(sx, iw - 1);
-                    sy = std::min(sy, ih - 1);
-                    std::memcpy(&crop[((size_t)y * cw + x) * 3], &rgb[((size_t)sy * iw + sx) * 3], 3);
-                }
-            }
-            std::vector<float> img = resampleChw(crop, cw, chh, width, height);
-            // image pixels [-1,1] -> latent space: the mid gray maps to 0, noise is added at the
-            // sigma the schedule starts from (img2img convention)
-            for (uint64_t k = 0; k < latFloats; k++) {
-                uint64_t pix = k % ((uint64_t)width * height);
-                float v = img[pix] * 0.5f * 0.18215f;
-                lat[k] = v + nd(rng) * sch.sigmas[0];
-            }
+        const uint64_t maskCells = (uint64_t)Lh * Lw;
+        // The seed latent comes from the VAE encode done before the UNet was loaded; nothing is
+        // re-read here, so img2img cannot silently fall back to the pixel path.
+        if (!initLat.empty()) {
+            uint64_t was = (uint64_t)4 * Lh * Lw;
+            if (initLat.size() < was) fail("encoded latent does not match the canvas");
+            for (uint64_t k = 0; k < latFloats; k++) lat[k] = initLat[k] + nd(rng) * sch.sigmas[0];
             seededFromImage = true;
-            std::printf("init image %s (%ux%u) -> seed latent, denoise %.2f\n", p.initImage.c_str(), iw, ih,
-                        p.denoise);
+            if (!initMask.empty()) std::printf("inpaint: latent mask blend active (%u px feather)\n", p.maskFeather);
         }
         G.eng.uploadNow(xLat, lat.data(), lat.size() * 4);
 
@@ -2994,6 +3309,14 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                     x0 = std::min(std::max(x0, -thr), thr) / thr;
                     x0v[k] = x0;
                 }
+                // inpaint: every step pulls the untouched region back to the encoded latent. The
+                // x0 estimate is what gets replaced, so the schedule keeps its own noise level and
+                // the masked area simply never gets to move.
+                if (!initMask.empty()) {
+                    float m = initMask[(size_t)(k % maskCells)];
+                    x0 = m * x0 + (1.0f - m) * initLat[k];
+                    x0v[k] = x0;
+                }
                 float prev;
                 if (ancestral) {
                     // EulerAncestral: move to sigma_down along the x0 direction, then inject
@@ -3017,6 +3340,108 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         G.eng.profileDump();
         res.secPerStep = stepMsSum / 1000.0 / std::max(1, steps);
 
+        // ---------------- hires refine: latent upscale + tiled img2img re-denoise
+        // Plain bicubic on the decoded image adds no detail. Re-denoising the upscaled latent in
+        // overlapping tiles lets the UNet paint real detail back in, and the tiles keep the work
+        // inside what a 6 GB card can hold.
+        if (p.hires > 1.01f && p.hiresRefine > 0.01f) {
+            uint32_t rh = std::max(8u, (uint32_t)std::lround((double)Lh * p.hires));
+            uint32_t rw = std::max(8u, (uint32_t)std::lround((double)Lw * p.hires));
+            rh = (rh + 7u) & ~7u;
+            rw = (rw + 7u) & ~7u;
+            std::vector<float> rlat = upscaleLatentBilinear(lat, Lh, Lw, rh, rw);
+            Euler rs = buildPartial(full, steps, p.hiresRefine, p.zsnr);
+            const int rn = (int)rs.timesteps.size();
+            // The refine pass reuses the step arena that was sized for the base canvas, so a tile
+            // must never be larger than the base latent (96 px of canvas at 768 -> ~1.5 GB already).
+            const uint32_t tile = std::min<uint32_t>(96u, std::min(Lh, Lw));
+            const uint32_t ov = std::min<uint32_t>(24u, tile / 2);
+            const uint32_t st = tile - ov;
+            std::vector<float> acc((size_t)4 * rh * rw, 0.0f), wsum((size_t)rh * rw, 0.0f);
+            std::printf("hires refine: %ux%u -> %ux%u  denoise %.2f  %d steps  tile %u\n", Lw, Lh, rw, rh,
+                        p.hiresRefine, rn, tile);
+            auto runPassHW = [&](const BufRef& pool, const BufRef& ctx, float t, uint32_t hh, uint32_t ww,
+                                 const BufRef& xb, std::vector<float>& epsOut) {
+                auto te = timeEmbHost(t, 320);
+                G.eng.uploadNow(embHost, te.data(), te.size() * 4);
+                G.eng.beginStep();
+                BufRef temb = buildTemb(pool, addTimeB, embHost);
+                BufRef eps = unetForward(xb, temb, ctx, hh, ww);
+                G.eng.endStep();
+                G.eng.waitStep();
+                G.eng.downloadNow(eps, epsOut.data(), epsOut.size() * 4);
+            };
+            uint64_t tileCount = 0;
+            for (uint32_t y0 = 0; y0 < rh;) {
+                if (p.shouldCancel && p.shouldCancel()) fail("cancelled");
+                uint32_t yy = (rh > tile) ? std::min(y0, rh - tile) : 0u;
+                uint32_t y1 = std::min(rh, yy + tile);
+                for (uint32_t x0 = 0; x0 < rw;) {
+                    if (p.shouldCancel && p.shouldCancel()) fail("cancelled");
+                    uint32_t xx = (rw > tile) ? std::min(x0, rw - tile) : 0u;
+                    uint32_t x1 = std::min(rw, xx + tile);
+                    uint32_t th = y1 - yy, tw = x1 - xx;
+                    uint64_t tf = (uint64_t)4 * th * tw;
+                    std::vector<float> blk(tf), epsC(tf), epsU(tf), resv(tf), x0v(tf), scaled(tf);
+                    for (uint32_t c = 0; c < 4; c++)
+                        for (uint32_t y = 0; y < th; y++)
+                            std::memcpy(&blk[((size_t)c * th + y) * tw],
+                                        &rlat[((size_t)c * rh + yy + y) * rw + xx], tw * 4);
+                    uint32_t ts = p.seed * 2654435761u + yy * 73856093u + xx * 19349663u;
+                    std::mt19937 rng(ts);
+                    std::normal_distribution<float> nd(0.0f, 1.0f);
+                    for (uint64_t k = 0; k < tf; k++) blk[k] += nd(rng) * rs.sigmas[0];
+                    BufRef xb = G.scratchArena.alloc(tf * 4);
+                    for (int i = 0; i < rn; i++) {
+                        float t = rs.timesteps[i], sigma = rs.sigmas[i];
+                        float inv = 1.0f / std::sqrt(sigma * sigma + 1.0f);
+                        for (uint64_t k = 0; k < tf; k++) scaled[k] = blk[k] * inv;
+                        G.eng.uploadNow(xb, scaled.data(), tf * 4);
+                        runPassHW(poolCB, ctxC, t, th, tw, xb, epsC);
+                        runPassHW(poolUB, ctxU, t, th, tw, xb, epsU);
+                        for (uint64_t k = 0; k < tf; k++) resv[k] = epsU[k] + p.cfg * (epsC[k] - epsU[k]);
+                        for (uint64_t k = 0; k < tf; k++) {
+                            float xv = blk[k], e = resv[k];
+                            float s2 = sigma * sigma + 1.0f;
+                            x0v[k] = p.vpred ? e * (-sigma / std::sqrt(s2)) + xv / s2 : xv - sigma * e;
+                        }
+                        float dt = rs.sigmas[i + 1] - sigma;
+                        for (uint64_t k = 0; k < tf; k++) blk[k] += (blk[k] - x0v[k]) / sigma * dt;
+                    }
+                    for (uint32_t c = 0; c < 4; c++)
+                        for (uint32_t y = 0; y < th; y++) {
+                            float wy = 1.0f;
+                            if (yy > 0) wy = std::min(wy, (y + 0.5f) / (float)ov);
+                            if (y1 < rh) wy = std::min(wy, (th - y - 0.5f) / (float)ov);
+                            for (uint32_t bx = 0; bx < tw; bx++) {
+                                float wx = 1.0f;
+                                if (xx > 0) wx = std::min(wx, (bx + 0.5f) / (float)ov);
+                                if (x1 < rw) wx = std::min(wx, (tw - bx - 0.5f) / (float)ov);
+                                float w = wx * wy;
+                                acc[((size_t)c * rh + yy + y) * rw + xx + bx] +=
+                                    blk[((size_t)c * th + y) * tw + bx] * w;
+                                if (c == 0) wsum[(size_t)(yy + y) * rw + xx + bx] += w;
+                            }
+                        }
+                    tileCount++;
+                    if (x1 >= rw) break;
+                    x0 = xx + st;
+                }
+                if (y1 >= rh) break;
+                y0 = yy + st;
+            }
+            for (uint32_t c = 0; c < 4; c++)
+                for (uint32_t y = 0; y < rh; y++)
+                    for (uint32_t x = 0; x < rw; x++) {
+                        size_t i = ((size_t)c * rh + y) * rw + x;
+                        acc[i] /= std::max(wsum[(size_t)y * rw + x], 1e-6f);
+                    }
+            lat.swap(acc);
+            Lh = rh;
+            Lw = rw;
+            std::printf("hires refine: %llu tiles done, latent %ux%u\n", (unsigned long long)tileCount, Lw, Lh);
+        }
+
         if (p.saveLatent && !p.latentOut.empty()) {
             if (writeLatent(p.latentOut, lat, Lh, Lw)) std::printf("latent saved: %s\n", p.latentOut.c_str());
         }
@@ -3031,13 +3456,19 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         report(onProgress, Progress::Kind::Decode, steps, steps, 0.88, 0.0, "vae decode");
         auto tD0 = std::chrono::steady_clock::now();
         std::vector<float> img = vaeDecode(p, lat, Lh, Lw);
+        uint32_t ow = Lw * 8, oh = Lh * 8;
+        if (p.hires > 1.01f && p.hiresRefine <= 0.01f) upscaleImageBicubic(img, ow, oh, p.hires);
         res.vaeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tD0).count();
         std::string info = p.infoOut ? ofc::sdxl::infoText(p, m.modelName, gDeviceName) : std::string();
-        if (!writeImageFile(p.outPath, img, width, height, p.pngCompress, info))
+        if (!writeImageFile(p.outPath, img, ow, oh, p.pngCompress, info))
             fail("cannot write " + p.outPath);
         res.outPath = p.outPath;
+        width = ow;
+        height = oh;
         res.image.width = width;
         res.image.height = height;
+        res.width = width;
+        res.height = height;
         res.image.rgb.resize((size_t)3 * width * height);
         for (uint64_t k = 0; k < res.image.rgb.size(); k++) res.image.rgb[k] = img[k] * 0.5f + 0.5f;
         res.totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
@@ -3072,23 +3503,25 @@ RunResult decodeLatentFile(EvalModel& m, const GenParams& in, const std::string&
             ModelSet set;
             if (!ofc::sdxl::resolveModels(p, set, err)) fail(err);
         }
-        if (!ensureDevice(p.spvDir, err)) fail(err);
+        if (!ensureDevice(p.spvDir, err, p.device)) fail(err);
         std::vector<float> lat;
         uint32_t lh = 0, lw = 0;
         if (!readLatent(latentPath, lat, lh, lw, err)) fail(err);
         report(onProgress, Progress::Kind::Load, 0, 1, 0.05, 0.0, "decoding latent " + latentPath);
         auto tv = std::chrono::steady_clock::now();
         std::vector<float> img = vaeDecode(p, lat, lh, lw);
+        uint32_t ow = lw * 8, oh = lh * 8;
+        if (p.hires > 1.01f) upscaleImageBicubic(img, ow, oh, p.hires);
         res.vaeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
         report(onProgress, Progress::Kind::Decode, 1, 1, 0.9, res.vaeMs, "vae decoded");
         std::string out = p.outPath;
         if (out.empty()) out = latentPath + ".png";
-        p.width = lw * 8;
-        p.height = lh * 8;
+        p.width = ow;
+        p.height = oh;
         std::string info = p.infoOut ? infoText(p, "latent", m.deviceName) : std::string();
-        if (!writeImageFile(out, img, lw * 8, lh * 8, p.pngCompress, info)) fail("cannot write " + out);
-        res.image.width = lw * 8;
-        res.image.height = lh * 8;
+        if (!writeImageFile(out, img, ow, oh, p.pngCompress, info)) fail("cannot write " + out);
+        res.image.width = ow;
+        res.image.height = oh;
         res.image.rgb.resize((size_t)3 * res.image.width * res.image.height);
         for (uint64_t k = 0; k < res.image.rgb.size(); k++) res.image.rgb[k] = img[k] * 0.5f + 0.5f;
         res.outPath = out;
@@ -3110,7 +3543,7 @@ RunResult decodeLatentFile(EvalModel& m, const GenParams& in, const std::string&
 
 std::string deviceCheck(const std::string& spvDir, bool bench) {
     std::string err;
-    if (!ensureDevice(spvDir, err)) {
+    if (!ensureDevice(spvDir, err, 0)) {
         return "device init failed: " + err + "\n(pass --spv <folder with compiled *.spv shaders>)\n";
     }
     std::string out = G.eng.deviceReport();

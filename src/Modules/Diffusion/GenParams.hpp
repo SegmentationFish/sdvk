@@ -77,6 +77,11 @@ struct GenParams {
     std::string spacing = "leading";
     SamplerKind sampler = SamplerKind::Euler;
     uint32_t seed = 1234;
+    bool seedGiven = false;  // --seed given; otherwise a random seed is drawn per run
+    std::string promptsFile;  // --prompts: one prompt per line, reuses the resident UNet
+    int device = 0;           // Vulkan compute device index (see /api/devices)
+    float hires = 1.0f;      // latent upscale factor before VAE decode (1 = off)
+    float hiresRefine = 0.0f;  // >0: re-denoise the upscaled latent in tiles at this strength
 
     // ---- canvas
     uint32_t width = 512;
@@ -86,6 +91,12 @@ struct GenParams {
     uint32_t cropOffsetY = 0;
     std::string initImage;  // PNG / PPM, opt-in (useInit)
     bool useInit = false;
+    // Inpaint: a second image where white means "repaint here". Needs initImage. The mask is
+    // reduced to latent resolution and feathered before it is blended into every sampler step.
+    std::string maskImage;
+    uint32_t maskFeather = 8;  // feather radius in latent px (0 = hard edge)
+    bool maskInvert = false;   // black means repaint
+    bool roundtrip = false;    // encode -> decode only, no sampling; validates the VAE pair
     bool noOutpaint = false;
 
     // ---- models

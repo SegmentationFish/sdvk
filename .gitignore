@@ -33,3 +33,7 @@ dbg_*.f32
 
 # internal handover notes
 HANDOVER.md
+PLAN-*.md
+
+# local test inputs (mask/tone fixtures)
+input/

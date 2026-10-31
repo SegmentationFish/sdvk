@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
-// 3x3 stride2 pad1 im2col (NCHW, batch=1): OH=H/2, OW=W/2
+// 3x3 stride2 im2col (NCHW, batch=1): OH=H/2, OW=W/2.
+// off=-1 : symmetric pad 1 on both sides (LDM/UNet downsamplers)
+// off= 0 : pad only right/bottom (diffusers AutoencoderKL Downsample2D passes padding=0 and
+//          prepends F.pad((0,1,0,1))); the bounds test drops the padded ring.
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer IN { float inx[]; };
 layout(binding = 1) writeonly buffer COL { float col[]; };
-layout(push_constant) uniform PC { uint C; uint H; uint W; uint OH; uint OW; } pc;
+layout(push_constant) uniform PC { uint C; uint H; uint W; uint OH; uint OW; int off; } pc;
 
 void main(){
     uint P = pc.OH * pc.OW;
@@ -20,8 +23,8 @@ void main(){
     uint kx = rr - ky * 3u;
     uint oh = p / pc.OW;
     uint ow = p - oh * pc.OW;
-    int ih = int(oh * 2u) + int(ky) - 1;
-    int iw = int(ow * 2u) + int(kx) - 1;
+    int ih = int(oh * 2u) + int(ky) + pc.off;
+    int iw = int(ow * 2u) + int(kx) + pc.off;
     float v = 0.0;
     if (ih >= 0 && ih < int(pc.H) && iw >= 0 && iw < int(pc.W))
         v = inx[(c * pc.H + uint(ih)) * pc.W + uint(iw)];

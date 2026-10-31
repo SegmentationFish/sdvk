@@ -9,10 +9,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -22,6 +25,12 @@ namespace fs = std::filesystem;
 
 static const char* kVersion = "0.3.0";
 static const char* kLicense = "GPL-3.0-only";
+
+// Ctrl+C used to kill the process with several GB of device memory live, which makes the WDDM
+// driver tear the context down mid-command and the display reset (black screen for seconds).
+// Catch it, let the sampler stop at the next safe point and release everything in order.
+static volatile std::sig_atomic_t gStop = 0;
+static void onSignal(int) { gStop = 1; }
 
 static void usage() {
     std::printf(
@@ -47,7 +56,8 @@ static void usage() {
         "  --neg <text>            negative prompt\n"
         "  --steps <n>             sampler steps (default 20)\n"
         "  --cfg <f>               guidance scale (default 7.5; 3.0 recommended for v-pred)\n"
-        "  --seed <n>              noise seed (default 1234)\n"
+        "  --seed <n>              noise seed (default: random each run)\n"
+        "  --prompts <file>        one prompt per line; the UNet stays loaded across the batch\n"
         "  --sampler <name>        euler | euler_a (default euler)\n"
         "  --spacing <s>           leading | trailing (SDXL checkpoints use trailing)\n"
         "  --vpred                 v-prediction sampling\n"
@@ -59,9 +69,14 @@ static void usage() {
         "canvas:\n"
         "  --size <n | WxH>        square edge, or width x height (multiple of 8; default 512)\n"
         "  --width/--height <n>    non-square canvas\n"
-        "  --init <image>          img2img seed image (PNG or PPM)\n"
+        "  --init <image>          img2img seed image (PNG or PPM), VAE-encoded into the latent\n"
         "  --denoise <f>           img2img strength, 0..1 (default 0.75 with --init)\n"
         "  --crop <x,y,w,h>        region of the seed image to use\n"
+        "  --mask <image>          inpaint mask (white = repaint); needs --init\n"
+        "  --mask-feather <n>      mask edge feather in latent px (default 8, 0 = hard)\n"
+        "  --mask-invert           black means repaint\n"
+        "  --roundtrip             encode the seed image and decode it back, no sampling\n"
+        "                          (prints PSNR; the check that the VAE pair agrees)\n"
         "\n"
         "output:\n"
         "  --out <file>            .png (default sdvkgen.png) or .ppm\n"
@@ -77,6 +92,9 @@ static void usage() {
         "  --step-mb/--scratch-mb/--vstep-mb <n>   arena sizes in MB\n"
         "  --vae-tile <n>          decode the VAE in n-latent-px tiles (0 = auto)\n"
         "  --vae-overlap <n>       tile overlap in latent px (default 8)\n"
+        "  --hires <f>             post-decode bicubic upscale (1 = off, 2 = 2x output)\n"
+        "  --hires-denoise <d>     with --hires: latent upscale + tiled image-to-image re-denoise\n"
+        "                          at strength d (0 = plain bicubic, 0.3-0.4 recommended)\n"
         "  -v, --verbose           print timing detail\n"
         "  --check                 report device, heaps and canvas suggestions\n"
         "  --bench                 --check plus bandwidth and GEMM benchmarks\n"
@@ -222,6 +240,15 @@ static Parsed parseArgs(int argc, char** argv) {
         } else if (a == "--seed") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.seed = (uint32_t)std::strtoul(val().c_str(), nullptr, 10);
+            p.seedGiven = true;
+            i++;
+        } else if (a == "--device") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.device = std::atoi(val().c_str());
+            i++;
+        } else if (a == "--prompts") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.promptsFile = val();
             i++;
         } else if (a == "--sampler") {
             if (!need(i, argc, a.c_str(), o)) break;
@@ -243,6 +270,19 @@ static Parsed parseArgs(int argc, char** argv) {
             p.useInit = true;
             p.denoise = 0.75f;
             i++;
+        } else if (a == "--mask") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.maskImage = val();
+            i++;
+        } else if (a == "--mask-feather") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.maskFeather = (uint32_t)std::max(0, std::atoi(val().c_str()));
+            i++;
+        } else if (a == "--mask-invert") {
+            p.maskInvert = true;
+        } else if (a == "--roundtrip") {
+            p.roundtrip = true;
+            p.useInit = true;
         } else if (a == "--crop") {
             if (!need(i, argc, a.c_str(), o)) break;
             unsigned x = 0, y = 0, w = 0, h = 0;
@@ -302,6 +342,16 @@ static Parsed parseArgs(int argc, char** argv) {
             if (!need(i, argc, a.c_str(), o)) break;
             p.vaeOverlap = (uint32_t)std::strtoul(val().c_str(), nullptr, 10);
             i++;
+        } else if (a == "--hires") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.hires = (float)std::atof(val().c_str());
+            if (p.hires < 1.0f || p.hires > 4.0f) o.err = "--hires expects 1.0 .. 4.0";
+            i++;
+        } else if (a == "--hires-denoise") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.hiresRefine = (float)std::atof(val().c_str());
+            if (p.hiresRefine < 0.0f || p.hiresRefine > 1.0f) o.err = "--hires-denoise expects 0 .. 1";
+            i++;
         } else if (a == "--lat-in") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.initImage = val();
@@ -345,12 +395,22 @@ static Parsed parseArgs(int argc, char** argv) {
     }
     if (p.prompt.empty() && !positional.empty()) p.prompt = positional.front();
     if (p.height == 0) p.height = p.width;
+    // A fixed default seed made every default-parameter run reproduce the same noise field, and
+    // some noise fields sit on a model out-of-distribution spot (over-exposed, magenta skin at
+    // 768-class canvases). Draw a fresh seed unless the caller pinned one.
+    if (!p.seedGiven) p.seed = std::random_device{}();
     if (p.useInit && p.initImage.empty()) o.err = "--init needs a path";
+    if (!p.maskImage.empty() && p.initImage.empty()) o.err = "--mask needs --init";
     return o;
 }
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, onSignal);
+#endif
     if (argc < 2) {
         usage();
         return 1;
@@ -420,12 +480,12 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (p.prompt.empty()) {
+    if (p.prompt.empty() && p.promptsFile.empty()) {
         std::printf("error: no prompt given\n(run with --help)\n");
         return 1;
     }
-    if (p.width % 8 || p.height % 8 || p.width < 64 || p.height < 64) {
-        std::printf("error: --width/--height must be multiples of 8 and at least 64\n");
+    if (p.width % 64 || p.height % 64 || p.width < 64 || p.height < 64) {
+        std::printf("error: --width/--height must be multiples of 64 and at least 64 (e.g. 832x1216, 768x1024)\n");
         return 1;
     }
 
@@ -438,7 +498,52 @@ int main(int argc, char** argv) {
         }
     };
     auto t0 = std::chrono::steady_clock::now();
-    RunResult r = run(m, p, onProgress);
+    p.shouldCancel = [] { return gStop != 0; };
+    // --prompts keeps the process (and therefore the 2.9 GB resident UNet) alive across prompts.
+    // Two separate processes cannot share Vulkan device memory at all, so batching inside one
+    // process is the only way to avoid reloading the weights for every image.
+    std::vector<std::string> batch;
+    if (!p.promptsFile.empty()) {
+        std::ifstream f(p.promptsFile);
+        if (!f) {
+            std::printf("error: cannot read %s\n", p.promptsFile.c_str());
+            return 1;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+            size_t b = line.find_first_not_of(" \t");
+            if (b == std::string::npos || line[b] == '#') continue;
+            batch.push_back(line.substr(b));
+        }
+        if (batch.empty()) {
+            std::printf("error: no prompts in %s\n", p.promptsFile.c_str());
+            return 1;
+        }
+    } else {
+        batch.push_back(p.prompt);
+    }
+    RunResult r;
+    for (size_t bi = 0; bi < batch.size(); bi++) {
+        GenParams q = p;
+        q.prompt = batch[bi];
+        if (!p.seedGiven) q.seed = std::random_device{}();
+        if (batch.size() > 1) {
+            std::string path = p.outPath;
+            char suffix[16];
+            std::snprintf(suffix, sizeof suffix, "_%03u", (unsigned)bi);
+            size_t dot = path.find_last_of('.');
+            if (dot == std::string::npos) path = path + suffix + ".png";
+            else path = path.substr(0, dot) + suffix + path.substr(dot);
+            q.outPath = path;
+        }
+        if (batch.size() > 1) {
+            std::printf("\n[%zu/%zu] %.70s%s\n", bi + 1, batch.size(), batch[bi].c_str(),
+                        batch[bi].size() > 70 ? "..." : "");
+        }
+        r = run(m, q, onProgress);
+        if (!r.ok) break;
+    }
     if (!r.ok) {
         std::printf("error: %s\n", r.error.c_str());
         return 1;

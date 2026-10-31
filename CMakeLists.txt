@@ -44,6 +44,8 @@ add_library(sdvkcore STATIC
     src/Modules/Diffusion/Safetensors.cpp
     src/Modules/Diffusion/GenParams.cpp
     src/Modules/Diffusion/ModelSet.cpp
+    src/Modules/Audio/Wav.cpp
+    src/Modules/Audio/Dsp.cpp
     src/Modules/Model/Gguf.cpp
     src/Modules/GPU/gpu_ops.cpp
     src/Modules/GPU/vk_engine.cpp
@@ -104,3 +106,11 @@ target_link_libraries(vkbudget PRIVATE sdvkcore)
 
 add_executable(ggufinfo tools/ggufinfo.cpp)
 target_link_libraries(ggufinfo PRIVATE sdvkcore)
+
+# ---- host-side allocator property test ----
+add_executable(lolavamem_test tests/lolavamem_test.cpp src/Modules/GPU/lolavamem.cpp)
+target_include_directories(lolavamem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# ---- audio module: pure CPU, links nothing GPU ----
+add_executable(audio_test tests/audio_test.cpp src/Modules/Audio/Wav.cpp src/Modules/Audio/Dsp.cpp)
+target_include_directories(audio_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
