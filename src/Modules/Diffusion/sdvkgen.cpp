@@ -56,6 +56,7 @@ struct ModelFile {
     Safetensors st;
 };
 static ModelFile gUNet, gTe1, gTe2, gVae;
+static int gArch = 2;  // 1 = SD1.5 (LDM UNet, single CLIP-L), 2 = SDXL
 static std::string gDeviceName;
 
 static std::vector<std::pair<std::string, Safetensors*>> gSTs;  // (prefix, file) for dim lookup
@@ -63,6 +64,9 @@ static std::vector<std::pair<std::string, Safetensors*>> gSTs;  // (prefix, file
 static std::unordered_map<std::string, BufRef> gW;   // fp32 weights
 static std::unordered_map<std::string, BufRef> gWQ;  // Q8_0 int8 payloads
 static std::unordered_map<std::string, BufRef> gWS;  // Q8_0 fp32 scales
+// logical (rows, cols) of every fp32 weight we uploaded. Checkpoint slices rename tensors on the
+// way in, so the file-based findST lookup cannot resolve them; this table keeps the dims.
+static std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> gDims;
 
 static uint32_t ceilDiv(uint64_t a, uint32_t b) { return (uint32_t)((a + b - 1) / b); }
 
@@ -186,6 +190,12 @@ static bool hasST(const std::string& name) { return findST(name) != nullptr; }
 // dims of a weight that may live in the GGUF (Q8) or in a safetensors file (fp32)
 // Route by which container holds the tensor: the GGUF also stores some UNet tensors as F16/F32.
 static void linearDims(const std::string& name, uint32_t& rows, uint32_t& cols) {
+    auto it = gDims.find(name);
+    if (it != gDims.end()) {
+        rows = it->second.first;
+        cols = it->second.second;
+        return;
+    }
     if (gUNet.gg.find(name)) ggdims(name, rows, cols);
     else sdims(name, rows, cols);
 }
@@ -199,6 +209,7 @@ static void clearWeights() {
     gW.clear();
     gWQ.clear();
     gWS.clear();
+    gDims.clear();
     gSTs.clear();
 }
 
@@ -290,8 +301,21 @@ static bool wantTensor(const std::string& n, Part part) {
 static void loadSafetensors(Safetensors& st, const std::string& from, const std::string& to, Part part,
                             const std::string& label) {
     uint64_t pending = 0, n = 0;
+    // `from` is a real slice prefix only when the file actually carries it (checkpoints); for
+    // diffusers components the caller passes a virtual alias ("vae." on decoder.* keys), and the
+    // Part filter does the selection there.
+    bool havePrefix = false;
+    if (!from.empty()) {
+        for (auto& t : st.tensors())
+            if (t.name.rfind(from, 0) == 0) {
+                havePrefix = true;
+                break;
+            }
+    }
     for (auto& t : st.tensors()) {
+        if (havePrefix && t.name.rfind(from, 0) != 0) continue;  // slice a checkpoint, don't load all of it
         if (!wantTensor(t.name, part)) continue;
+        if (t.dtype != "F32" && t.dtype != "F16" && t.dtype != "BF16") continue;  // position_ids and friends
         std::vector<float> v;
         try {
             v = st.readF32(t.name);
@@ -300,12 +324,25 @@ static void loadSafetensors(Safetensors& st, const std::string& from, const std:
         }
         std::string key = t.name;
         if (!from.empty() && key.rfind(from, 0) == 0) key = to + key.substr(from.size());
+        uint32_t rows = t.shape.empty() ? 1u : (uint32_t)t.shape[0];
+        uint64_t cols = 1;
+        for (size_t i = 1; i < t.shape.size(); i++) cols *= t.shape[i];
+        gDims[key] = {rows, (uint32_t)cols};
         uploadF32(key, v, pending);
         n++;
     }
     G.eng.flushUploads();
     std::printf("weights loaded (%s): %zu tensors, param arena %.0f MB\n", label.c_str(), n,
                 G.paramArena.used() / 1048576.0);
+    if (std::getenv("OFC_DBG_KEYS")) {
+        int shown = 0;
+        for (auto& kv : gW)
+            if (kv.first.find("fc1") != std::string::npos && shown++ < 3) std::printf("  key: %s\n", kv.first.c_str());
+        std::printf("  layer0 keys: %d, exact=%d\n", (int)std::count_if(gW.begin(), gW.end(), [](const auto& kv) {
+                        return kv.first.find("layers.0.mlp") != std::string::npos;
+                    }),
+                    (int)gW.count("te1.text_model.encoder.layers.0.mlp.fc1.weight"));
+    }
 }
 
 // Loads the UNet from a GGUF (kept quantized, dequantized in-shader) or a safetensors UNet.
@@ -319,6 +356,8 @@ static void loadUnet(const GenParams& p) {
         gUNet.path = f;
         std::printf("unet: %s (%zu tensors, gguf)\n", f.c_str(), gUNet.gg.tensorCount());
         loadGgufUnet();
+        gArch = hasAnyW("label_emb.0.0.weight") ? 2 : 1;
+        std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
         return;
     }
     if (!gUNet.st.ensureOpen(f)) fail("cannot open UNet " + f + ": " + gUNet.st.error());
@@ -329,6 +368,8 @@ static void loadUnet(const GenParams& p) {
                 checkpoint ? ", full checkpoint" : "");
     loadSafetensors(gUNet.st, checkpoint ? "model.diffusion_model." : "", "", checkpoint ? Part::Unet : Part::All,
                     "unet");
+    gArch = hasAnyW("label_emb.0.0.weight") ? 2 : 1;
+    std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
 }
 
 // Text encoders, one at a time. `phase` 0 = CLIP-L, 1 = CLIP-G; whichever pass runs rebinds the
@@ -342,13 +383,19 @@ static void loadOneTextEncoder(const GenParams& p, int phase) {
     std::error_code ec;
     uint64_t fileBytes = std::filesystem::file_size(path, ec);
     if (ec) fileBytes = 0;
-    G.paramBytes = std::min<uint64_t>(std::max<uint64_t>(fileBytes * 2 / 1048576 + 512, 512), 6144) << 20;
+    G.paramBytes = std::min<uint64_t>(std::max<uint64_t>(fileBytes * 2 / 1048576 + 512, 512), phase == 0 ? 2048 : 6144) << 20;
     clearWeights();
     G.eng.initArenas(192ull << 20, 192ull << 20);  // CLIP attention peaks near 77x77x1280
     G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
     std::printf("%s arena: %.0f MB\n", what, G.paramBytes / 1048576.0);
 
-    if (containsPrefix(st, "text_encoder.")) {
+    if (containsPrefix(st, "cond_stage_model.transformer.")) {
+        // SD1.5 single-file checkpoint: a bare CLIP-L under the LDM prefix (one extra segment).
+        // Must be tested before the text_model.* branch: containsPrefix is a substring match and
+        // "text_model." is inside "cond_stage_model.transformer.text_model.".
+        if (phase != 0) fail("SD1.5 checkpoints carry a single text encoder; CLIP-G is not available");
+        loadSafetensors(st, "cond_stage_model.transformer.text_model.", "te1.text_model.", Part::All, what);
+    } else if (containsPrefix(st, "text_encoder.")) {
         loadSafetensors(st, phase == 0 ? "text_encoder." : "text_encoder_2.", phase == 0 ? "te1." : "te2.",
                         phase == 0 ? Part::ClipL : Part::ClipG, what);
     } else if (containsPrefix(st, "text_model.")) {
@@ -1169,11 +1216,11 @@ static BufRef geglu(const BufRef& x, const std::string& p, uint32_t rows) {
 }
 
 static BufRef spatialTransformer(const BufRef& x, const std::string& p, const BufRef& ctx, uint32_t H, uint32_t Wd,
-                                 uint32_t layers, const char* tag = "") {
+                                 uint32_t layers, const char* tag = "", uint32_t headsOverride = 0) {
     uint32_t C, tmp;
     linearDims(p + ".norm.weight", C, tmp);
     uint32_t P = H * Wd;
-    uint32_t heads = C / 64;
+    uint32_t heads = headsOverride ? headsOverride : C / 64;
     bool sel = gTrace && *gDbSel && tag && *tag && strstr(gDbSel, tag) != nullptr;
     auto dt = [&](const char* suf, const BufRef& b, uint64_t floats) {
         if (sel) tr(std::string(tag) + suf, b, floats);
@@ -1244,7 +1291,85 @@ static BufRef concatCh(const BufRef& a, uint32_t ca, const BufRef& b, uint32_t c
     return y;
 }
 
+// SD1.5 (LDM) UNet: same building blocks as the SDXL path, different block order, attention
+// placement and head width. Layout taken from the checkpoint: conv_in; [res+attn]x2, down,
+// [res+attn]x2, down, [res+attn]x2, down, [res]x2; mid res+attn+res; then 12 up blocks that
+// concat one skip, run a resnet, optionally attend (out.3..11) and optionally upsample
+// (out.2 / out.5 / out.8, where the checkpoint carries a .1.conv / .2.conv).
+static BufRef unetForwardSd15(const BufRef& lat, const BufRef& temb, const BufRef& ctx, uint32_t H, uint32_t Wd) {
+    const uint32_t kHeads = 8;  // SD1.5 attention heads (head dim = C/8)
+    std::vector<BufRef> hs;
+    std::vector<uint32_t> hch;
+    uint32_t h = H, w = Wd;
+    BufRef x = conv3Raw(lat, "input_blocks.0.0.weight", 4, 320, H, Wd);
+    uint32_t ch = 320;
+    hs.push_back(x);
+    hch.push_back(ch);
+    auto down = [&](const char* pre, bool attn_) {
+        std::string p = pre;
+        // LDM checkpoints keep the resnet under an explicit .0 segment (SDXL conversions flatten it)
+        x = resBlock(x, p + ".0", temb, h, w);
+        ch = wdimT(p + ".0.out_layers.3.weight");
+        if (attn_) x = spatialTransformer(x, p + ".1", ctx, h, w, 1, nullptr, kHeads);
+        hs.push_back(x);
+        hch.push_back(ch);
+    };
+    auto downSample = [&](const char* op) {
+        x = conv3s2(x, op, h, w);
+        ch = wdimT(std::string(op) + ".weight");
+        h /= 2;
+        w /= 2;
+        hs.push_back(x);
+        hch.push_back(ch);
+    };
+    down("input_blocks.1", true);
+    down("input_blocks.2", true);
+    downSample("input_blocks.3.0.op");
+    down("input_blocks.4", true);
+    down("input_blocks.5", true);
+    downSample("input_blocks.6.0.op");
+    down("input_blocks.7", true);
+    down("input_blocks.8", true);
+    downSample("input_blocks.9.0.op");
+    down("input_blocks.10", false);
+    down("input_blocks.11", false);
+
+    x = resBlock(x, "middle_block.0", temb, h, w);
+    ch = wdimT("middle_block.0.out_layers.3.weight");
+    x = spatialTransformer(x, "middle_block.1", ctx, h, w, 1, nullptr, kHeads);
+    x = resBlock(x, "middle_block.2", temb, h, w);
+    ch = wdimT("middle_block.2.out_layers.3.weight");
+
+    for (int j = 0; j < 12; j++) {
+        std::string pre = "output_blocks." + std::to_string(j);
+        uint32_t cs = hch.back();
+        BufRef skip = hs.back();
+        hs.pop_back();
+        hch.pop_back();
+        x = concatCh(x, ch, skip, cs, h * w);
+        ch += cs;
+        x = resBlock(x, pre + ".0", temb, h, w);
+        ch = wdimT(pre + ".0.out_layers.3.weight");
+        if (hasAnyW(pre + ".1.transformer_blocks.0.attn1.to_q.weight")) {
+            x = spatialTransformer(x, pre + ".1", ctx, h, w, 1, nullptr, kHeads);
+        }
+        std::string upPfx;
+        if (hasAnyW(pre + ".2.conv.weight")) upPfx = ".2.conv";
+        else if (hasAnyW(pre + ".1.conv.weight")) upPfx = ".1.conv";
+        if (!upPfx.empty()) {
+            x = up2(x, ch, h, w);
+            h *= 2;
+            w *= 2;
+            x = conv3Raw(x, pre + upPfx + ".weight", ch, ch, h, w);
+        }
+    }
+    x = gnSilu(x, "out.0", ch, h * w, 32, 1e-5f);
+    x = conv3Raw(x, "out.2.weight", ch, 4, h, w);
+    return x;
+}
+
 static BufRef unetForward(const BufRef& lat, const BufRef& temb, const BufRef& ctx, uint32_t H, uint32_t Wd) {
+    if (gArch == 1) return unetForwardSd15(lat, temb, ctx, H, Wd);
     // stage tags mirror ref/unet_stages.py so dbg_<tag>.f32 files line up 1:1
     static const char* kDnRes[6] = {"d0_r0", "d0_r1", "d1_r0", "d1_r1", "d2_r0", "d2_r1"};
     static const char* kDnAttn[6] = {"", "", "d1_a0", "d1_a1", "d2_a0", "d2_a1"};
@@ -1355,6 +1480,7 @@ static BufRef buildTemb(const BufRef& pool, const BufRef& addTime1536, const Buf
     BufRef t = linear(tEmb320, "time_embed.0", 1);
     t = silu(t, (uint64_t)wdimT("time_embed.0.weight"));
     t = linear(t, "time_embed.2", 1);
+    if (gArch == 1) return t;  // SD1.5 has no add_embedding (pooled + size conditioning)
     BufRef cat = allocN(2816);
     copyInto(cat, 0, pool, 1280 * 4);
     copyInto(cat, 1280 * 4, addTime1536, 1536 * 4);
@@ -1476,7 +1602,8 @@ static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>
 
     G.eng.beginStep();
     std::vector<float> latScaled(latFloats);
-    for (uint64_t k = 0; k < latFloats; k++) latScaled[k] = lat[k] / 0.13025f;
+    const float vaeScale = (gArch == 1) ? 0.18215f : 0.13025f;  // SD1.5 VAE scaling factor
+    for (uint64_t k = 0; k < latFloats; k++) latScaled[k] = lat[k] / vaeScale;
     BufRef x = allocN(latFloats);
     auto snap = [&](const char* tag) {
         if (!vaeTrace) return;
@@ -2386,6 +2513,17 @@ static std::vector<float> resampleChw(const std::vector<uint8_t>& rgb, uint32_t 
 
 // ================================================================ generate
 
+// Peek at the UNet file before any text encoding: the TE stage needs to know whether a CLIP-G
+// exists at all (SDXL) or not (SD1.5). loadUnet() re-detects from the loaded weights later.
+static void detectArch(const std::string& unetPath) {
+    if (unetPath.size() > 5 && unetPath.compare(unetPath.size() - 5, 5, ".gguf") == 0) return;
+    Safetensors st;
+    if (!st.open(unetPath)) return;
+    bool sdxl = containsPrefix(st, "model.diffusion_model.label_emb.0.0.") || containsPrefix(st, "label_emb.0.0.");
+    gArch = sdxl ? 2 : 1;
+    std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
+}
+
 RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
     RunResult res;
     GenParams p = in;
@@ -2400,6 +2538,7 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             if (!ofc::sdxl::resolveModels(p, set, err)) throw std::runtime_error(err);
         }
         if (!m.loaded) {
+            detectArch(p.models.unet);
             std::string err;
             if (!loadModel(m, p, onProgress, err)) throw std::runtime_error(err);
         }
@@ -2416,6 +2555,7 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         // bigger arenas later in this function.
         uint64_t teStepBytes = 192ull << 20;
         std::vector<float> embCond, embUncond, poolC, poolU;
+        const uint32_t ctxDim = (gArch == 1) ? 768u : 2048u;  // SD1.5 cross-attn is CLIP-L only
         bool latinOnly = false;
         if (!p.embCondFile.empty()) {
             auto loadRaw = [](const std::string& path, size_t n, const char* what) {
@@ -2426,9 +2566,9 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 std::fclose(f);
                 return v;
             };
-            embCond = loadRaw(p.embCondFile, 77ull * 2048, "emb-cond");
-            embUncond = p.embUncondFile.empty() ? std::vector<float>(77ull * 2048, 0.0f)
-                                                : loadRaw(p.embUncondFile, 77ull * 2048, "emb-uncond");
+            embCond = loadRaw(p.embCondFile, 77ull * ctxDim, "emb-cond");
+            embUncond = p.embUncondFile.empty() ? std::vector<float>(77ull * ctxDim, 0.0f)
+                                                : loadRaw(p.embUncondFile, 77ull * ctxDim, "emb-uncond");
             poolC = p.embPoolFile.empty() ? std::vector<float>(1280, 0.0f) : loadRaw(p.embPoolFile, 1280, "emb-pool");
             poolU = p.embPoolUFile.empty() ? std::vector<float>(1280, 0.0f) : loadRaw(p.embPoolUFile, 1280, "emb-poolu");
             std::printf("emb from files (te phase skipped)\n");
@@ -2453,8 +2593,8 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 n1 = p.uncondTokens.empty() ? clipTokenize(gS.tok.t1, p.negative) : p.uncondTokens;
                 n2 = p.uncondTokens.empty() ? clipTokenize(gS.tok.t2, p.negative) : p.uncondTokens;
             }
-            embCond.assign(77ull * 2048, 0.0f);
-            embUncond.assign(77ull * 2048, 0.0f);
+            embCond.assign(77ull * ctxDim, 0.0f);
+            embUncond.assign(77ull * ctxDim, 0.0f);
             poolC.assign(1280, 0.0f);
             poolU.assign(1280, 0.0f);
 
@@ -2485,10 +2625,11 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 std::vector<float> eL = encodeOne(0, i1, nullptr);
                 std::vector<float> eLn = needUncond ? encodeOne(0, n1, nullptr) : std::vector<float>();
                 for (uint32_t t = 0; t < 77; t++) {
-                    std::memcpy(&embCond[(size_t)t * 2048], &eL[(size_t)t * 768], 768 * 4);
-                    if (needUncond) std::memcpy(&embUncond[(size_t)t * 2048], &eLn[(size_t)t * 768], 768 * 4);
+                    std::memcpy(&embCond[(size_t)t * ctxDim], &eL[(size_t)t * 768], 768 * 4);
+                    if (needUncond) std::memcpy(&embUncond[(size_t)t * ctxDim], &eLn[(size_t)t * 768], 768 * 4);
                 }
             }
+            if (gArch != 1) {  // SD1.5 has no CLIP-G: the cross-attn context is CLIP-L only
             report(onProgress, Progress::Kind::Encode, 0, 0, 0.14, 0.0, "encoding prompt (clip-g)");
             loadOneTextEncoder(p, 1);
             {
@@ -2496,11 +2637,12 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 std::vector<float> eG = encodeOne(1, i2, &poolCv);
                 std::vector<float> eGn = needUncond ? encodeOne(1, n2, &poolUv) : std::vector<float>();
                 for (uint32_t t = 0; t < 77; t++) {
-                    std::memcpy(&embCond[(size_t)t * 2048 + 768], &eG[(size_t)t * 1280], 1280 * 4);
-                    if (needUncond) std::memcpy(&embUncond[(size_t)t * 2048 + 768], &eGn[(size_t)t * 1280], 1280 * 4);
+                    std::memcpy(&embCond[(size_t)t * ctxDim + 768], &eG[(size_t)t * 1280], 1280 * 4);
+                    if (needUncond) std::memcpy(&embUncond[(size_t)t * ctxDim + 768], &eGn[(size_t)t * 1280], 1280 * 4);
                 }
                 poolC = poolCv;
                 if (needUncond) poolU = poolUv;
+            }
             }
         }
         res.latinOnly = latinOnly;
@@ -2592,8 +2734,8 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             sCache[key] = b;
             return b;
         };
-        BufRef ctxC = scratchBuf("__ctx_cond", 77ull * 2048 * 4);
-        BufRef ctxU = scratchBuf("__ctx_uncond", 77ull * 2048 * 4);
+        BufRef ctxC = scratchBuf("__ctx_cond", (uint64_t)embCond.size() * 4);
+        BufRef ctxU = scratchBuf("__ctx_uncond", (uint64_t)embUncond.size() * 4);
         BufRef poolCB = scratchBuf("__pool_cond", 1280 * 4);
         BufRef poolUB = scratchBuf("__pool_uncond", 1280 * 4);
         BufRef addTimeB = scratchBuf("__addtime", 1536 * 4);
