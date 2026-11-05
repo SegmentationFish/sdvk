@@ -36,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -371,6 +372,7 @@ static void appendCors(Response& r) {
 static int gCurrentDevice = 0;
 static std::string gWebRoot = "webui";
 static std::string gOutDir = "output";
+static std::string gSpv = "shaders";
 static std::string gInputDir = "input";
 
 // Turns a JSON body into GenParams. Unknown keys are ignored so the API stays forward compatible.
@@ -492,7 +494,7 @@ static void handleCancel(const std::map<std::string, std::string>& q, Response& 
 
 static std::string jobJson(const std::shared_ptr<Job>& j) {
     std::ostringstream o;
-    o << "{\"id\":" << jstr(j->id) << ",\"running\":" << (j->running ? "true" : "false")
+    o << "{\"ok\":true,\"id\":" << jstr(j->id) << ",\"running\":" << (j->running ? "true" : "false")
       << ",\"done\":" << (j->done ? "true" : "false") << ",\"cancel\":" << (j->cancel ? "true" : "false")
       << ",\"step\":" << j->step.load()
       << ",\"steps\":" << j->steps << ",\"progress\":" << jnum(j->progress) << ",\"text\":" << jstr(j->text)
@@ -598,6 +600,121 @@ static void handleModels(const std::map<std::string, std::string>& q, Response& 
     for (size_t i = 0; i < set.warn.size(); i++) o << (i ? "," : "") << jstr(set.warn[i]);
     o << "]}";
     setJson(r, 200, o.str());
+}
+
+
+static bool safeJoin(const std::string& root, const std::string& rel, std::string& out);
+
+// GET /api/scan?dir=<folder>: list the components the direct-prompt UI can pick from.
+// Paths are returned as absolute files so the client can round-trip them into /api/generate.
+static void handleScan(const std::map<std::string, std::string>& q, Response& r) {
+    auto it = q.find("dir");
+    if (it == q.end() || it->second.empty()) {
+        setErr(r, 400, "no model folder given (use ?dir=)");
+        return;
+    }
+    const std::string dir = it->second;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        setErr(r, 400, "not a directory: " + dir);
+        return;
+    }
+    std::vector<std::string> unets, checkpoints, vaes, clipL, clipG, loras;
+    std::unordered_map<std::string, bool> seen;
+    uint32_t scanned = 0;
+    for (auto fit = fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied);
+         fit != fs::recursive_directory_iterator(); ++fit) {
+        if (++scanned > 4000) break;
+        if (!fit->is_regular_file(ec)) continue;
+        std::string ext = fit->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (ext != ".gguf" && ext != ".safetensors") continue;
+        std::string full = fit->path().string();
+        if (!seen.emplace(full, true).second) continue;
+        std::string rel = fs::relative(fit->path(), dir, ec).string();
+        std::string low = rel;
+        std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (low.find("lora") != std::string::npos) { loras.push_back(full); continue; }
+        if (low.find("vae") != std::string::npos) { vaes.push_back(full); continue; }
+        if (low.find("text_encoder_2") != std::string::npos || low.find("clip_g") != std::string::npos) {
+            clipG.push_back(full);
+            continue;
+        }
+        if (low.find("text_encoder") != std::string::npos || low.find("clip_l") != std::string::npos) {
+            clipL.push_back(full);
+            continue;
+        }
+        if (ext == ".gguf" || low.find("unet") != std::string::npos) { unets.push_back(full); continue; }
+        std::error_code se;
+        auto sz = fs::file_size(fit->path(), se);
+        if (!se && sz > (1200ull << 20)) checkpoints.push_back(full);
+        else unets.push_back(full);
+    }
+    auto sortv = [](std::vector<std::string>& v) { std::sort(v.begin(), v.end()); };
+    sortv(unets); sortv(checkpoints); sortv(vaes); sortv(clipL); sortv(clipG); sortv(loras);
+
+    GenParams p;
+    p.models.modelDir = dir;
+    p.prompt = "probe";
+    ModelSet set;
+    std::string err;
+    std::string dUnet, dTe1, dTe2, dVae, dTok1, dTok2;
+    if (resolveModels(p, set, err)) {
+        dUnet = p.models.unet; dTe1 = p.models.te1; dTe2 = p.models.te2; dVae = p.models.vae;
+        dTok1 = p.models.tok1; dTok2 = p.models.tok2;
+    }
+    auto arr = [&](const std::vector<std::string>& v) {
+        std::ostringstream o;
+        o << "[";
+        for (size_t i = 0; i < v.size(); i++) { if (i) o << ","; o << jstr(v[i]); }
+        o << "]";
+        return o.str();
+    };
+    std::ostringstream o;
+    o << "{\"ok\":true,\"dir\":" << jstr(dir) << ",\"unets\":" << arr(unets) << ",\"checkpoints\":"
+      << arr(checkpoints) << ",\"vaes\":" << arr(vaes) << ",\"clipL\":" << arr(clipL) << ",\"clipG\":" << arr(clipG)
+      << ",\"loras\":" << arr(loras) << ",\"defaults\":{\"unet\":" << jstr(dUnet) << ",\"te1\":" << jstr(dTe1)
+      << ",\"te2\":" << jstr(dTe2) << ",\"vae\":" << jstr(dVae) << ",\"tok1\":" << jstr(dTok1)
+      << ",\"tok2\":" << jstr(dTok2) << "},\"error\":" << jstr(err) << "}";
+    setJson(r, 200, o.str());
+}
+
+// POST /api/decode {"latent":"input/x.bin","vae":".../vae.safetensors"}
+// VAE-only: free the resident UNet first, decode the latent, write output/decode_<id>.png.
+static void handleDecode(const Request& req, Response& r) {
+    FlatJson j;
+    if (!parseFlatJson(req.body, j) || !j.s.count("latent")) {
+        setErr(r, 400, "expected {\"latent\":\"input/x.bin\",\"vae\":...}");
+        return;
+    }
+    std::string base = fs::path(j.s.at("latent")).filename().string();
+    std::string latent;
+    {
+        std::lock_guard<std::mutex> lk(gModelMu);
+        unloadModel(gModel);
+        gLoaded.clear();
+    }
+    std::error_code ec;
+    if (!safeJoin(gInputDir, base, latent) || !fs::is_regular_file(latent, ec)) {
+        if (!safeJoin(gOutDir, base, latent) || !fs::is_regular_file(latent, ec)) {
+            setErr(r, 404, "latent not found (upload it first): " + base);
+            return;
+        }
+    }
+    GenParams p;
+    applyDefaults(p, gSpv);
+    p.models.modelDir = j.s.count("model") ? j.s.at("model") : gLoaded;
+    if (j.s.count("vae")) p.models.vae = j.s.at("vae");
+    if (j.n.count("hires")) p.hires = (float)j.n.at("hires");
+    p.pngCompress = 1;
+    p.infoOut = true;
+    EvalModel m;
+    RunResult res = decodeLatentFile(m, p, latent, nullptr);
+    std::ostringstream o;
+    o << "{\"ok\":" << (res.ok ? "true" : "false") << ",\"outPath\":" << jstr(res.outPath)
+      << ",\"width\":" << res.width << ",\"height\":" << res.height << ",\"totalMs\":" << jnum(res.totalMs)
+      << ",\"vaeMs\":" << jnum(res.vaeMs) << ",\"error\":" << jstr(res.error) << "}";
+    setJson(r, res.ok ? 200 : 500, o.str());
 }
 
 static void handleGenerate(const Request& req, Response& r) {
@@ -981,6 +1098,10 @@ static Response dispatch(const Request& req) {
         handleDevices(r);
     } else if (path == "/api/models") {
         handleModels(q, r);
+    } else if (path == "/api/scan") {
+        handleScan(q, r);
+    } else if (path == "/api/decode" && req.method == "POST") {
+        handleDecode(req, r);
     } else if (path == "/api/generate" && req.method == "POST") {
         handleGenerate(req, r);
     } else if (path == "/api/upload" && req.method == "POST") {
@@ -1132,6 +1253,7 @@ int main(int argc, char** argv) {
             port = std::atoi(next().c_str());
         } else if (a == "--spv") {
             spv = next();
+            gSpv = spv;
         } else if (a == "-m" || a == "--model-dir") {
             modelDir = next();
         } else if (a == "--web") {
@@ -1154,6 +1276,8 @@ int main(int argc, char** argv) {
                 "  POST /api/generate    {\"prompt\":\"...\", ...}  one image per call\n"
                 "  GET  /api/info        engine and model state\n"
                 "  GET  /api/models      ?dir=<folder> classification\n"
+                "  GET  /api/scan        ?dir=<folder> list unet/vae/clip/lora files\n"
+                "  POST /api/decode      {latent, vae} VAE-only latent -> png\n"
                 "  GET  /api/job         ?id=<job> progress of an async job\n"
                 "  POST /api/cancel      ?id=<job> stop at the next sampler step\n"
                 "  GET  /api/image       ?path=<file.png> fetch a generated image\n\n"

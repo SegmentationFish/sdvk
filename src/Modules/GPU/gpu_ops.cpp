@@ -207,10 +207,12 @@ BufRef gHpBuf() { return G.hp; }
 void gUploadHp(const float* hp, int n) { G.eng.uploadNow(G.hp, hp, (uint64_t)n * 4); }
 
 void gShutdown() {
-    G.eng.destroy();
+    // External arenas hold the VkDevice used to create them. Engine::destroy() tears that device
+    // down, so they must be released first; otherwise vkFreeMemory runs on a dead device handle.
     G.paramArena.destroy();
     G.paramGradArena.destroy();
     G.scratchArena.destroy();
+    G.eng.destroy();
     gResetTape();
     gStepTensorCount = 0;
     G.stepPreZeroed = false;

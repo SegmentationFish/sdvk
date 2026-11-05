@@ -2634,12 +2634,14 @@ static void report(const ProgressFn& fn, Progress::Kind k, int step, int steps, 
 }
 
 void unloadModel(EvalModel& m) {
-    if (!m.loaded) {
+    // A VAE-only decode leaves the engine alive without m.loaded, so "not loaded" is not the
+    // same as "no device memory". Tear down whenever the engine still owns an instance.
+    if (!m.loaded && !G.eng.alive()) {
         delete (State*)m.impl;
         m.impl = nullptr;
         return;
     }
-    gShutdown();
+    if (G.eng.alive()) gShutdown();
     clearWeights();
     gS.unetResident = false;
     gS.tok.ready = false;

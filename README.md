@@ -143,6 +143,7 @@ a single GPU can only run one job anyway.
 | `GET /` | the web UI from `webui/` |
 | `GET /api/info` | version, device, loaded model |
 | `GET /api/models?dir=<folder>` | classification of a model folder |
+| `GET /api/scan?dir=<folder>` | per-component lists (UNet/checkpoint, VAE, CLIP-L/G, LoRA) plus defaults for the web UI |
 | `POST /api/generate` | one image per call (blocking) |
 | `POST /api/generate?async=1` | returns a job id immediately; poll `/api/job` |
 | `POST /api/cancel?id=<id>` | stop an async job at the next sampler step |
@@ -152,7 +153,8 @@ a single GPU can only run one job anyway.
 | `GET /api/audio?path=<file.wav>` | fetch a rendered WAV |
 | `GET /api/devices` | Vulkan devices plus the host-RAM entry |
 | `POST /api/upload` | store a PNG/WAV the UI picked, returns its path |
-| `POST /api/unload` | drop the resident model |
+| `POST /api/decode` | VAE-only latent → PNG: `{"latent":"input/x.bin","vae":"...","model":"..."}` |
+| `POST /api/unload` | drop the resident UNet/VAE and free device memory |
 
 `/api/generate` also accepts `"lora": "<path>", "loraScale": 0.8` to merge a LoRA before sampling.
 The LoRA is merged into the Q8 UNet at load time; `dora_scale` is currently ignored (standard LoRA is used).
@@ -188,7 +190,25 @@ JSON body maps to a `GenParams` member; unknown keys are ignored, which keeps th
 ## Web UI
 
 `webui/` holds three static files (`index.html`, `style.css`, `app.js`) with no build step and no framework.
-`sdvk-server` serves them from the working directory, or from `--web <dir>`.
+`sdvk-server` serves them from the working directory, or from `--web <dir>`:
+
+```bash
+build/sdvk-server.exe --port 7500 --spv build/shaders --web webui --out-dir output
+```
+
+Open `http://127.0.0.1:7500/` and set the model directory at the top. **扫描** walks that folder and fills the
+component pickers — UNet/checkpoint, CLIP-L, CLIP-G, VAE and LoRA — while `（自动）` keeps the server-side
+heuristics. Pick any file explicitly to override them, set a LoRA strength, then generate; settings and the last
+prompt are kept in `localStorage`. The layout is a three-column direct-prompt studio:
+
+- left rail: model components, LoRA (merged into Q8 at load), sampler/size, and the **Latent → PNG** card;
+- centre: prompts, canvas with per-step progress, generate/cancel and download;
+- right rail: output path and metrics, run log, and VRAM tips.
+
+**清理显存** posts `/api/unload`: the UNet, CLIP and VAE weights are released and the Vulkan device is torn down, so
+the next request pays the load cost again. **Latent → PNG** uploads an `.bin` latent and decodes it with the selected
+VAE only — it unloads the resident UNet first so a 768×1024 decode fits in 8 GB of VRAM. `DoRA` files are currently
+loaded as standard LoRA (`dora_scale` is ignored).
 
 ## Weights
 

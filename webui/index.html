@@ -1,121 +1,145 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sdvk - SDXL on Vulkan</title>
+<title>sdvk studio — SDXL on Vulkan</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div id="app">
-    <aside class="panel">
-        <header class="brand">
-            <div class="logo">sdvk</div>
-            <div class="meta">
-                <span id="status" class="dot" title="engine state"></span>
-                <span id="device">connecting…</span>
-            </div>
-        </header>
+<header class="topbar">
+  <div class="brand">
+    <div class="mark">sdvk</div>
+    <div class="brand-text">
+      <strong>sdvk studio</strong>
+      <span>SDXL · self-built Vulkan engine</span>
+    </div>
+  </div>
+  <div class="dirbar">
+    <label for="modelDir">模型目录</label>
+    <input id="modelDir" spellcheck="false" placeholder="E:/ofc-data/noobai">
+    <button id="scanBtn" class="btn primary small">扫描</button>
+    <span id="scanState" class="pill muted">未扫描</span>
+  </div>
+  <div class="topactions">
+    <span id="device" class="pill muted">connecting…</span>
+    <button id="cleanBtn" class="btn ghost small" title="POST /api/unload">清理显存</button>
+  </div>
+</header>
 
-        <section class="field">
-            <label for="model">Model folder</label>
-            <div class="row">
-                <input id="model" spellcheck="false" placeholder="E:/ofc-data/noobai">
-                <button id="probe" class="ghost" title="Inspect folder">Scan</button>
-            </div>
-            <div id="modelInfo" class="hint"></div>
-        </section>
+<main class="layout">
+  <aside class="rail">
+    <section class="card">
+      <div class="card-head"><h3>模型</h3><span class="hint">扫描后自动填充</span></div>
+      <label class="field"><span>UNet / Checkpoint</span><select id="unetSel"></select></label>
+      <label class="field"><span>CLIP-L</span><select id="clipLSel"></select></label>
+      <label class="field"><span>CLIP-G</span><select id="clipGSel"></select></label>
+      <label class="field"><span>VAE</span><select id="vaeSel"></select></label>
+    </section>
 
-        <section class="field">
-            <label for="prompt">Prompt</label>
-            <textarea id="prompt" rows="4" placeholder="a lighthouse at dusk, oil painting"></textarea>
-        </section>
+    <section class="card">
+      <div class="card-head"><h3>LoRA</h3><span class="hint">合并进 Q8 UNet</span></div>
+      <label class="field"><span>LoRA 文件</span><select id="loraSel"><option value="">（不使用）</option></select></label>
+      <label class="field range"><span>强度</span>
+        <input id="loraScale" type="range" min="0" max="1.5" step="0.05" value="1">
+        <output id="loraScaleV">1.00</output>
+      </label>
+      <p class="hint">DoRA 的 dora_scale 暂按普通 LoRA 忽略。</p>
+    </section>
 
-        <section class="field">
-            <label for="negative">Negative</label>
-            <textarea id="negative" rows="2" placeholder="low quality, blurry, watermark"></textarea>
-        </section>
+    <section class="card">
+      <div class="card-head"><h3>采样</h3><span class="hint">v-pred 推荐 leading</span></div>
+      <div class="grid2">
+        <label class="field"><span>步数</span><input id="steps" type="number" min="1" max="200" value="20"></label>
+        <label class="field"><span>CFG</span><input id="cfg" type="number" min="0" max="20" step="0.1" value="3.0"></label>
+        <label class="field"><span>采样器</span>
+          <select id="samplerSel"><option value="euler">Euler</option><option value="euler_a">Euler Ancestral</option></select>
+        </label>
+        <label class="field"><span>schedule</span>
+          <select id="spacingSel"><option value="leading">Leading</option><option value="trailing">Trailing</option></select>
+        </label>
+        <label class="field"><span>seed</span><input id="seed" type="number" value="42"></label>
+        <button id="diceBtn" class="btn ghost tiny" type="button">随机</button>
+        <label class="field"><span>宽</span><input id="width" type="number" min="64" step="64" value="768"></label>
+        <label class="field"><span>高</span><input id="height" type="number" min="64" step="64" value="1024"></label>
+      </div>
+      <div class="checks">
+        <label><input id="vpred" type="checkbox" checked> v-prediction</label>
+        <label><input id="dynthresh" type="checkbox"> dynamic threshold</label>
+        <label><input id="zsnr" type="checkbox"> zero-SNR</label>
+      </div>
+    </section>
 
-        <section class="field grid2">
-            <div>
-                <label for="width">Width</label>
-                <input id="width" type="number" value="768" min="64" step="8">
-            </div>
-            <div>
-                <label for="height">Height</label>
-                <input id="height" type="number" value="768" min="64" step="8">
-            </div>
-        </section>
+    <section class="card">
+      <div class="card-head"><h3>Latent → PNG</h3><span class="hint">只用 VAE</span></div>
+      <label class="field"><span>latent (.bin / .f32)</span><input id="latentFile" type="file" accept=".bin,.f32"></label>
+      <label class="field"><span>解码 VAE</span><select id="decodeVae"></select></label>
+      <button id="decodeBtn" class="btn ghost">用 VAE 解码</button>
+      <p id="decodeStatus" class="hint"></p>
+    </section>
+  </aside>
 
-        <section class="field">
-            <div class="labeled">
-                <label for="steps">Steps</label>
-                <output id="stepsOut">20</output>
-            </div>
-            <input id="steps" type="range" min="1" max="60" value="20">
-        </section>
+  <section class="stagecol">
+    <div class="promptbar card">
+      <label class="field grow"><span>正向提示词</span><textarea id="prompt" rows="3" placeholder="masterpiece, best quality, 1girl, solo, ..."></textarea></label>
+      <label class="field grow"><span>负向提示词</span><textarea id="negative" rows="2" placeholder="worst quality, low quality, ..."></textarea></label>
+    </div>
 
-        <section class="field">
-            <div class="labeled">
-                <label for="cfg">CFG</label>
-                <output id="cfgOut">3.0</output>
-            </div>
-            <input id="cfg" type="range" min="1" max="15" step="0.1" value="3">
-        </section>
+    <div class="stage" id="stage">
+      <div id="placeholder" class="placeholder">
+        <div class="ph-mark">sdvk</div>
+        <p>输入提示词，点击生成</p>
+        <span>SDXL · Q8 UNet · VAE decode</span>
+      </div>
+      <img id="result" alt="generated" hidden>
+      <a id="download" class="download" hidden download>下载 PNG</a>
+      <div id="progressWrap" class="progress-wrap" hidden>
+        <div class="bar"><i id="bar"></i></div>
+        <div class="progress-row"><span id="progressText">准备中…</span><span id="progressPct">0%</span></div>
+      </div>
+    </div>
 
-        <section class="field grid2">
-            <div>
-                <label for="sampler">Sampler</label>
-                <select id="sampler">
-                    <option value="euler">euler</option>
-                    <option value="euler_a">euler a</option>
-                </select>
-            </div>
-            <div>
-                <label for="seed">Seed</label>
-                <input id="seed" type="number" value="1234" min="0">
-            </div>
-        </section>
+    <div class="actionbar card">
+      <div class="action-left">
+        <button id="generateBtn" class="btn primary">生成</button>
+        <button id="cancelBtn" class="btn ghost" disabled>取消</button>
+      </div>
+      <div class="action-right">
+        <span id="genInfo" class="hint"></span>
+        <button id="openOut" class="btn ghost small" disabled>最新输出</button>
+      </div>
+    </div>
 
-        <section class="field">
-            <div class="labeled">
-                <label>Options</label>
-            </div>
-            <div class="checks">
-                <label class="check"><input id="vpred" type="checkbox" checked> v-pred</label>
-                <label class="check"><input id="zsnr" type="checkbox"> zero SNR</label>
-                <label class="check"><input id="dynthresh" type="checkbox"> dyn thresh</label>
-                <label class="check"><input id="rescale" type="checkbox"> cfg rescale</label>
-            </div>
-        </section>
+    <div id="decodeResultWrap" class="card decode-result" hidden>
+      <div class="card-head"><h3>解码结果</h3><span class="hint" id="decodeInfo"></span></div>
+      <img id="decodeResult" alt="decoded latent">
+    </div>
+  </section>
 
-        <button id="run" class="primary">Generate</button>
-        <button id="stop" class="ghost stop" hidden>Cancel</button>
-        <div class="hint" id="runHint">The first run loads the model; later runs reuse it.</div>
-        <footer class="foot">
-            <span id="ver">sdvk</span>
-            <span>GPL-3.0-only</span>
-        </footer>
-    </aside>
+  <aside class="rail">
+    <section class="card">
+      <div class="card-head"><h3>本次输出</h3><span class="pill muted" id="jobState">idle</span></div>
+      <div id="lastOut" class="outpath">尚无</div>
+      <div class="meta-grid">
+        <div><span>尺寸</span><b id="metaSize">—</b></div>
+        <div><span>seed</span><b id="metaSeed">—</b></div>
+        <div><span>耗时</span><b id="metaTime">—</b></div>
+        <div><span>速度</span><b id="metaSpeed">—</b></div>
+      </div>
+    </section>
 
-    <main class="stage">
-        <div id="canvas" class="canvas">
-            <div class="empty">
-                <div class="emptyTitle">No image yet</div>
-                <div class="emptyText">Set a model folder and a prompt, then press Generate.</div>
-            </div>
-            <img id="preview" alt="" hidden>
-        </div>
-        <div class="bar">
-            <div class="prog"><div id="progFill" class="progFill"></div></div>
-            <div class="barText">
-                <span id="progText">idle</span>
-                <span id="progMeta"></span>
-            </div>
-        </div>
-        <div class="log" id="log"></div>
-    </main>
-</div>
+    <section class="card logcard">
+      <div class="card-head"><h3>运行日志</h3><button id="clearLog" class="btn ghost tiny" type="button">清空</button></div>
+      <pre id="log" class="log"></pre>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h3>提示</h3></div>
+      <p class="hint">768×768 约 4.2 s/步；768×1024 约 5.8 s/步。832×1216 显存紧张时把 scratch 调到 700 MB（CLI）。</p>
+      <p class="hint">VAE-only 解码会先卸载常驻 UNet 以腾出显存，下一次生成会重新加载。</p>
+    </section>
+  </aside>
+</main>
 <script src="app.js"></script>
 </body>
 </html>
