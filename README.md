@@ -97,7 +97,10 @@ $ build/sdvkgen.exe --models -m model
 
 Override any single component when the layout is unusual: `--unet`, `--te1`, `--te2`, `--vae`, `--tok`, `--tok2`.
 A full single-file checkpoint (`.safetensors` holding `model.diffusion_model.*`, `conditioner.embedders.*`,
-`first_stage_model.*`) can supply the UNet, both text encoders and the VAE at once.
+`first_stage_model.*`) can supply the UNet, both text encoders and the VAE at once. A full-checkpoint
+**GGUF** works too: the loader keeps only the `model.diffusion_model.*` tensors for the UNet (CLIP/VAE
+still come from `--te1/--te2/--vae`), sizes the arena from the UNet subset instead of the whole file,
+and dequantizes 1-D Q8 biases/norms to fp32.
 
 ### Common flags
 
@@ -106,7 +109,7 @@ A full single-file checkpoint (`.safetensors` holding `model.diffusion_model.*`,
 | `--neg <text>` | negative prompt |
 | `--steps <n>` / `--cfg <f>` | sampler length and guidance |
 | `--size <n>` / `--width` `--height` | square edge or explicit canvas, multiples of 8 |
-| `--sampler euler\|euler_a` | sampler |
+| `--sampler <name>` | `euler`, `euler_a`, `heun`, `lms`, `dpm2`, `dpm2_a`, `dpmpp_2m`, `dpmpp_2s_a`, `ddim` (`heun`/`dpm2`/`dpm2_a` use 2 model evals per step and run ~2x slower) |
 | `--vpred` / `--zsnr` / `--dynthresh` / `--rescale <f>` | schedule and guidance options |
 | `--seed <n>` | noise seed |
 | `--lora <file>` / `--lora-scale <f>` | merge a LoRA safetensors at load time (default scale 1.0) |
@@ -209,6 +212,14 @@ prompt are kept in `localStorage`. The layout is a three-column direct-prompt st
 the next request pays the load cost again. **Latent → PNG** uploads an `.bin` latent and decodes it with the selected
 VAE only — it unloads the resident UNet first so a 768×1024 decode fits in 8 GB of VRAM. `DoRA` files are currently
 loaded as standard LoRA (`dora_scale` is ignored).
+
+## Model library manifest
+
+A model folder can describe itself with a `manifest.json` (`schema: "sdvk.model-library/1"`): for each model it
+declares the UNet, CLIP-L/G, VAE, tokenizers, recommended steps/CFG/sampler, source URL and SHA256; shared
+components and LoRAs get their own sections. The file is plain JSON and is meant to be edited by hand or by a
+download script. `E:/sdvkmodel/` is this workstation's library, with `fetch_loras.ps1` filling the Civitai LoRAs
+once `$env:CIVITAI_TOKEN` is set; sdvk itself never stores credentials.
 
 ## Weights
 

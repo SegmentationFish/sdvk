@@ -162,6 +162,14 @@ static void ggdims(const std::string& name, uint32_t& rows, uint32_t& cols) {
         cols = 1;
         return;
     }
+    if (t->dims.size() > 2) {
+        // Untagged full-checkpoint GGUFs keep convs in their native [kx, ky, in, out] order.
+        // PyTorch stores them [out, in, ky, kx], which is the same bytes read out-major.
+        rows = (uint32_t)t->dims.back();
+        cols = 1;
+        for (size_t i = 0; i + 1 < t->dims.size(); i++) cols *= (uint32_t)t->dims[i];
+        return;
+    }
     rows = (uint32_t)t->dims[1];
     cols = (uint32_t)t->dims[0];
 }
@@ -454,7 +462,10 @@ static void loadGgufUnet() {
         // tensors are written straight into the mapped staging ring: a separate host vector per
         // tensor would double the commit footprint of a 2.5 GB upload on a 16 GB box
         auto lora = gLora.find(t.name);
-        if (t.type == GgmlType::Q8_0) {
+        // 1-D Q8 tensors are biases/norms. The conv/linear paths read those from the fp32 map,
+        // and dequantizing a few hundred values is cheaper than teaching every kernel a Q8 bias.
+        bool q8Vector = t.type == GgmlType::Q8_0 && t.dims.size() <= 1;
+        if (t.type == GgmlType::Q8_0 && !q8Vector) {
             uint64_t ne = t.nElems(), nb = ne / 32;
             BufRef bq = G.paramArena.alloc((ne + 255) & ~255ull);
             BufRef bs = G.paramArena.alloc((nb * 4 + 255) & ~255ull);
@@ -607,9 +618,13 @@ static void loadUnet(const GenParams& p) {
     if (gguf) {
         std::string err;
         if (!gUNet.gg.open(f, &err)) fail("cannot open UNet " + f + ": " + err);
+        bool full = gUNet.gg.find("model.diffusion_model.input_blocks.0.0.weight") != nullptr;
+        if (full && !gUNet.gg.open(f, &err, "model.diffusion_model."))
+            fail("cannot reopen UNet " + f + ": " + err);
         gUNet.kind = 1;
         gUNet.path = f;
-        std::printf("unet: %s (%zu tensors, gguf)\n", f.c_str(), gUNet.gg.tensorCount());
+        std::printf("unet: %s (%zu tensors, gguf%s)\n", f.c_str(), gUNet.gg.tensorCount(),
+                    full ? ", full checkpoint" : "");
         loadGgufUnet();
         gArch = hasAnyW("label_emb.0.0.weight") ? 2 : 1;
         std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
@@ -2684,6 +2699,23 @@ static uint64_t unetParamBytes(const GenParams& p) {
     // fp32 scale pairs add a little on top. The margin covers alignment and the small side
     // tables; a 288 MB margin once came up 0.4 MB short, so leave a little more.
     mb = gguf ? ((fileBytes + (320ull << 20)) >> 20) : ((fileBytes / 1048576) * 2 + 640);
+    if (gguf) {
+        // A full-checkpoint GGUF also carries CLIP and the VAE. Sizing the arena from the file
+        // would over-allocate by ~1.5 GB, which on an 8 GB card makes the AMD driver kill the
+        // process outright. Sum the UNet tensors instead.
+        GgufFile probe;
+        std::string perr;
+        bool full = probe.open(p.models.unet, &perr) &&
+                    probe.find("model.diffusion_model.input_blocks.0.0.weight") != nullptr;
+        if (full && probe.open(p.models.unet, &perr, "model.diffusion_model.")) {
+            uint64_t need = 0;
+            for (auto& t : probe.tensors()) {
+                uint64_t ne = t.nElems();
+                need += t.type == GgmlType::Q8_0 ? ne + (ne / 32) * 4 : ne * 4;
+            }
+            mb = (need + (192ull << 20)) >> 20;
+        }
+    }
     if (!gguf) mb = std::max<uint64_t>(mb, 512);
     mb = std::max<uint64_t>(mb, 512);
     mb = std::min<uint64_t>(mb, 6144);
@@ -3523,104 +3555,277 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
 
         bool needCfg = p.cfg > 1.0001f;
         std::vector<float> epsU(latFloats), epsC(latFloats), scaled(latFloats), resv(latFloats), x0v(latFloats),
-            absv(latFloats);
+            x0b(latFloats), epsG(latFloats), epsG2(latFloats), xTmp(latFloats), xNext(latFloats), absv(latFloats);
         double stepMsSum = 0;
-        for (int i = 0; i < steps; i++) {
-            if (p.shouldCancel && p.shouldCancel()) fail("cancelled");
-            float t = sch.timesteps[i];
-            float sigma = sch.sigmas[i];
-            float inv = 1.0f / std::sqrt(sigma * sigma + 1.0f);
-            for (uint64_t k = 0; k < latFloats; k++) scaled[k] = lat[k] * inv;
-            G.eng.uploadNow(xLat, scaled.data(), scaled.size() * 4);
+        std::vector<std::vector<float>> lmsDeriv;
+        std::vector<float> x0Prev(latFloats);
+        bool havePrev = false;
+        double tPrev = 0.0;
 
-            auto ta = std::chrono::steady_clock::now();
-            runPass(poolCB, ctxC, t, epsC);
-            if (needCfg) runPass(poolUB, ctxU, t, epsU);
-            auto tb = std::chrono::steady_clock::now();
-            double passMs = std::chrono::duration<double, std::milli>(tb - ta).count();
-            stepMsSum += passMs;
-
-            uint64_t bad = 0;
+        auto x0FromEps = [&](const std::vector<float>& x, const std::vector<float>& e, float sig,
+                             std::vector<float>& x0) {
+            float s2 = sig * sig + 1.0f;
+            float root = std::sqrt(s2);
             for (uint64_t k = 0; k < latFloats; k++)
-                if (!std::isfinite(epsC[k]) || (needCfg && !std::isfinite(epsU[k]))) bad++;
-            if (bad) fail("non-finite model output at step " + std::to_string(i + 1) + " (" + std::to_string(bad) +
-                          " of " + std::to_string(latFloats) + " values)");
-
-            for (uint64_t k = 0; k < latFloats; k++)
-                resv[k] = needCfg ? epsU[k] + p.cfg * (epsC[k] - epsU[k]) : epsC[k];
-            // CFG rescale ("mimic scale"): the guided output's std is clamped back toward the
-            // uncond output's std before x0 is formed.
-            if (p.rescale > 0.0f && needCfg) {
-                double m = 0, s2 = 0, u2 = 0;
-                for (uint64_t k = 0; k < latFloats; k++) m += resv[k];
-                m /= (double)latFloats;
-                for (uint64_t k = 0; k < latFloats; k++) {
-                    double d = resv[k] - m;
-                    s2 += d * d;
-                }
-                for (uint64_t k = 0; k < latFloats; k++) u2 += (double)epsU[k] * epsU[k];
-                double su = std::sqrt(u2 / (double)latFloats);
-                double sg = std::sqrt(s2 / (double)latFloats) + 1e-6;
-                for (uint64_t k = 0; k < latFloats; k++) {
-                    float er = (float)((resv[k] - m) * (su / sg) + m);
-                    resv[k] = (float)(p.rescale * er + (1.0 - p.rescale) * resv[k]);
-                }
-            }
-            double se = 0;
-            for (uint64_t k = 0; k < latFloats; k++) se += (double)resv[k] * resv[k];
-            // Imagen/SD2.x dynamic thresholding: v-prediction checkpoints routinely return x0
-            // estimates with ~2x the latent std of real images; clamping to the 99.5 percentile
-            // keeps every step's x0 inside the distribution the VAE was trained on.
-            for (uint64_t k = 0; k < latFloats; k++) {
-                float x = lat[k];
-                float e = resv[k];
-                x0v[k] = p.vpred ? e * (-sigma / std::sqrt(sigma * sigma + 1.0f)) + x / (sigma * sigma + 1.0f)
-                                 : x - sigma * e;
-            }
+                x0[k] = p.vpred ? e[k] * (-sig / root) + x[k] / s2 : x[k] - sig * e[k];
+        };
+        // Imagen/SD2.x dynamic thresholding plus the per-step inpaint blend. Both replace the x0
+        // estimate, so they run on every model evaluation, not only on the final one of a step.
+        auto finishX0 = [&](std::vector<float>& x0, float& thrOut) {
             float thr = 1.0f;
             if (p.dynthresh) {
-                for (uint64_t k = 0; k < latFloats; k++) absv[k] = std::abs(x0v[k]);
+                for (uint64_t k = 0; k < latFloats; k++) absv[k] = std::abs(x0[k]);
                 size_t q = (size_t)((double)(latFloats - 1) * 0.995);
                 std::nth_element(absv.begin(), absv.begin() + q, absv.end());
                 thr = std::max(absv[q], 1.0f);
             }
-            float dt = sch.sigmas[i + 1] - sigma;
-            bool ancestral = p.sampler == ofc::sdxl::SamplerKind::EulerAncestral && sch.sigmas[i + 1] > 0.0f;
-            float sigmaUp = ancestralSigma(sch.sigmas[i + 1], sigma, p.eta > 0 ? p.eta : 1.0f);
-            double sx = 0, sx0 = 0;
             for (uint64_t k = 0; k < latFloats; k++) {
-                float x = lat[k];
-                float x0 = x0v[k];
-                if (p.dynthresh) {
-                    x0 = std::min(std::max(x0, -thr), thr) / thr;
-                    x0v[k] = x0;
-                }
-                // inpaint: every step pulls the untouched region back to the encoded latent. The
-                // x0 estimate is what gets replaced, so the schedule keeps its own noise level and
-                // the masked area simply never gets to move.
+                float v = x0[k];
+                if (p.dynthresh) v = std::min(std::max(v, -thr), thr) / thr;
                 if (!initMask.empty()) {
                     float m = initMask[(size_t)(k % maskCells)];
-                    x0 = m * x0 + (1.0f - m) * initLat[k];
-                    x0v[k] = x0;
+                    v = m * v + (1.0f - m) * initLat[k];
                 }
-                float prev;
-                if (ancestral) {
-                    // EulerAncestral: move to sigma_down along the x0 direction, then inject
-                    // the noise that brings the sample back up to sigma_up
-                    float sd = sch.sigmas[i + 1];
-                    float ratio = std::sqrt(std::max(0.0f, sigma * sigma - sd * sd)) / sigma;
-                    prev = x + (x - x0) * ratio + nd(rng) * sigmaUp;
-                } else {
-                    prev = x + (x - x0) / sigma * dt;
-                }
-                lat[k] = prev;
-                sx += (double)prev * prev;
-                sx0 += (double)x0 * x0;
+                x0[k] = v;
             }
-            std::printf("step %2d/%d  t=%6.1f  sigma %.5f  |x| %.4f  |x0| %.4f  |e| %.4f  thr %.3f  median %.0f ms\n", i + 1,
-                        steps, t, sigma, std::sqrt(sx / latFloats), std::sqrt(sx0 / latFloats),
+            thrOut = thr;
+        };
+
+        for (int i = 0; i < steps; i++) {
+            if (p.shouldCancel && p.shouldCancel()) fail("cancelled");
+            float t = sch.timesteps[i];
+            float sigma = sch.sigmas[i];
+            float sigmaNext = sch.sigmas[i + 1];
+            float dt = sigmaNext - sigma;
+            double stepMs = 0;
+
+            auto evalGuided = [&](const std::vector<float>& xIn, float tEv, float sigEv,
+                                  std::vector<float>& outEps) {
+                float invEv = 1.0f / std::sqrt(sigEv * sigEv + 1.0f);
+                for (uint64_t k = 0; k < latFloats; k++) scaled[k] = xIn[k] * invEv;
+                G.eng.uploadNow(xLat, scaled.data(), scaled.size() * 4);
+                auto ta = std::chrono::steady_clock::now();
+                runPass(poolCB, ctxC, tEv, epsC);
+                if (needCfg) runPass(poolUB, ctxU, tEv, epsU);
+                auto tb = std::chrono::steady_clock::now();
+                double passMs = std::chrono::duration<double, std::milli>(tb - ta).count();
+                stepMs += passMs;
+                stepMsSum += passMs;
+
+                uint64_t bad = 0;
+                for (uint64_t k = 0; k < latFloats; k++)
+                    if (!std::isfinite(epsC[k]) || (needCfg && !std::isfinite(epsU[k]))) bad++;
+                if (bad) fail("non-finite model output at step " + std::to_string(i + 1) + " (" +
+                              std::to_string(bad) + " of " + std::to_string(latFloats) + " values)");
+
+                for (uint64_t k = 0; k < latFloats; k++)
+                    resv[k] = needCfg ? epsU[k] + p.cfg * (epsC[k] - epsU[k]) : epsC[k];
+                // CFG rescale ("mimic scale"): the guided output's std is clamped back toward the
+                // uncond output's std before x0 is formed.
+                if (p.rescale > 0.0f && needCfg) {
+                    double m = 0, s2 = 0, u2 = 0;
+                    for (uint64_t k = 0; k < latFloats; k++) m += resv[k];
+                    m /= (double)latFloats;
+                    for (uint64_t k = 0; k < latFloats; k++) {
+                        double d = resv[k] - m;
+                        s2 += d * d;
+                    }
+                    for (uint64_t k = 0; k < latFloats; k++) u2 += (double)epsU[k] * epsU[k];
+                    double su = std::sqrt(u2 / (double)latFloats);
+                    double sg = std::sqrt(s2 / (double)latFloats) + 1e-6;
+                    for (uint64_t k = 0; k < latFloats; k++) {
+                        float er = (float)((resv[k] - m) * (su / sg) + m);
+                        resv[k] = (float)(p.rescale * er + (1.0 - p.rescale) * resv[k]);
+                    }
+                }
+                std::copy(resv.begin(), resv.end(), outEps.begin());
+            };
+
+            evalGuided(lat, t, sigma, epsG);
+            double se = 0;
+            for (uint64_t k = 0; k < latFloats; k++) se += (double)epsG[k] * epsG[k];
+            x0FromEps(lat, epsG, sigma, x0v);
+            float thr = 1.0f;
+            finishX0(x0v, thr);
+
+            const float eta = p.eta > 0 ? p.eta : 1.0f;
+            const bool last = sigmaNext <= 0.0f;
+            const float tNext = last ? 0.0f : sch.timesteps[std::min(i + 1, steps - 1)];
+
+            switch (p.sampler) {
+                case SamplerKind::EulerAncestral: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    // diffusers EulerAncestral: step to sigma_down, then inject sigma_up noise.
+                    float sigmaUp = ancestralSigma(sigmaNext, sigma, eta);
+                    float sigmaDown = std::sqrt(std::max(0.0f, sigmaNext * sigmaNext - sigmaUp * sigmaUp));
+                    float ratio = sigmaDown / sigma;
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xNext[k] = lat[k] + (lat[k] - x0v[k]) * (ratio - 1.0f) + nd(rng) * sigmaUp;
+                    break;
+                }
+                case SamplerKind::Heun: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xTmp[k] = lat[k] + (lat[k] - x0v[k]) / sigma * dt;
+                    evalGuided(xTmp, tNext, sigmaNext, epsG2);
+                    x0FromEps(xTmp, epsG2, sigmaNext, x0b);
+                    float thr2 = 1.0f;
+                    finishX0(x0b, thr2);
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xNext[k] = lat[k] + 0.5f * ((lat[k] - x0v[k]) / sigma +
+                                                    (xTmp[k] - x0b[k]) / sigmaNext) * dt;
+                    break;
+                }
+                case SamplerKind::LMS: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    if (lmsDeriv.size() == 4) lmsDeriv.pop_back();
+                    lmsDeriv.insert(lmsDeriv.begin(), std::vector<float>(latFloats));
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        lmsDeriv.front()[k] = (lat[k] - x0v[k]) / sigma;
+                    static const float coeff[4][4] = {
+                        {1.0f, 0.0f, 0.0f, 0.0f},
+                        {3.0f / 2.0f, -1.0f / 2.0f, 0.0f, 0.0f},
+                        {23.0f / 12.0f, -16.0f / 12.0f, 5.0f / 12.0f, 0.0f},
+                        {55.0f / 24.0f, -59.0f / 24.0f, 37.0f / 24.0f, -9.0f / 24.0f},
+                    };
+                    const float* cf = coeff[lmsDeriv.size() - 1];
+                    for (uint64_t k = 0; k < latFloats; k++) {
+                        float acc = 0.0f;
+                        for (size_t j = 0; j < lmsDeriv.size(); j++) acc += cf[j] * lmsDeriv[j][k];
+                        xNext[k] = lat[k] + dt * acc;
+                    }
+                    break;
+                }
+                case SamplerKind::DPM2: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    float sigmaMid = sigma + 0.5f * dt;
+                    float tMid = 0.5f * (t + tNext);
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xTmp[k] = lat[k] + (lat[k] - x0v[k]) / sigma * (0.5f * dt);
+                    evalGuided(xTmp, tMid, sigmaMid, epsG2);
+                    x0FromEps(xTmp, epsG2, sigmaMid, x0b);
+                    float thr2 = 1.0f;
+                    finishX0(x0b, thr2);
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xNext[k] = lat[k] + (xTmp[k] - x0b[k]) / sigmaMid * dt;
+                    break;
+                }
+                case SamplerKind::DPM2Ancestral: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    float sigmaUp = std::min(sigmaNext, ancestralSigma(sigmaNext, sigma, eta));
+                    float sigmaDown = std::sqrt(std::max(0.0f, sigmaNext * sigmaNext - sigmaUp * sigmaUp));
+                    float dDown = sigmaDown - sigma;
+                    float sigmaMid = sigma + 0.5f * dDown;
+                    float tMid = 0.5f * (t + tNext);
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xTmp[k] = lat[k] + (lat[k] - x0v[k]) / sigma * (0.5f * dDown);
+                    evalGuided(xTmp, tMid, sigmaMid, epsG2);
+                    x0FromEps(xTmp, epsG2, sigmaMid, x0b);
+                    float thr2 = 1.0f;
+                    finishX0(x0b, thr2);
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xNext[k] = lat[k] + (xTmp[k] - x0b[k]) / sigmaMid * dDown + nd(rng) * sigmaUp;
+                    break;
+                }
+                case SamplerKind::DPMPP2M: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    double tNow = -std::log((double)sigma);
+                    double tN = -std::log((double)sigmaNext);
+                    double h = tN - tNow;
+                    if (!havePrev) {
+                        for (uint64_t k = 0; k < latFloats; k++)
+                            xNext[k] = (sigmaNext / sigma) * lat[k] - std::expm1(-h) * x0v[k];
+                    } else {
+                        double r = (tNow - tPrev) / h;
+                        float c0 = (float)(1.0 + 1.0 / (2.0 * r));
+                        float c1 = (float)(1.0 / (2.0 * r));
+                        for (uint64_t k = 0; k < latFloats; k++) {
+                            float x0d = c0 * x0v[k] - c1 * x0Prev[k];
+                            xNext[k] = (sigmaNext / sigma) * lat[k] - std::expm1(-h) * x0d;
+                        }
+                    }
+                    x0Prev = x0v;
+                    tPrev = tNow;
+                    havePrev = true;
+                    break;
+                }
+                case SamplerKind::DPMPP2SAncestral: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    float sigmaUp = std::min(sigmaNext, ancestralSigma(sigmaNext, sigma, eta));
+                    float sigmaDown = std::sqrt(std::max(0.0f, sigmaNext * sigmaNext - sigmaUp * sigmaUp));
+                    double tNow = -std::log((double)sigma);
+                    double tN = -std::log((double)sigmaNext);
+                    double h = tN - tNow;
+                    if (!havePrev) {
+                        for (uint64_t k = 0; k < latFloats; k++)
+                            xNext[k] = (sigmaDown / sigma) * lat[k] - std::expm1(-h) * x0v[k];
+                    } else {
+                        double r = (tNow - tPrev) / h;
+                        float c0 = (float)(1.0 + 1.0 / (2.0 * r));
+                        float c1 = (float)(1.0 / (2.0 * r));
+                        for (uint64_t k = 0; k < latFloats; k++) {
+                            float x0d = c0 * x0v[k] - c1 * x0Prev[k];
+                            xNext[k] = (sigmaDown / sigma) * lat[k] - std::expm1(-h) * x0d;
+                        }
+                    }
+                    for (uint64_t k = 0; k < latFloats; k++) xNext[k] += nd(rng) * sigmaUp;
+                    x0Prev = x0v;
+                    tPrev = tNow;
+                    havePrev = true;
+                    break;
+                }
+                case SamplerKind::DDIM: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xNext[k] = x0v[k] + (sigmaNext / sigma) * (lat[k] - x0v[k]);
+                    break;
+                }
+                case SamplerKind::Euler:
+                default: {
+                    if (last) {
+                        std::copy(x0v.begin(), x0v.end(), xNext.begin());
+                        break;
+                    }
+                    for (uint64_t k = 0; k < latFloats; k++)
+                        xNext[k] = lat[k] + (lat[k] - x0v[k]) / sigma * dt;
+                    break;
+                }
+            }
+
+            double sx = 0, sx0 = 0;
+            for (uint64_t k = 0; k < latFloats; k++) {
+                lat[k] = xNext[k];
+                sx += (double)xNext[k] * xNext[k];
+                sx0 += (double)x0v[k] * x0v[k];
+            }
+            std::printf("step %2d/%d  t=%6.1f  sigma %.5f  |x| %.4f  |x0| %.4f  |e| %.4f  thr %.3f  median %.0f ms\n",
+                        i + 1, steps, t, sigma, std::sqrt(sx / latFloats), std::sqrt(sx0 / latFloats),
                         std::sqrt(se / latFloats), thr, stepMsSum / (i + 1));
-            report(onProgress, Progress::Kind::Step, i + 1, steps, 0.15 + 0.7 * (double)(i + 1) / steps, passMs,
+            report(onProgress, Progress::Kind::Step, i + 1, steps, 0.15 + 0.7 * (double)(i + 1) / steps, stepMs,
                    "step " + std::to_string(i + 1) + "/" + std::to_string(steps));
         }
         G.eng.profileDump();

@@ -558,7 +558,8 @@ static void handleInfo(Response& r) {
       << (gModel.loaded ? "true" : "false") << ",\"modelDir\":" << jstr(gLoaded) << ",\"outDir\":" << jstr(gOutDir)
       << ",\"inputDir\":" << jstr(gInputDir)
       << ",\"caps\":[\"txt2img\",\"img2img\",\"inpaint\",\"upload\",\"vae\",\"hires\",\"batch\"],\"samplers\":["
-         "\"euler\",\"euler_a\"],\"spacings\":[\"leading\",\"trailing\"]}";
+         "\"euler\",\"euler_a\",\"heun\",\"lms\",\"dpm2\",\"dpm2_a\",\"dpmpp_2m\",\"dpmpp_2s_a\",\"ddim\"],"
+         "\"spacings\":[\"leading\",\"trailing\"]}";
     setJson(r, 200, o.str());
 }
 

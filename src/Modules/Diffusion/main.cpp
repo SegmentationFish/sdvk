@@ -60,7 +60,8 @@ static void usage() {
         "  --cfg <f>               guidance scale (default 7.5; 3.0 recommended for v-pred)\n"
         "  --seed <n>              noise seed (default: random each run)\n"
         "  --prompts <file>        one prompt per line; the UNet stays loaded across the batch\n"
-        "  --sampler <name>        euler | euler_a (default euler)\n"
+        "  --sampler <name>        euler | euler_a | heun | lms | dpm2 | dpm2_a | dpmpp_2m | dpmpp_2s_a | ddim\n"
+        "                          (default euler; heun/dpm2/dpm2_a use 2 model evals per step)\n"
         "  --spacing <s>           leading | trailing (SDXL checkpoints use trailing)\n"
         "  --vpred                 v-prediction sampling\n"
         "  --zsnr                  zero terminal SNR schedule\n"
@@ -258,7 +259,9 @@ static Parsed parseArgs(int argc, char** argv) {
             i++;
         } else if (a == "--sampler") {
             if (!need(i, argc, a.c_str(), o)) break;
-            if (!samplerFromName(val(), p.sampler)) o.err = "unknown sampler '" + val() + "' (euler, euler_a)";
+            if (!samplerFromName(val(), p.sampler))
+                o.err = "unknown sampler '" + val() +
+                        "' (euler, euler_a, heun, lms, dpm2, dpm2_a, dpmpp_2m, dpmpp_2s_a, ddim)";
             i++;
         } else if (a == "--spacing") {
             if (!need(i, argc, a.c_str(), o)) break;

@@ -287,7 +287,7 @@ bool GgufFile::readArrayItems(uint32_t etype, uint64_t count, GgufMeta& m) const
     }
 }
 
-bool GgufFile::open(const std::string& path, std::string* err) {
+bool GgufFile::open(const std::string& path, std::string* err, const std::string& prefix) {
     path_ = path;
     if (f_.is_open()) f_.close();
     meta_.clear();
@@ -383,6 +383,10 @@ bool GgufFile::open(const std::string& path, std::string* err) {
         if (!readExact(&t.offset, 8)) {
             if (err) *err = "truncated tensor offset";
             return false;
+        }
+        if (!prefix.empty()) {
+            if (t.name.rfind(prefix, 0) != 0) continue;
+            t.name.erase(0, prefix.size());
         }
         uint64_t be = ggmlTypeBlockElems(t.type), bb = ggmlTypeBlockBytes(t.type);
         uint64_t ne = t.nElems();

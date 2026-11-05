@@ -84,7 +84,9 @@ enum GgufMetaType : uint32_t {
 
 class GgufFile {
 public:
-    bool open(const std::string& path, std::string* err = nullptr);
+    // prefix != "": keep only tensors whose names start with it and strip it. Full-checkpoint
+    // GGUFs store the UNet as model.diffusion_model.* next to CLIP and VAE tensors.
+    bool open(const std::string& path, std::string* err = nullptr, const std::string& prefix = std::string());
 
     uint32_t version() const { return version_; }
     size_t tensorCount() const { return tensors_.size(); }

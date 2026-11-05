@@ -13,12 +13,36 @@
 namespace ofc {
 namespace sdxl {
 
-enum class SamplerKind { Euler = 0, EulerAncestral = 1 };
+enum class SamplerKind {
+    Euler = 0,
+    EulerAncestral,
+    Heun,
+    LMS,
+    DPM2,
+    DPM2Ancestral,
+    DPMPP2M,
+    DPMPP2SAncestral,
+    DDIM,
+};
 
 inline const char* samplerName(SamplerKind s) {
     switch (s) {
         case SamplerKind::EulerAncestral:
             return "euler_a";
+        case SamplerKind::Heun:
+            return "heun";
+        case SamplerKind::LMS:
+            return "lms";
+        case SamplerKind::DPM2:
+            return "dpm2";
+        case SamplerKind::DPM2Ancestral:
+            return "dpm2_a";
+        case SamplerKind::DPMPP2M:
+            return "dpmpp_2m";
+        case SamplerKind::DPMPP2SAncestral:
+            return "dpmpp_2s_a";
+        case SamplerKind::DDIM:
+            return "ddim";
         default:
             return "euler";
     }
@@ -33,7 +57,47 @@ inline bool samplerFromName(const std::string& n, SamplerKind& out) {
         out = SamplerKind::EulerAncestral;
         return true;
     }
+    if (n == "heun") {
+        out = SamplerKind::Heun;
+        return true;
+    }
+    if (n == "lms") {
+        out = SamplerKind::LMS;
+        return true;
+    }
+    if (n == "dpm2") {
+        out = SamplerKind::DPM2;
+        return true;
+    }
+    if (n == "dpm2_a" || n == "dpm2-ancestral" || n == "dpm2a") {
+        out = SamplerKind::DPM2Ancestral;
+        return true;
+    }
+    if (n == "dpmpp_2m" || n == "dpm++2m" || n == "dpmpp2m") {
+        out = SamplerKind::DPMPP2M;
+        return true;
+    }
+    if (n == "dpmpp_2s_a" || n == "dpm++2s_a" || n == "dpmpp2sa" || n == "dpmpp_2s_ancestral") {
+        out = SamplerKind::DPMPP2SAncestral;
+        return true;
+    }
+    if (n == "ddim") {
+        out = SamplerKind::DDIM;
+        return true;
+    }
     return false;
+}
+
+// Model evaluations per sampler step (used by the UI to explain the 2x cost).
+inline int samplerModelEvals(SamplerKind s) {
+    switch (s) {
+        case SamplerKind::Heun:
+        case SamplerKind::DPM2:
+        case SamplerKind::DPM2Ancestral:
+            return 2;
+        default:
+            return 1;
+    }
 }
 
 // Where each model component comes from. Empty paths fall back to the directory scan in
