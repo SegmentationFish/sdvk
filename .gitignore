@@ -21,7 +21,6 @@ cmake-build-*/
 *.log
 
 # runtime folders
-shaders/
 output/
 
 # debug artifacts

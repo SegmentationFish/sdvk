@@ -1,0 +1,125 @@
+#version 460
+
+// sdvk fused attention: QK^T + causal mask + online softmax + PV, written
+// straight into the interleaved [T][heads*hd] activation layout. Replaces
+// headsView copies + gemm_nt + softmax + gemm_nn + headsMerge copies with one
+// dispatch and never materialises the Tq x Tk score matrix.
+//
+// One workgroup = 8 half-warps = 32 queries (QPH = 4 each) for one head.
+// K/V are staged in 32-token tiles and reused by all queries in the group.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256) in;
+
+#define QPH 4
+#define KV_BLK 32
+#define MAX_HD 64
+#define LOG2E 1.4426950408889634
+
+layout(set=0, binding=0) readonly buffer qaQ { float Q[]; };
+layout(set=0, binding=1) readonly buffer qaK { float K[]; };
+layout(set=0, binding=2) readonly buffer qaV { float V[]; };
+layout(set=0, binding=3) writeonly buffer qaO { float O[]; };
+
+layout(push_constant) uniform FaPc {
+    uint  Tq;
+    uint  Tk;
+    uint  C;
+    uint  heads;
+    uint  hd;
+    uint  causal;
+    uint  pad0;
+    uint  pad1;
+    float scale;
+} pc;
+
+shared float sk[KV_BLK * MAX_HD];
+shared float sv[KV_BLK * MAX_HD];
+
+float qaReduceSum(float x) {
+    x += subgroupShuffleXor(x, 16u);
+    x += subgroupShuffleXor(x, 8u);
+    x += subgroupShuffleXor(x, 4u);
+    x += subgroupShuffleXor(x, 2u);
+    x += subgroupShuffleXor(x, 1u);
+    return x;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint halfId = tid >> 5u;
+    uint lane = tid & 31u;
+    uint head = gl_WorkGroupID.y;
+    uint qBase = gl_WorkGroupID.x * (8u * QPH) + halfId * QPH;
+    bool has2 = (lane + 32u) < pc.hd;
+
+    float q0[QPH], q1[QPH];
+    float acc0[QPH], acc1[QPH];
+    float mRun[QPH], lRun[QPH];
+
+    #pragma unroll
+    for (uint u = 0u; u < QPH; ++u) {
+        uint qr = qBase + u;
+        bool ok = qr < pc.Tq;
+        uint src = qr * pc.C + head * pc.hd + lane;
+        q0[u] = ok ? Q[src] : 0.0;
+        q1[u] = (ok && has2) ? Q[src + 32u] : 0.0;
+        acc0[u] = 0.0;
+        acc1[u] = 0.0;
+        mRun[u] = -1e30;
+        lRun[u] = 0.0;
+    }
+
+    for (uint kv0 = 0u; kv0 < pc.Tk; kv0 += KV_BLK) {
+        for (uint idx = tid; idx < KV_BLK * pc.hd; idx += 256u) {
+            uint j = idx / pc.hd;
+            uint d = idx % pc.hd;
+            uint kv = kv0 + j;
+            if (kv < pc.Tk) {
+                uint src = kv * pc.C + head * pc.hd + d;
+                sk[idx] = K[src];
+                sv[idx] = V[src];
+            } else {
+                sk[idx] = 0.0;
+                sv[idx] = 0.0;
+            }
+        }
+        barrier();
+
+        uint jmax = min(KV_BLK, pc.Tk - kv0);
+        for (uint j = 0u; j < jmax; ++j) {
+            uint kv = kv0 + j;
+            float k0 = sk[j * pc.hd + lane];
+            float k1 = has2 ? sk[j * pc.hd + lane + 32u] : 0.0;
+            float v0 = sv[j * pc.hd + lane];
+            float v1 = has2 ? sv[j * pc.hd + lane + 32u] : 0.0;
+            #pragma unroll
+            for (uint u = 0u; u < QPH; ++u) {
+                float dot = q0[u] * k0 + q1[u] * k1;
+                dot = qaReduceSum(dot);
+                float s = dot * pc.scale * LOG2E;
+                if (pc.causal != 0u && kv > qBase + u) s = -1e30;
+                float mNew = max(mRun[u], s);
+                float resc = exp2(mRun[u] - mNew);
+                float p = exp2(s - mNew);
+                lRun[u] = lRun[u] * resc + p;
+                acc0[u] = acc0[u] * resc + p * v0;
+                acc1[u] = acc1[u] * resc + p * v1;
+                mRun[u] = mNew;
+            }
+        }
+        barrier();
+    }
+
+    #pragma unroll
+    for (uint u = 0u; u < QPH; ++u) {
+        uint qr = qBase + u;
+        if (qr >= pc.Tq) continue;
+        float inv = (lRun[u] > 0.0) ? (1.0 / lRun[u]) : 0.0;
+        uint dst = qr * pc.C + head * pc.hd + lane;
+        O[dst] = acc0[u] * inv;
+        if (has2) O[dst + 32u] = acc1[u] * inv;
+    }
+}

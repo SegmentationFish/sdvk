@@ -1,0 +1,128 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// C[M,N] = A[M,K] * B[N,K]^T ; A fp32 row-major, B = Q8_0 payload (uint32 packed int8, 4/word)
+// + fp32 scales (one per 32 elements). B row stride = K. Batched on z.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer Bq { uint bq[]; };
+layout(binding = 2) writeonly buffer C { float c[]; };
+layout(binding = 3) readonly buffer S { float s[]; };
+#if QBIAS
+layout(binding = 4) readonly buffer Bias { float bias[]; };
+#endif
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint mode;
+                                  uint sA; uint sB; uint sC; uint batch;
+                                  uint lda; uint ldb; uint ldc; uint pad; } pc;
+
+#ifndef QBM
+#define QBM 64
+#endif
+#ifndef QBN
+#define QBN 64
+#endif
+#ifndef QBK
+#define QBK 16
+#endif
+#ifndef QBIAS
+#define QBIAS 0
+#endif
+const uint BM = QBM, BN = QBN, BK = QBK, TM = QBM / 16, TN = QBN / 16;
+// +1 padding: with a 16-float row stride the inner Bs[tx*4+j][k] reads land a warp on two
+// banks (16-way conflict); +1 makes the stride coprime with 32
+shared float As[BM][BK + 1];
+shared float Bs[BN][BK + 1];
+
+float deqB(uint gr, uint gc){
+    uint fl = gr * pc.K + gc;
+    uint w = bq[fl >> 2];
+    int v = int((w >> ((fl & 3u) * 8u)) & 0xFFu);
+    if (v > 127) v -= 256;
+    return float(v) * s[fl >> 5];
+}
+
+void main(){
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint by = gl_WorkGroupID.y;
+    uint bx = gl_WorkGroupID.x;
+    uint zo = gl_WorkGroupID.z;
+    uint ao = zo * pc.sA;
+    uint co = zo * pc.sC;
+    uint lda = pc.lda == 0u ? pc.K : pc.lda;
+    uint ldc = pc.ldc == 0u ? pc.N : pc.ldc;
+
+    float acc[TM][TN];
+    for(uint i=0;i<TM;i++)
+        for(uint j=0;j<TN;j++) acc[i][j]=0.0;
+
+    uint nTiles = (pc.K + BK - 1) / BK;
+    for(uint t=0;t<nTiles;t++){
+        uint kBase = t * BK;
+        // A: one float4 per thread, coalesced 16B global loads
+        for(uint e = ty*16u + tx; e < (BM*BK)/4u; e += 256u){
+            uint r = (e*4u) / BK;
+            uint cc = (e*4u) % BK;
+            uint gr = by*BM + r;
+            uint gc = kBase + cc;
+            if (gr < pc.M && gc + 3u < pc.K) {
+                vec4 v = vec4(a[ao + gr*lda + gc + 0u], a[ao + gr*lda + gc + 1u],
+                              a[ao + gr*lda + gc + 2u], a[ao + gr*lda + gc + 3u]);
+                As[r][cc + 0u] = v.x; As[r][cc + 1u] = v.y;
+                As[r][cc + 2u] = v.z; As[r][cc + 3u] = v.w;
+            } else {
+                As[r][cc + 0u] = 0.0; As[r][cc + 1u] = 0.0;
+                As[r][cc + 2u] = 0.0; As[r][cc + 3u] = 0.0;
+            }
+        }
+        // B: packed int8 words; all 4 values share one fp32 scale
+        for (uint e = ty*16u + tx; e < (BN*BK)/4u; e += 256u) {
+            {
+                uint r = (e*4u) / BK;
+                uint cc = (e*4u) % BK;
+                uint gr = bx*BN + r;
+                uint gc = kBase + cc;
+                if (gr < pc.N && gc + 3u < pc.K) {
+                    uint fl = gr * pc.K + gc;
+                    uint w = bq[fl >> 2];
+                    float sc = s[fl >> 5];
+                    int v0 = int(w & 0xFFu); if (v0 > 127) v0 -= 256;
+                    int v1 = int((w >> 8u) & 0xFFu); if (v1 > 127) v1 -= 256;
+                    int v2 = int((w >> 16u) & 0xFFu); if (v2 > 127) v2 -= 256;
+                    int v3 = int((w >> 24u) & 0xFFu); if (v3 > 127) v3 -= 256;
+                    Bs[r][cc + 0u] = float(v0) * sc;
+                    Bs[r][cc + 1u] = float(v1) * sc;
+                    Bs[r][cc + 2u] = float(v2) * sc;
+                    Bs[r][cc + 3u] = float(v3) * sc;
+                } else {
+                    Bs[r][cc + 0u] = 0.0; Bs[r][cc + 1u] = 0.0;
+                    Bs[r][cc + 2u] = 0.0; Bs[r][cc + 3u] = 0.0;
+                }
+            }
+        }
+        barrier();
+        for(uint k=0;k<BK;k++){
+            float av[TM];
+            float bv[TN];
+            for(uint i=0;i<TM;i++) av[i]=As[ty*TM+i][k];
+            for(uint j=0;j<TN;j++) bv[j]=Bs[tx*TN+j][k];
+            for(uint i=0;i<TM;i++)
+                for(uint j=0;j<TN;j++) acc[i][j]+=av[i]*bv[j];
+        }
+        barrier();
+    }
+    for(uint i=0;i<TM;i++)
+        for(uint j=0;j<TN;j++){
+            uint gr = by*BM + ty*TM + i;
+            uint gc = bx*BN + tx*TN + j;
+            if(gr < pc.M && gc < pc.N){
+                float v = acc[i][j];
+#if QBIAS
+                if (pc.mode == 0u) v += bias[gc];
+#endif
+                if(pc.mode == 0u) c[co + gr*ldc + gc] = v;
+                else c[co + gr*ldc + gc] += acc[i][j];
+            }
+        }
+}

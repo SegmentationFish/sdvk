@@ -49,6 +49,8 @@ static void usage() {
         "  --vae <file>            VAE safetensors (fp16/bf16/fp32)\n"
         "  --tok/--tok2 <dir>      tokenizer folders holding vocab.json + merges.txt\n"
         "  --taesd <file>          optional tiny decoder\n"
+        "  --lora <file>           merge a LoRA safetensors into the Q8 UNet at load\n"
+        "  --lora-scale <f>        LoRA strength multiplier (default 1.0)\n"
         "  --list-models <dir>     print how a folder is classified and exit\n"
         "\n"
         "sampler:\n"
@@ -179,6 +181,10 @@ static Parsed parseArgs(int argc, char** argv) {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.tok2 = val();
             i++;
+        } else if (a == "--lora") {
+            p.lora = val();
+        } else if (a == "--lora-scale") {
+            p.loraScale = std::strtof(val().c_str(), nullptr);
         } else if (a == "--taesd") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.taesd = val();

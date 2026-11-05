@@ -1,0 +1,194 @@
+#version 460
+
+// Tiled fused attention (FlashAttention-2 style) for headDim == 64.
+// 64x64 query/key tiles, register tiling 4x4 per thread, online softmax,
+// P overwrites the K tile in shared memory, PV accumulates in registers.
+//
+// One workgroup: 64 queries x one head, looping over all KV tiles.
+// Shared: Q[64][65], K/P[64][65], V[64][65] = ~50 KB.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256) in;
+
+#define BM 64
+#define BN 64
+#define HD 64
+#define PAD 65
+#define LOG2E 1.4426950408889634
+
+layout(set=0, binding=0) readonly buffer qaQ { float Q[]; };
+layout(set=0, binding=1) readonly buffer qaK { float K[]; };
+layout(set=0, binding=2) readonly buffer qaV { float V[]; };
+layout(set=0, binding=3) writeonly buffer qaO { float O[]; };
+
+layout(push_constant) uniform FaPc {
+    uint  Tq;
+    uint  Tk;
+    uint  C;
+    uint  heads;
+    uint  hd;
+    uint  causal;
+    uint  pad0;
+    uint  pad1;
+    float scale;
+} pc;
+
+shared float Qs[BM * PAD];
+shared float Ks[BN * PAD];
+shared float Vs[BN * PAD];
+
+float qaRowReduceMax(float x) {
+    x = max(x, subgroupShuffleXor(x, 8u));
+    x = max(x, subgroupShuffleXor(x, 4u));
+    x = max(x, subgroupShuffleXor(x, 2u));
+    x = max(x, subgroupShuffleXor(x, 1u));
+    return x;
+}
+
+float qaRowReduceSum(float x) {
+    x += subgroupShuffleXor(x, 8u);
+    x += subgroupShuffleXor(x, 4u);
+    x += subgroupShuffleXor(x, 2u);
+    x += subgroupShuffleXor(x, 1u);
+    return x;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint tx = tid & 15u;
+    uint ty = tid >> 4u;
+    uint r0 = ty * 4u;          // 4 query rows per thread
+    uint c0 = tx * 4u;          // 4 KV columns per thread
+    uint d0 = tx * 4u;          // 4 output dims per thread
+    uint head = gl_WorkGroupID.y;
+    uint q0 = gl_WorkGroupID.x * BM;
+    uint hOff = head * HD;
+
+    float mRun[4], lRun[4];
+    float acc[4][4];
+    #pragma unroll
+    for (uint i = 0; i < 4u; ++i) {
+        mRun[i] = -1e30;
+        lRun[i] = 0.0;
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) acc[i][j] = 0.0;
+    }
+
+    // Q is invariant across the KV loop: stage it once.
+    for (uint idx = tid; idx < BM * HD; idx += 256u) {
+        uint r = idx / HD;
+        uint d = idx % HD;
+        uint qr = q0 + r;
+        Qs[r * PAD + d] = (qr < pc.Tq) ? Q[qr * pc.C + hOff + d] : 0.0;
+    }
+    barrier();
+
+    for (uint kv0 = 0u; kv0 < pc.Tk; kv0 += BN) {
+        // ---- stage K, V tiles ----------------------------------------------------
+        for (uint idx = tid; idx < BM * HD; idx += 256u) {
+            uint r = idx / HD;
+            uint d = idx % HD;
+            uint kv = kv0 + r;
+            if (kv < pc.Tk) {
+                Ks[r * PAD + d] = K[kv * pc.C + hOff + d];
+                Vs[r * PAD + d] = V[kv * pc.C + hOff + d];
+            } else {
+                Ks[r * PAD + d] = 0.0;
+                Vs[r * PAD + d] = 0.0;
+            }
+        }
+        barrier();
+
+        // ---- S = Q K^T -----------------------------------------------------------
+        float s[4][4];
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i)
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) s[i][j] = 0.0;
+
+        for (uint d = 0u; d < HD; ++d) {
+            float qv[4], kv[4];
+            #pragma unroll
+            for (uint i = 0; i < 4u; ++i) qv[i] = Qs[(r0 + i) * PAD + d];
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) kv[j] = Ks[(c0 + j) * PAD + d];
+            #pragma unroll
+            for (uint i = 0; i < 4u; ++i)
+                #pragma unroll
+                for (uint j = 0; j < 4u; ++j) s[i][j] += qv[i] * kv[j];
+        }
+
+        // ---- mask + online softmax ----------------------------------------------
+        float rowMax[4], rowSum[4];
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i) {
+            uint qr = q0 + r0 + i;
+            float mx = -1e30;
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) {
+                uint kv = kv0 + c0 + j;
+                float v = s[i][j] * pc.scale;
+                if (qr >= pc.Tq || kv >= pc.Tk) v = -1e30;
+                if (pc.causal != 0u && kv > qr) v = -1e30;
+                s[i][j] = v;
+                mx = max(mx, v);
+            }
+            mx = qaRowReduceMax(mx);
+            float mNew = max(mRun[i], mx);
+            float resc = exp2((mRun[i] - mNew) * LOG2E);
+            mRun[i] = mNew;
+            lRun[i] *= resc;
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) acc[i][j] *= resc;
+
+            float sum = 0.0;
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) {
+                float p = (s[i][j] > -1e29) ? exp2((s[i][j] - mNew) * LOG2E) : 0.0;
+                s[i][j] = p;
+                sum += p;
+            }
+            rowMax[i] = mNew;
+            rowSum[i] = qaRowReduceSum(sum);
+            lRun[i] += rowSum[i];
+        }
+
+        barrier();   // all QK reads of Ks are done; safe to overwrite with P
+
+        // ---- P overwrites K ------------------------------------------------------
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i)
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) Ks[(r0 + i) * PAD + (c0 + j)] = s[i][j];
+
+        barrier();
+
+        // ---- O += P V ------------------------------------------------------------
+        for (uint c = 0u; c < BN; ++c) {
+            float pv[4], vv[4];
+            #pragma unroll
+            for (uint i = 0; i < 4u; ++i) pv[i] = Ks[(r0 + i) * PAD + c];
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) vv[j] = Vs[c * PAD + d0 + j];
+            #pragma unroll
+            for (uint i = 0; i < 4u; ++i)
+                #pragma unroll
+                for (uint j = 0; j < 4u; ++j) acc[i][j] += pv[i] * vv[j];
+        }
+
+        barrier();   // next tile overwrites Ks/Vs
+    }
+
+    // ---- writeback --------------------------------------------------------------
+    #pragma unroll
+    for (uint i = 0; i < 4u; ++i) {
+        uint qr = q0 + r0 + i;
+        if (qr >= pc.Tq) continue;
+        float inv = (lRun[i] > 0.0) ? (1.0 / lRun[i]) : 0.0;
+        uint base = qr * pc.C + hOff + d0;
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) O[base + j] = acc[i][j] * inv;
+    }
+}

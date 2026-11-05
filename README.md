@@ -1,7 +1,7 @@
 # sdvk
 
 **SDXL text-to-image on a self-built Vulkan compute engine.** No deep-learning framework, no external runtime dependencies:
-one CLI binary + an optional HTTP server + 66 GLSL compute shaders + [volk](src/Modules/GPU/volk) (single-file Vulkan loader)
+one CLI binary + an optional HTTP server + 70 GLSL compute shaders + [volk](src/Modules/GPU/volk) (single-file Vulkan loader)
 run the whole SDXL pipeline — dual CLIP text encoding, UNet denoising and VAE decoding — directly on the GPU.
 
 > Provenance: the inference engine is built from scratch in this project. Model weights come from third parties (see [Weights](#weights));
@@ -23,7 +23,10 @@ MIT license; that notice is kept in `volk.h`.
 - **Free VAE**: any SDXL VAE (fp16 / bf16 / fp32 safetensors) can be dropped in independently of the UNet
 - **One command end to end**: prompt in, PNG out (encoding → sampling → decoding → file), no intermediate tooling
 - **Zero-dependency PNG**: hand-written deflate (fixed-Huffman LZ77), CRC32 and a `tEXt` block that embeds the generation parameters
-- **Sampling recipes**: v-prediction and eps prediction, CFG, trailing spacing, CFG rescale (mimic scale), dynamic thresholding, Euler / Euler-ancestral
+- **Sampling recipes**: v-prediction and eps prediction, CFG, leading/trailing spacing, CFG rescale (mimic scale), dynamic thresholding, Euler / Euler-ancestral
+- **Fused attention**: one dispatch for reshape → QKᵀ → mask → online softmax → PV → writeback; a 64×64 register-tiled flash kernel for long self-attention
+- **q8 GEMM vectorised loads**: packed-word / float4 staging, adaptive 64/128-row tiles; ~2.2–3.1 TFLOP/s on RX 580
+- **LoRA merge**: Kohya/PEFT safetensors, diffusers + LDM naming, conv/resnet targets, Q8 and fp32 weights
 - **img2img and inpaint on a real VAE encoder**: the encoder half of the VAE is loaded and run
   (`conv_in → down blocks → mid → conv_out → quant_conv`), so a seed image becomes a latent the
   sampler understands; `--mask` blends the untouched region back every step
@@ -37,10 +40,10 @@ MIT license; that notice is kept in `volk.h`.
 
 | Item | Value |
 |---|---|
-| SDXL UNet forward @768×768 (latent 96²) | 14.1 s / pass (one CFG step = 2 passes) |
-| SDXL UNet forward @512×512 | 6.9 s / pass |
+| SDXL 768×768, 20 steps, CFG 3.0 | ~4.2 s/step (sampling), ~112 s total |
+| SDXL 512×512, 2 steps | ~1.95 s/step |
+| q8 GEMM microbench 9216×1280×1280 | 9.65 ms (3.1 TFLOP/s) |
 | VRAM usage | ~5.0 GiB in the UNet phase @768; device-local ceiling 6.0–6.1 GiB |
-| 768×768 / 28 steps / CFG 3.0 (UNet only) | ~6.5 min |
 
 ## Build
 
@@ -106,6 +109,7 @@ A full single-file checkpoint (`.safetensors` holding `model.diffusion_model.*`,
 | `--sampler euler\|euler_a` | sampler |
 | `--vpred` / `--zsnr` / `--dynthresh` / `--rescale <f>` | schedule and guidance options |
 | `--seed <n>` | noise seed |
+| `--lora <file>` / `--lora-scale <f>` | merge a LoRA safetensors at load time (default scale 1.0) |
 | `--init <img.png> --denoise <f>` | img2img (the source is VAE-encoded, not pixel-seeded) |
 | `--mask <mask.png> --mask-feather <n>` | inpaint; white = repaint, needs `--init` |
 | `--mask-invert` | black = repaint |
@@ -119,7 +123,7 @@ Recommended recipe for a v-pred checkpoint at 768 on an 8 GB card:
 
 ```bash
 build/sdvkgen.exe -m model "your prompt, masterpiece" \
-    --vpred --spacing trailing --steps 28 --cfg 3.0 --size 768 \
+    --vpred --spacing leading --steps 20 --cfg 3.0 --size 768 \
     --neg "nsfw, worst quality, old, early, low quality, lowres"
 ```
 
@@ -149,6 +153,9 @@ a single GPU can only run one job anyway.
 | `GET /api/devices` | Vulkan devices plus the host-RAM entry |
 | `POST /api/upload` | store a PNG/WAV the UI picked, returns its path |
 | `POST /api/unload` | drop the resident model |
+
+`/api/generate` also accepts `"lora": "<path>", "loraScale": 0.8` to merge a LoRA before sampling.
+The LoRA is merged into the Q8 UNet at load time; `dora_scale` is currently ignored (standard LoRA is used).
 
 ```bash
 curl -s -X POST http://127.0.0.1:7500/api/generate \
@@ -199,7 +206,7 @@ src/Modules/
   Diffusion/  sdvkgen.cpp (pipeline), Eval.hpp (library API), GenParams, ModelSet (folder classification),
               main.cpp (CLI), Safetensors reader
   Server/     sdvk-server: HTTP + JSON, no dependencies
-  GPU/        Vulkan engine (arenas, barrier tracking, kernel table, profiler) + 66 compute shaders + volk
+  GPU/        Vulkan engine (arenas, barrier tracking, kernel table, profiler) + 70 compute shaders + volk
   Model/      GGUF reader (Q8_0)
   Core/       tensor buffer helpers
 webui/        static web front end
@@ -213,7 +220,10 @@ webui/        static web front end
 - [x] HTTP API and web UI
 - [ ] In-engine VAE decode at 768 (step-arena budget / chunked decode)
 - [ ] `--ckpt`: single-file fp checkpoint loading (on-the-fly rank-2 quantization to Q8_0)
-- [ ] Hotspot optimization driven by the per-kernel profiler (GEMM tiles / fusion / barrier overhead)
+- [x] Hotspot optimization: fused tiled attention, vectorised q8 GEMM loads, bias epilogue
+- [x] LoRA merge (Kohya / PEFT, conv + attention targets)
+- [ ] DoRA magnitude application
+- [ ] int4 weight variant / Winograd 3×3
 
 ## Tools
 

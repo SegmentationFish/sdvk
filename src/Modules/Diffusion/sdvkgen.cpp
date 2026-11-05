@@ -1,3 +1,4 @@
+#include "Modules/GPU/fused_attn.hpp"
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
@@ -215,20 +216,266 @@ static void clearWeights() {
 
 // ================================================================ weight loading
 
+
+// ---------------------------------------------------------------- LoRA
+// Kohya/PEFT LoRA pairs are merged into the resident UNet weights at load time:
+// Q8_0 tensors dequant -> +scale*B@A -> requant, fp32 tensors are updated in place.
+// DoRA checkpoints also carry dora_scale; it is currently ignored and the pair is used as
+// a standard LoRA (applying the magnitude renormalisation on quantised weights broke outputs).
+struct LoraPair {
+    std::vector<float> down, up;
+    float alpha = 0.f;
+    uint32_t rank = 0, in = 0, out = 0;
+};
+static std::unordered_map<std::string, LoraPair> gLora;
+static float gLoraScale = 1.0f;
+static uint64_t gLoraApplied = 0;
+
+static bool loraReplace(std::string& s, const char* a, const char* b) {
+    size_t p = s.find(a);
+    if (p == std::string::npos) return false;
+    s.replace(p, std::strlen(a), b);
+    return true;
+}
+
+// lora_unet_<diffusers module> -> LDM walker key (without .weight)
+static std::string loraModuleToLdm(const std::string& mod) {
+    std::string s = mod;
+    const std::string pre = "lora_unet_";
+    if (s.rfind(pre, 0) != 0) return {};
+    s = s.substr(pre.size());
+    auto digits = [&](size_t& p) {
+        size_t q = p;
+        while (q < s.size() && s[q] >= '0' && s[q] <= '9') q++;
+        if (q == p) return -1;
+        int v = std::atoi(s.substr(p, q - p).c_str());
+        p = q;
+        return v;
+    };
+    auto resSuffix = [](const std::string& t) -> std::string {
+        if (t == "conv1") return "in_layers.2";
+        if (t == "conv2") return "out_layers.3";
+        if (t == "conv_shortcut") return "skip_connection";
+        if (t == "time_emb_proj") return "emb_layers.1";
+        return {};
+    };
+    std::string ldm;
+    if (s.rfind("down_blocks_", 0) == 0) {
+        size_t p = std::strlen("down_blocks_");
+        int b = digits(p);
+        if (b < 0) return {};
+        if (s.compare(p, std::strlen("_attentions_"), "_attentions_") == 0) {
+            p += std::strlen("_attentions_");
+            int a = digits(p);
+            if ((b != 1 && b != 2) || a < 0 || a > 1 || p >= s.size() || s[p] != '_') return {};
+            p++;
+            ldm = "input_blocks." + std::to_string(b == 1 ? 4 + a : 7 + a) + ".1";
+            s = s.substr(p);
+        } else if (s.compare(p, std::strlen("_resnets_"), "_resnets_") == 0) {
+            p += std::strlen("_resnets_");
+            int r = digits(p);
+            if (b < 0 || b > 2 || r < 0 || r > 1 || p >= s.size() || s[p] != '_') return {};
+            std::string suf = resSuffix(s.substr(p + 1));
+            if (suf.empty()) return {};
+            return "input_blocks." + std::to_string(1 + 3 * b + r) + ".0." + suf;
+        } else if (s.compare(p, std::strlen("_downsamplers_0_conv"), "_downsamplers_0_conv") == 0) {
+            if (b < 0 || b > 2) return {};
+            return "input_blocks." + std::to_string(3 + 3 * b) + ".0.op";
+        } else {
+            return {};
+        }
+    } else if (s.rfind("mid_block_", 0) == 0) {
+        size_t p = std::strlen("mid_block_");
+        if (s.compare(p, std::strlen("attentions_"), "attentions_") == 0) {
+            p += std::strlen("attentions_");
+            int a = digits(p);
+            if (a != 0 || p >= s.size() || s[p] != '_') return {};
+            ldm = "middle_block.1";
+            s = s.substr(p + 1);
+        } else if (s.compare(p, std::strlen("resnets_"), "resnets_") == 0) {
+            p += std::strlen("resnets_");
+            int r = digits(p);
+            if ((r != 0 && r != 1) || p >= s.size() || s[p] != '_') return {};
+            std::string suf = resSuffix(s.substr(p + 1));
+            if (suf.empty()) return {};
+            return std::string("middle_block.") + (r == 0 ? "0" : "2") + "." + suf;
+        } else {
+            return {};
+        }
+    } else if (s.rfind("up_blocks_", 0) == 0) {
+        size_t p = std::strlen("up_blocks_");
+        int b = digits(p);
+        if (b < 0) return {};
+        if (s.compare(p, std::strlen("_attentions_"), "_attentions_") == 0) {
+            p += std::strlen("_attentions_");
+            int a = digits(p);
+            if ((b != 0 && b != 1) || a < 0 || a > 2 || p >= s.size() || s[p] != '_') return {};
+            p++;
+            ldm = "output_blocks." + std::to_string(3 * b + a) + ".1";
+            s = s.substr(p);
+        } else if (s.compare(p, std::strlen("_resnets_"), "_resnets_") == 0) {
+            p += std::strlen("_resnets_");
+            int r = digits(p);
+            if (b < 0 || b > 2 || r < 0 || r > 2 || p >= s.size() || s[p] != '_') return {};
+            std::string suf = resSuffix(s.substr(p + 1));
+            if (suf.empty()) return {};
+            return "output_blocks." + std::to_string(3 * b + r) + ".0." + suf;
+        } else if (s.compare(p, std::strlen("_upsamplers_0_conv"), "_upsamplers_0_conv") == 0) {
+            if (b < 0 || b > 1) return {};
+            return "output_blocks." + std::to_string(3 * b + 2) + ".2.conv";
+        } else {
+            return {};
+        }
+    } else if (s == "conv_in") {
+        return "input_blocks.0.0";
+    } else if (s == "conv_out") {
+        return "out.2";
+    } else if (s == "time_embedding_linear_1" || s == "time_embedding_linear_2") {
+        return s.back() == '1' ? "time_embed.0" : "time_embed.2";
+    } else if (s == "add_embedding_linear_1" || s == "add_embedding_linear_2") {
+        return s.back() == '1' ? "label_emb.0.0" : "label_emb.0.2";
+    } else {
+        return {};
+    }
+
+    if (s == "proj_in" || s == "proj_out") return ldm + "." + s;
+    if (s.rfind("transformer_blocks_", 0) != 0) return {};
+    size_t p = std::strlen("transformer_blocks_");
+    int k = digits(p);
+    if (k < 0 || p >= s.size() || s[p] != '_') return {};
+    std::string t = "transformer_blocks." + std::to_string(k) + s.substr(p);
+    loraReplace(t, "_attn1_to_out_0", ".attn1.to_out.0");
+    loraReplace(t, "_attn1_to_q", ".attn1.to_q");
+    loraReplace(t, "_attn1_to_k", ".attn1.to_k");
+    loraReplace(t, "_attn1_to_v", ".attn1.to_v");
+    loraReplace(t, "_attn2_to_out_0", ".attn2.to_out.0");
+    loraReplace(t, "_attn2_to_q", ".attn2.to_q");
+    loraReplace(t, "_attn2_to_k", ".attn2.to_k");
+    loraReplace(t, "_attn2_to_v", ".attn2.to_v");
+    loraReplace(t, "_ff_net_0_proj", ".ff.net.0.proj");
+    loraReplace(t, "_ff_net_2", ".ff.net.2");
+    return ldm + "." + t;
+}
+
+static void loadLoraFile(const std::string& path, float userScale) {
+    gLora.clear();
+    gLoraScale = userScale;
+    gLoraApplied = 0;
+    Safetensors st;
+    if (!st.ensureOpen(path)) fail("cannot open LoRA " + path + ": " + st.error());
+    const std::string downSuf = ".lora_down.weight";
+    uint32_t pairs = 0, skipped = 0;
+    for (auto& t : st.tensors()) {
+        if (t.name.size() <= downSuf.size() ||
+            t.name.compare(t.name.size() - downSuf.size(), downSuf.size(), downSuf) != 0)
+            continue;
+        std::string mod = t.name.substr(0, t.name.size() - downSuf.size());
+        std::string key = loraModuleToLdm(mod);
+        if (key.empty()) { skipped++; continue; }
+        const STTensor* ta = st.find(mod + ".lora_down.weight");
+        const STTensor* tb = st.find(mod + ".lora_up.weight");
+        if (!ta || !tb || ta->shape.empty() || tb->shape.empty()) { skipped++; continue; }
+        LoraPair L;
+        L.rank = (uint32_t)ta->shape[0];
+        uint64_t dn = st.numel(*ta), un = st.numel(*tb);
+        if (L.rank == 0 || L.rank > 256 || dn % L.rank || un % L.rank) { skipped++; continue; }
+        L.in = (uint32_t)(dn / L.rank);
+        L.out = (uint32_t)(un / L.rank);
+        try {
+            L.down = st.readF32(ta->name);
+            L.up = st.readF32(tb->name);
+        } catch (const std::exception& e) {
+            fail(std::string("LoRA tensor read failed: ") + e.what());
+        }
+        if (L.down.size() != (size_t)L.rank * L.in || L.up.size() != (size_t)L.out * L.rank) { skipped++; continue; }
+        if (const STTensor* al = st.find(mod + ".alpha")) {
+            auto v = st.readF32(al->name);
+            if (!v.empty()) L.alpha = v[0];
+        }
+        gLora[key + ".weight"] = std::move(L);
+        pairs++;
+    }
+    std::printf("lora: %s -> %u modules mapped, %u skipped, scale %.2f\n", path.c_str(), pairs, skipped,
+                userScale);
+}
+
+static void loraApplyF32(std::vector<float>& w, uint32_t rows, uint32_t cols, const LoraPair& L) {
+    if (L.out != rows || L.in != cols || gLoraScale == 0.0f) return;
+    const float scale = (L.alpha > 0.f ? L.alpha / (float)L.rank : 1.0f) * gLoraScale;
+    for (uint32_t o = 0; o < rows; o++) {
+        float* wr = &w[(size_t)o * cols];
+        for (uint32_t r = 0; r < L.rank; r++) {
+            float b = L.up[(size_t)o * L.rank + r] * scale;
+            if (b == 0.0f) continue;
+            const float* a = &L.down[(size_t)r * cols];
+            for (uint32_t i = 0; i < cols; i++) wr[i] += b * a[i];
+        }
+    }
+    gLoraApplied++;
+}
+
+static void loraApplyQ8(std::vector<int8_t>& q, std::vector<float>& sc, uint32_t rows, uint32_t cols,
+                        const LoraPair& L) {
+    if (L.out != rows || L.in != cols || gLoraScale == 0.0f) return;
+    const float scale = (L.alpha > 0.f ? L.alpha / (float)L.rank : 1.0f) * gLoraScale;
+    std::vector<float> row(cols);
+    const uint32_t blocks = cols / 32;
+    for (uint32_t o = 0; o < rows; o++) {
+        int8_t* qr = &q[(size_t)o * cols];
+        float* sr = &sc[(size_t)o * blocks];
+        for (uint32_t i = 0; i < cols; i++) row[i] = (float)qr[i] * sr[i >> 5];
+        for (uint32_t r = 0; r < L.rank; r++) {
+            float b = L.up[(size_t)o * L.rank + r] * scale;
+            if (b == 0.0f) continue;
+            const float* a = &L.down[(size_t)r * cols];
+            for (uint32_t i = 0; i < cols; i++) row[i] += b * a[i];
+        }
+        for (uint32_t b = 0; b < blocks; b++) {
+            float mx = 0.0f;
+            for (uint32_t i = 0; i < 32; i++) mx = std::max(mx, std::fabs(row[b * 32 + i]));
+            float s = mx > 0.0f ? mx / 127.0f : 0.0f;
+            float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+            sr[b] = s;
+            for (uint32_t i = 0; i < 32; i++) {
+                float x = row[b * 32 + i] * inv;
+                int v = (int)(x + (x >= 0.0f ? 0.5f : -0.5f));
+                qr[b * 32 + i] = (int8_t)std::max(-127, std::min(127, v));
+            }
+        }
+    }
+    gLoraApplied++;
+}
+
 static void loadGgufUnet() {
     GgufFile& gg = gUNet.gg;
+    gLoraApplied = 0;
     uint64_t pending = 0, q8n = 0, f32n = 0;
     for (auto& t : gg.tensors()) {
         // tensors are written straight into the mapped staging ring: a separate host vector per
         // tensor would double the commit footprint of a 2.5 GB upload on a 16 GB box
+        auto lora = gLora.find(t.name);
         if (t.type == GgmlType::Q8_0) {
             uint64_t ne = t.nElems(), nb = ne / 32;
             BufRef bq = G.paramArena.alloc((ne + 255) & ~255ull);
             BufRef bs = G.paramArena.alloc((nb * 4 + 255) & ~255ull);
-            int8_t* qd = (int8_t*)G.eng.beginUpload(bq, ne);
-            float* sd = (float*)G.eng.beginUpload(bs, nb * 4);
-            std::string err;
-            if (!gg.readQ8Into(t.name, qd, sd, &err)) fail(err + " (" + t.name + ")");
+            if (lora != gLora.end()) {
+                uint32_t rows = 0, cols = 0;
+                ggdims(t.name, rows, cols);
+                std::vector<int8_t> q(ne);
+                std::vector<float> sc(nb);
+                std::string err;
+                if (!gg.readQ8(t.name, q, sc, &err)) fail(err + " (" + t.name + ")");
+                loraApplyQ8(q, sc, rows, cols, lora->second);
+                int8_t* qd = (int8_t*)G.eng.beginUpload(bq, ne);
+                std::memcpy(qd, q.data(), (size_t)ne);
+                float* sd = (float*)G.eng.beginUpload(bs, nb * 4);
+                std::memcpy(sd, sc.data(), (size_t)nb * 4);
+            } else {
+                int8_t* qd = (int8_t*)G.eng.beginUpload(bq, ne);
+                float* sd = (float*)G.eng.beginUpload(bs, nb * 4);
+                std::string err;
+                if (!gg.readQ8Into(t.name, qd, sd, &err)) fail(err + " (" + t.name + ")");
+            }
             gWQ[t.name] = bq;
             gWS[t.name] = bs;
             q8n++;
@@ -237,6 +484,11 @@ static void loadGgufUnet() {
             std::string err;
             auto v = gg.readFloat(t.name, &err);
             if (v.empty()) fail(err + " (" + t.name + ")");
+            if (lora != gLora.end()) {
+                uint32_t rows = 0, cols = 0;
+                ggdims(t.name, rows, cols);
+                if (v.size() == (size_t)rows * cols) loraApplyF32(v, rows, cols, lora->second);
+            }
             BufRef b = G.paramArena.alloc((v.size() * 4 + 255) & ~255ull);
             G.eng.stageUpload(b, v.data(), v.size() * 4);
             gW[t.name] = b;
@@ -251,6 +503,7 @@ static void loadGgufUnet() {
     G.eng.flushUploads();
     std::printf("unet weights: %llu Q8_0 + %llu fp (param arena %.0f MB)\n", (unsigned long long)q8n,
                 (unsigned long long)f32n, G.paramArena.used() / 1048576.0);
+    if (!gLora.empty()) std::printf("lora: applied to %llu tensors\n", (unsigned long long)gLoraApplied);
 }
 
 static bool containsPrefix(const Safetensors& st, const char* p) {
@@ -447,7 +700,22 @@ static void gemmNt(const BufRef& A, const BufRef& B, const BufRef& C, uint32_t M
 static void gemmNtQ8(const BufRef& A, const BufRef& Bq, const BufRef& C, const BufRef& Bs, uint32_t M, uint32_t N,
                      uint32_t K) {
     Pg pc{M, N, K, 0, 0, 0, 0, 1, 0, 0, 0, 0};
-    gDisp("gemm_nt_q8", {A, Bq, C, Bs}, &pc, ceilDiv(N, 64), ceilDiv(M, 64), 1);
+    // BM=128 halves weight/dequant traffic per output and wins once M is large.
+    if (M >= 1024) {
+        gDisp("gemm_nt_q8_v_bm128", {A, Bq, C, Bs}, &pc, ceilDiv(N, 64), ceilDiv(M, 128), 1);
+    } else {
+        gDisp("gemm_nt_q8_v", {A, Bq, C, Bs}, &pc, ceilDiv(N, 64), ceilDiv(M, 64), 1);
+    }
+}
+
+static void gemmNtQ8Bias(const BufRef& A, const BufRef& Bq, const BufRef& C, const BufRef& Bs,
+                         const BufRef& bias, uint32_t M, uint32_t N, uint32_t K) {
+    Pg pc{M, N, K, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+    if (M >= 1024) {
+        gDisp("gemm_nt_q8_v_bm128_b", {A, Bq, C, Bs, bias}, &pc, ceilDiv(N, 64), ceilDiv(M, 128), 1);
+    } else {
+        gDisp("gemm_nt_q8_v_b", {A, Bq, C, Bs, bias}, &pc, ceilDiv(N, 64), ceilDiv(M, 64), 1);
+    }
 }
 
 static void gemmNn(const BufRef& A, const BufRef& B, const BufRef& C, uint32_t M, uint32_t N, uint32_t K,
@@ -459,7 +727,7 @@ static void gemmNn(const BufRef& A, const BufRef& B, const BufRef& C, uint32_t M
 static void gemmNnQ8(const BufRef& Aq, const BufRef& As, const BufRef& B, const BufRef& C, uint32_t M, uint32_t N,
                      uint32_t K, uint32_t ldc) {
     Pg pc{M, N, K, 0, 0, 0, 0, 1, 0, 0, ldc, 0};
-    gDisp("gemm_nn_q8", {Aq, B, C, As}, &pc, ceilDiv(N, 64), ceilDiv(M, 64), 1);
+    gDisp("gemm_nn_q8_v", {Aq, B, C, As}, &pc, ceilDiv(N, 64), ceilDiv(M, 64), 1);
 }
 
 static BufRef copyNd(const BufRef& src, uint32_t n, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t os0, uint32_t os1,
@@ -594,6 +862,10 @@ static BufRef linear(const BufRef& x, const std::string& p, uint32_t rows) {
     linearDims(p + ".weight", nout, nin);
     BufRef y = allocN((uint64_t)rows * nout);
     if (isQ8(p + ".weight")) {
+        if (hasW(p + ".bias")) {
+            gemmNtQ8Bias(x, WQ(p + ".weight"), y, WS(p + ".weight"), W(p + ".bias"), rows, nout, nin);
+            return y;
+        }
         gemmNtQ8(x, WQ(p + ".weight"), y, WS(p + ".weight"), rows, nout, nin);
     } else {
         gemmNt(x, W(p + ".weight"), y, rows, nout, nin);
@@ -737,6 +1009,16 @@ static void headsMergeInto(const BufRef& dst, const BufRef& x, uint32_t T, uint3
 static BufRef attnCore(const BufRef& q, const BufRef& k, const BufRef& v, uint32_t Tq, uint32_t Tk, uint32_t C,
                        uint32_t heads, bool causal = false) {
     uint32_t hd = C / heads;
+    static int fusedEnv = -1;
+    if (fusedEnv < 0) { const char* e = std::getenv("SDVK_ATTN_FUSED"); fusedEnv = (e && e[0] == '1') ? 1 : 0; }
+    if (hd <= 64 && (hd == 64 || fusedEnv)) {
+        BufRef out = allocN((uint64_t)Tq * C);
+        if (!gArenaPlan) {
+            ofc::gpu::FusedAttnArgs a{q, k, v, out, Tq, Tk, C, heads, causal};
+            ofc::gpu::fusedAttention(G.eng, a);
+        }
+        return out;
+    }
     uint64_t perHead = (uint64_t)Tq * Tk;
     uint32_t chunk = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(16, 16000000ull / perHead));
     // A single head over a large token count does not fit either (the VAE mid-block attends over
@@ -2431,6 +2713,8 @@ bool loadModel(EvalModel& m, const GenParams& in, const ProgressFn& onProgress, 
     ModelSet set;
     if (!ofc::sdxl::resolveModels(p, set, err)) return false;
     if (!ensureDevice(p.spvDir, err, p.device)) return false;
+    gLora.clear();
+    if (!p.lora.empty()) loadLoraFile(p.lora, p.loraScale);
     gS.spvDir = p.spvDir;
     gS.tok.ready = false;
     m.warnings = set.warn;

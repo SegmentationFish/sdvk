@@ -53,6 +53,13 @@ static const KernelDef KERNELS[] = {
     {"gemm_nt", 3, 48, 0x4},
     {"gemm_tn", 3, 48, 0x4},
     {"gemm_nt_q8", 4, 48, 0x4},
+    {"gemm_nt_q8_v", 4, 48, 0x4},
+    {"gemm_nn_q8_v", 4, 48, 0x4},
+    {"gemm_nt_q8_v_bm128", 4, 48, 0x4},
+    {"gemm_nt_q8_v_b", 5, 48, 0x4},
+    {"gemm_nt_q8_v_bm128_b", 5, 48, 0x4},
+    {"gemm_nt_q8_v_bk32", 4, 48, 0x4},
+    {"gemm_nt_q8_v_bm128_bk32", 4, 48, 0x4},
     {"gemm_nn_q8", 4, 48, 0x4},
     {"copy_nd", 2, 60, 0x1},
     {"ew2", 3, 56, 0x1},
@@ -106,13 +113,15 @@ static const KernelDef KERNELS[] = {
     {"attn_softmax_fwd", 4, 20, 0x8},
     {"attn_softmax_bwd", 5, 20, 0x18},
     {"im2col", 2, 20, 0x2},
-    {"im2col_s2", 2, 20, 0x2},
+    {"im2col_s2", 2, 24, 0x2},  // shader added int off at +20
     {"layernorm_fwd", 4, 16, 0x8},
     {"causal_mask", 1, 12, 0x1},
     {"groupnorm", 4, 20, 0x8},
     {"upsample2x", 2, 12, 0x2},
     {"bias_add", 2, 8, 0x1},
     {"add2", 3, 4, 0x4},
+    {"fused_attn", 4, 36, 0x8},
+    {"fused_attn_tiled", 4, 36, 0x8},
 };
 static const size_t NUM_KERNELS = sizeof(KERNELS) / sizeof(KERNELS[0]);
 

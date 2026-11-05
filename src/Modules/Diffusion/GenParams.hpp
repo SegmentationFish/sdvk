@@ -102,7 +102,8 @@ struct GenParams {
     // ---- models
     ModelPaths models;
     uint32_t estVramMb = 0;
-    std::string lora;  // comma separated name[:weight]
+    std::string lora;      // path to a LoRA safetensors file (Kohya or PEFT keys)
+    float loraScale = 1.0f;  // user multiplier on alpha/rank
 
     // ---- output
     std::string outPath = "sdvkgen.png";

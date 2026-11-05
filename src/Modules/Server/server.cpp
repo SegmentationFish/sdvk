@@ -414,6 +414,8 @@ static bool paramsFromJson(const FlatJson& j, GenParams& p, std::string& err) {
     if (j.n.count("paramMb")) p.paramMb = (uint32_t)j.n.at("paramMb");
     if (j.n.count("stepMb")) p.stepMb = (uint32_t)j.n.at("stepMb");
     if (j.n.count("scratchMb")) p.scratchMb = (uint32_t)j.n.at("scratchMb");
+    if (j.s.count("lora")) p.lora = j.s.at("lora");
+    if (j.n.count("loraScale")) p.loraScale = (float)j.n.at("loraScale");
     if (j.n.count("pngCompress")) p.pngCompress = (int)j.n.at("pngCompress");
     if (j.n.count("cropX")) p.cropOffsetX = (uint32_t)j.n.at("cropX");
     if (j.n.count("cropY")) p.cropOffsetY = (uint32_t)j.n.at("cropY");
