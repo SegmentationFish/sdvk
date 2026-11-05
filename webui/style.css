@@ -192,12 +192,18 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
 .decode-result { display: flex; flex-direction: column; gap: 10px; }
 
 @media (max-width: 1180px) {
-  .layout { grid-template-columns: 270px 1fr; }
+  .layout { grid-template-columns: 270px minmax(0, 1fr); }
   .rail:last-child { grid-column: 1 / -1; }
 }
 @media (max-width: 820px) {
-  .topbar { flex-wrap: wrap; gap: 10px; }
-  .layout { grid-template-columns: 1fr; padding: 12px; }
+  .topbar { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+  .brand { min-width: 0; }
+  .dirbar { flex: 1 1 100%; flex-wrap: wrap; }
+  .dirbar input { min-width: 0; flex: 1 1 150px; max-width: none; }
+  .dirbar .pill { margin-left: auto; }
+  .topactions { flex: 1 1 100%; justify-content: space-between; }
+  .layout { grid-template-columns: minmax(0, 1fr); padding: 12px; }
   .rail:last-child { grid-column: auto; }
-  .stage { min-height: 420px; }
+  .card { min-width: 0; }
+  .stage { min-height: 360px; }
 }

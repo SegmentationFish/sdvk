@@ -1242,16 +1242,42 @@ static void serveOne(Sock s) {
     closeSock(s);
 }
 
+static std::vector<std::string> localIPv4s() {
+    std::vector<std::string> out;
+    char name[256] = {};
+    if (gethostname(name, sizeof name) != 0) return out;
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(name, nullptr, &hints, &res) != 0) return out;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        const sockaddr_in* sa = (const sockaddr_in*)p->ai_addr;
+        char buf[INET_ADDRSTRLEN] = {};
+        if (!inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof buf)) continue;
+        std::string ip = buf;
+        if (ip.rfind("127.", 0) == 0) continue;
+        if (std::find(out.begin(), out.end(), ip) == out.end()) out.push_back(ip);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     int port = 7500;
     std::string spv = "shaders";
     std::string modelDir;
+    std::string host = "127.0.0.1";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--port" || a == "-p") {
             port = std::atoi(next().c_str());
+        } else if (a == "--lan") {
+            host = "0.0.0.0";
+        } else if (a == "--host") {
+            host = next();
         } else if (a == "--spv") {
             spv = next();
             gSpv = spv;
@@ -1269,6 +1295,8 @@ int main(int argc, char** argv) {
                 "sdvk-server %s - HTTP API for the sdvk engine\n\n"
                 "usage: sdvk-server [options]\n\n"
                 "  -p, --port <n>        listen port (default 7500)\n"
+                "      --lan              listen on all interfaces (phone/tablet on the same Wi-Fi)\n"
+                "      --host <ipv4>      bind one address (default 127.0.0.1)\n"
                 "  -m, --model-dir <dir>  load this model folder on first request if unset\n"
                 "      --spv <dir>        compiled shader folder (default shaders)\n"
                 "      --web <dir>        web UI folder (default webui)\n"
@@ -1309,15 +1337,22 @@ int main(int argc, char** argv) {
     ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((unsigned short)port);
+    if (host == "0.0.0.0") {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (host == "127.0.0.1") {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        std::printf("error: --host expects an IPv4 address, got '%s'\n", host.c_str());
+        return 1;
+    }
     if (::bind(srv, (sockaddr*)&addr, sizeof(addr)) != 0) {
 #ifdef _WIN32
         int e = WSAGetLastError();
-        std::printf("error: bind 127.0.0.1:%d failed (%d)%s\n", port, e,
+        std::printf("error: bind %s:%d failed (%d)%s\n", host.c_str(), port, e,
                     e == 10013 ? " - port is reserved by the OS, pick another one" : "");
 #else
-        std::printf("error: bind 127.0.0.1:%d failed\n", port);
+        std::printf("error: bind %s:%d failed\n", host.c_str(), port);
 #endif
         return 1;
     }
@@ -1325,7 +1360,14 @@ int main(int argc, char** argv) {
         std::printf("error: listen failed\n");
         return 1;
     }
-    std::printf("sdvk-server %s listening on http://127.0.0.1:%d\n", kVersion, port);
+    if (host == "127.0.0.1") {
+        std::printf("sdvk-server %s listening on http://127.0.0.1:%d\n", kVersion, port);
+    } else {
+        std::printf("sdvk-server %s listening on %s:%d (LAN)\n", kVersion, host.c_str(), port);
+        for (const auto& ip : localIPv4s()) std::printf("  http://%s:%d/\n", ip.c_str(), port);
+        std::printf("  note: the HTTP API has no authentication; use a trusted network only.\n");
+        std::printf("  if the phone still cannot connect, allow TCP %d through the firewall.\n", port);
+    }
     std::printf("  web:    %s\n  models: %s\n  output: %s\n  shaders: %s\n", gWebRoot.c_str(),
                 modelDir.empty() ? "(set per request)" : modelDir.c_str(), gOutDir.c_str(), spv.c_str());
     if (!modelDir.empty()) {

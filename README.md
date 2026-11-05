@@ -138,8 +138,15 @@ build/sdvkgen.exe -m model "your prompt, masterpiece" \
 build/sdvk-server.exe -m model --port 7500
 ```
 
-Then open `http://127.0.0.1:7500/`. The server binds loopback only and serves one request at a time —
-a single GPU can only run one job anyway.
+Then open `http://127.0.0.1:7500/`. The server binds loopback by default and serves one request at a time —
+a single GPU can only run one job anyway. To use the UI from a phone/tablet on the same Wi-Fi:
+
+```bash
+build/sdvk-server.exe --lan --port 7500 --web webui --out-dir output
+```
+
+It prints the LAN URLs it detects; allow TCP 7500 through the firewall if Windows asks. The HTTP API has no
+authentication, so only do this on a trusted network.
 
 | Endpoint | Purpose |
 |---|---|
