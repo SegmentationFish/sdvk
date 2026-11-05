@@ -246,12 +246,103 @@ static bool loraReplace(std::string& s, const char* a, const char* b) {
     return true;
 }
 
+// Kohya checkpoints come in two naming families. The diffusers one uses down_blocks_*;
+// the LDM one encodes the walker key directly with underscores
+// (input_blocks_4_1_transformer_blocks_0_attn1_to_q). Rebuild the dotted LDM key from the
+// latter, keeping the tokens that themselves contain underscores.
+static std::string ldmUnderscoreName(const std::string& s) {
+    std::vector<std::string> tk, out;
+    size_t p = 0;
+    while (p <= s.size()) {
+        size_t q = s.find('_', p);
+        if (q == std::string::npos) q = s.size();
+        if (q > p) tk.push_back(s.substr(p, q - p));
+        p = q + 1;
+    }
+    for (size_t i = 0; i < tk.size(); i++) {
+        const std::string& a = tk[i];
+        const std::string b = i + 1 < tk.size() ? tk[i + 1] : std::string();
+        const std::string c = i + 2 < tk.size() ? tk[i + 2] : std::string();
+        if (a == "input" && b == "blocks") { out.push_back("input_blocks"); i++; }
+        else if (a == "output" && b == "blocks") { out.push_back("output_blocks"); i++; }
+        else if (a == "middle" && b == "block") { out.push_back("middle_block"); i++; }
+        else if (a == "transformer" && b == "blocks") { out.push_back("transformer_blocks"); i++; }
+        else if (a == "time" && b == "embed") { out.push_back("time_embed"); i++; }
+        else if (a == "label" && b == "emb") { out.push_back("label_emb"); i++; }
+        else if (a == "time" && b == "emb" && c == "proj") { out.push_back("time_emb_proj"); i += 2; }
+        else if (a == "in" && b == "layers") { out.push_back("in_layers"); i++; }
+        else if (a == "out" && b == "layers") { out.push_back("out_layers"); i++; }
+        else if (a == "emb" && b == "layers") { out.push_back("emb_layers"); i++; }
+        else if (a == "skip" && b == "connection") { out.push_back("skip_connection"); i++; }
+        else if (a == "proj" && (b == "in" || b == "out")) { out.push_back("proj_" + b); i++; }
+        else if (a == "to" && (b == "q" || b == "k" || b == "v" || b == "out")) {
+            out.push_back("to_" + b);
+            i++;
+        } else {
+            out.push_back(a);
+        }
+    }
+    std::string r;
+    for (auto& x : out) {
+        if (!r.empty()) r += '.';
+        r += x;
+    }
+    return r;
+}
+
+// lora_te1_* / lora_te2_* -> the te1./te2. keys used by loadOneTextEncoder.
+static std::string loraTeToKey(const std::string& mod) {
+    std::string pre, s;
+    if (mod.rfind("lora_te1_", 0) == 0) { pre = "te1."; s = mod.substr(9); }
+    else if (mod.rfind("lora_te2_", 0) == 0) { pre = "te2."; s = mod.substr(9); }
+    else return {};
+    std::vector<std::string> tk, out;
+    size_t p = 0;
+    while (p <= s.size()) {
+        size_t q = s.find('_', p);
+        if (q == std::string::npos) q = s.size();
+        if (q > p) tk.push_back(s.substr(p, q - p));
+        p = q + 1;
+    }
+    for (size_t i = 0; i < tk.size(); i++) {
+        const std::string& a = tk[i];
+        const std::string b = i + 1 < tk.size() ? tk[i + 1] : std::string();
+        const std::string c = i + 2 < tk.size() ? tk[i + 2] : std::string();
+        if (a == "text" && b == "model") { out.push_back("text_model"); i++; }
+        else if (a == "text" && b == "projection") { out.push_back("text_projection"); i++; }
+        else if (a == "self" && b == "attn") { out.push_back("self_attn"); i++; }
+        else if ((a == "k" || a == "q" || a == "v" || a == "out") && b == "proj") {
+            out.push_back(a + "_proj");
+            i++;
+        }
+        else if (a == "layer" && (b == "norm1" || b == "norm2")) { out.push_back("layer_" + b); i++; }
+        else if (a == "final" && b == "layer" && c == "norm") { out.push_back("final_layer_norm"); i += 2; }
+        else if (a == "token" && b == "embedding") { out.push_back("token_embedding"); i++; }
+        else if (a == "position" && b == "embedding") { out.push_back("position_embedding"); i++; }
+        else if (a == "logit" && b == "scale") { out.push_back("logit_scale"); i++; }
+        else if (a == "ln" && b == "final") { out.push_back("ln_final"); i++; }
+        else out.push_back(a);
+    }
+    std::string r = pre;
+    for (size_t i = 0; i < out.size(); i++) {
+        if (i) r += '.';
+        r += out[i];
+    }
+    return r;
+}
+
 // lora_unet_<diffusers module> -> LDM walker key (without .weight)
 static std::string loraModuleToLdm(const std::string& mod) {
     std::string s = mod;
+    std::string te = loraTeToKey(mod);
+    if (!te.empty()) return te;
     const std::string pre = "lora_unet_";
     if (s.rfind(pre, 0) != 0) return {};
     s = s.substr(pre.size());
+    if (s.rfind("input_blocks_", 0) == 0 || s.rfind("middle_block_", 0) == 0 ||
+        s.rfind("output_blocks_", 0) == 0 || s.rfind("out_", 0) == 0 || s.rfind("time_embed_", 0) == 0 ||
+        s.rfind("label_emb_", 0) == 0)
+        return ldmUnderscoreName(s);
     auto digits = [&](size_t& p) {
         size_t q = p;
         while (q < s.size() && s[q] >= '0' && s[q] <= '9') q++;
@@ -477,10 +568,11 @@ static void loadGgufUnet() {
                 std::string err;
                 if (!gg.readQ8(t.name, q, sc, &err)) fail(err + " (" + t.name + ")");
                 loraApplyQ8(q, sc, rows, cols, lora->second);
-                int8_t* qd = (int8_t*)G.eng.beginUpload(bq, ne);
-                std::memcpy(qd, q.data(), (size_t)ne);
-                float* sd = (float*)G.eng.beginUpload(bs, nb * 4);
-                std::memcpy(sd, sc.data(), (size_t)nb * 4);
+                // stageUpload copies immediately; the two beginUpload slots below can be
+                // invalidated by a staging flush between the calls, which silently zeroed
+                // parts of the merged payload even at --lora-scale 0.
+                G.eng.stageUpload(bq, q.data(), (uint64_t)ne);
+                G.eng.stageUpload(bs, sc.data(), (uint64_t)nb * 4);
             } else {
                 int8_t* qd = (int8_t*)G.eng.beginUpload(bq, ne);
                 float* sd = (float*)G.eng.beginUpload(bs, nb * 4);
@@ -594,6 +686,15 @@ static void loadSafetensors(Safetensors& st, const std::string& from, const std:
         uint64_t cols = 1;
         for (size_t i = 1; i < t.shape.size(); i++) cols *= t.shape[i];
         gDims[key] = {rows, (uint32_t)cols};
+        // Text-encoder LoRA deltas: lora_te1_* -> te1.text_model.*. Some repos store the
+        // encoders without the text_model. segment, so accept that alias too.
+        // key already ends in ".weight", exactly like the gLora keys.
+        auto loraIt = gLora.find(key);
+        if (loraIt == gLora.end() && key.rfind("te1.text_model.", 0) == 0)
+            loraIt = gLora.find("te1." + key.substr(std::strlen("te1.text_model.")));
+        if (loraIt == gLora.end() && key.rfind("te2.text_model.", 0) == 0)
+            loraIt = gLora.find("te2." + key.substr(std::strlen("te2.text_model.")));
+        if (loraIt != gLora.end() && t.shape.size() == 2) loraApplyF32(v, rows, (uint32_t)cols, loraIt->second);
         uploadF32(key, v, pending);
         n++;
     }
