@@ -32,6 +32,7 @@ using ofc::sdxl::RunResult;
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -756,6 +757,11 @@ static void loadOneTextEncoder(const GenParams& p, int phase) {
     if (ec) fileBytes = 0;
     G.paramBytes = std::min<uint64_t>(std::max<uint64_t>(fileBytes * 2 / 1048576 + 512, 512), phase == 0 ? 2048 : 6144) << 20;
     clearWeights();
+    // Destroy the old arena explicitly and give the AMD driver a moment to reclaim the
+    // device-local pages. Otherwise UNet (2.9 GB) and CLIP-G (3.1 GB) can overlap in the
+    // driver's accounting and the CLIP-G allocation fails with OUT_OF_HOST_MEMORY.
+    G.paramArena.destroy();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     G.eng.initArenas(192ull << 20, 192ull << 20);  // CLIP attention peaks near 77x77x1280
     G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
     std::printf("%s arena: %.0f MB\n", what, G.paramBytes / 1048576.0);
@@ -3595,6 +3601,8 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         auto tU0 = std::chrono::steady_clock::now();
         clearWeights();
         G.paramBytes = unetParamBytes(p);
+        G.paramArena.destroy();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
         G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
         loadUnet(p);
         uint32_t Lw = width / 8, Lh = height / 8;

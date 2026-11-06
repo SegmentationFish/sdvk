@@ -511,6 +511,21 @@ static std::string jobJson(const std::shared_ptr<Job>& j) {
     return o.str();
 }
 
+// A failed load/sample leaves arenas and possibly a half-initialised device behind. Release them
+// immediately instead of keeping several GB resident until the next manual unload. Cancellation is
+// not a failure: the resident weights stay for the next job.
+static void releaseAfterError(const std::string& err) {
+    if (err.find("cancelled") != std::string::npos) return;
+    try {
+        unloadModel(gModel);
+        gLoaded.clear();
+#ifdef _WIN32
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+#endif
+    } catch (...) {
+    }
+}
+
 // Runs the job on the calling thread. Progress goes to the Job so a concurrent /api/job can read it.
 static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
     job->running = true;
@@ -549,8 +564,10 @@ static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
         job->seed = r.seed;
         job->w = r.width;
         job->h = r.height;
+        if (!r.error.empty()) releaseAfterError(r.error);
     } catch (const std::exception& e) {
         job->error = e.what();
+        releaseAfterError(job->error);
     }
     job->progress = 1.0;
     job->done = true;
@@ -718,6 +735,7 @@ static void handleDecode(const Request& req, Response& r) {
     p.infoOut = true;
     EvalModel m;
     RunResult res = decodeLatentFile(m, p, latent, nullptr);
+    if (!res.ok) unloadModel(m);
     std::ostringstream o;
     o << "{\"ok\":" << (res.ok ? "true" : "false") << ",\"outPath\":" << jstr(res.outPath)
       << ",\"width\":" << res.width << ",\"height\":" << res.height << ",\"totalMs\":" << jnum(res.totalMs)
