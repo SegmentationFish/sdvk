@@ -7,6 +7,9 @@ run the whole SDXL pipeline — dual CLIP text encoding, UNet denoising and VAE 
 > Provenance: the inference engine is built from scratch in this project. Model weights come from third parties (see [Weights](#weights));
 > this project does not include, train, or redistribute any weights.
 
+See [CHANGELOG.md](CHANGELOG.md) for the user-visible changes in each round (samplers, web UI, LAN access,
+full-checkpoint GGUF/VAE, LoRA naming) and the current known issues.
+
 ## License
 
 sdvk is free software, released under the **GNU General Public License v3.0** (see [LICENSE](LICENSE)).
@@ -19,14 +22,14 @@ MIT license; that notice is kept in `volk.h`.
 ## Features
 
 - **Pure Vulkan compute**: no matrix libraries, no model framework; push descriptors, dependency-tracked minimal barriers, cached command-graph replay
-- **Bring your own weights**: a model *folder* is scanned and classified by header keys, so a diffusers tree, a single-file checkpoint and a flat export all work
+- **Bring your own weights**: a model *folder* is scanned and classified by header keys, so a diffusers tree, a single-file checkpoint, a full-checkpoint GGUF (UNet + embedded VAE) and a flat export all work
 - **Free VAE**: any SDXL VAE (fp16 / bf16 / fp32 safetensors) can be dropped in independently of the UNet
 - **One command end to end**: prompt in, PNG out (encoding → sampling → decoding → file), no intermediate tooling
 - **Zero-dependency PNG**: hand-written deflate (fixed-Huffman LZ77), CRC32 and a `tEXt` block that embeds the generation parameters
-- **Sampling recipes**: v-prediction and eps prediction, CFG, leading/trailing spacing, CFG rescale (mimic scale), dynamic thresholding, Euler / Euler-ancestral
+- **Sampling recipes**: v-prediction and eps prediction, CFG, leading/trailing spacing, CFG rescale (mimic scale), dynamic thresholding, and nine samplers: Euler, Euler Ancestral, Heun, LMS, DPM2, DPM2 Ancestral, DPM++ 2M, DPM++ 2S Ancestral and DDIM
 - **Fused attention**: one dispatch for reshape → QKᵀ → mask → online softmax → PV → writeback; a 64×64 register-tiled flash kernel for long self-attention
 - **q8 GEMM vectorised loads**: packed-word / float4 staging, adaptive 64/128-row tiles; ~2.2–3.1 TFLOP/s on RX 580
-- **LoRA merge**: Kohya/PEFT safetensors, diffusers + LDM naming, conv/resnet targets, Q8 and fp32 weights
+- **LoRA merge**: Kohya/PEFT safetensors, diffusers + LDM naming, UNet and text-encoder deltas, conv/resnet targets, Q8 and fp32 weights (image quality is still under investigation — see [Known issues](#known-issues))
 - **img2img and inpaint on a real VAE encoder**: the encoder half of the VAE is loaded and run
   (`conv_in → down blocks → mid → conv_out → quant_conv`), so a seed image becomes a latent the
   sampler understands; `--mask` blends the untouched region back every step
@@ -167,7 +170,9 @@ authentication, so only do this on a trusted network.
 | `POST /api/unload` | drop the resident UNet/VAE and free device memory |
 
 `/api/generate` also accepts `"lora": "<path>", "loraScale": 0.8` to merge a LoRA before sampling.
-The LoRA is merged into the Q8 UNet at load time; `dora_scale` is currently ignored (standard LoRA is used).
+Kohya/PEFT keys are supported in both diffusers and LDM naming; text-encoder deltas are merged while the
+CLIP weights are loaded. `dora_scale` is currently ignored (standard LoRA is used). LoRA output quality is
+still being validated — see [Known issues](#known-issues).
 
 ```bash
 curl -s -X POST http://127.0.0.1:7500/api/generate \
@@ -250,16 +255,31 @@ src/Modules/
 webui/        static web front end
 ```
 
+## Known issues
+
+- **Hassaku XL Lightning Q8 GGUF** (in the local model library) loads and decodes, including its embedded
+  VAE, but the images are noise. Its UNet `input_blocks` weights do not match the repository's fp16
+  safetensors (correlation ≈ 0), so the model file needs a verified re-export. Marked `experimental` in
+  the library manifest.
+- **LoRA merging is not production-ready.** LDM/diffusers keys and text-encoder deltas are mapped and
+  applied, but outputs were still corrupted even at low strength on WAI and NoobAI. A layer-by-layer
+  comparison against a reference implementation is required before enabling LoRA for real images.
+- 8 GB cards are tight at 768² with full-checkpoint UNets; use 512–640² or lower `--step-mb`/`--scratch-mb`.
+- The mobile web layout is functional but not fully redesigned; LAN access is intended for trusted networks
+  (the HTTP API has no authentication).
+
 ## Roadmap
 
 - [x] Direct PNG output (built-in, zero-dependency)
 - [x] `--decode` mode: load the VAE only and decode a latent
 - [x] Free model / VAE selection
-- [x] HTTP API and web UI
+- [x] HTTP API and web UI; direct-prompt studio with scan/progress/unload and LAN access
+- [x] Nine samplers including DPM++ 2M/2S and DPM2
+- [x] Full-checkpoint GGUF (UNet subset + embedded VAE, LDM→diffusers VAE keys)
 - [ ] In-engine VAE decode at 768 (step-arena budget / chunked decode)
 - [ ] `--ckpt`: single-file fp checkpoint loading (on-the-fly rank-2 quantization to Q8_0)
 - [x] Hotspot optimization: fused tiled attention, vectorised q8 GEMM loads, bias epilogue
-- [x] LoRA merge (Kohya / PEFT, conv + attention targets)
+- [x] LoRA key mapping (Kohya / PEFT, UNet + text encoder); visual correctness still under investigation
 - [ ] DoRA magnitude application
 - [ ] int4 weight variant / Winograd 3×3
 
