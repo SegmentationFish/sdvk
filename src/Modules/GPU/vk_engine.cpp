@@ -140,6 +140,10 @@ void Arena::init(VkDevice dev, VkPhysicalDevice phys, uint64_t bytes, bool devic
     cap_ = bytes;
     used_ = 0;
     mapped_ = nullptr;
+    // A failed vkAllocateMemory throws after freeing buffer_, so mem_ must not retain the
+    // previous arena's handle: the next destroy() would vkFreeMemory it a second time.
+    buffer_ = VK_NULL_HANDLE;
+    mem_ = VK_NULL_HANDLE;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = bytes;
     bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -189,6 +193,7 @@ void Arena::init(VkDevice dev, VkPhysicalDevice phys, uint64_t bytes, bool devic
                           req.size / 1048576.0, vkResName(ar), localMb + 0.0);
         vkDestroyBuffer(dev, buffer_, nullptr);
         buffer_ = VK_NULL_HANDLE;
+        mem_ = VK_NULL_HANDLE;
         throw OomError(msg);
     }
     VK_CHECK(vkBindBufferMemory(dev, buffer_, mem_, 0));

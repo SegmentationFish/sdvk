@@ -151,6 +151,12 @@ build/sdvk-server.exe --lan --port 7500 --web webui --out-dir output
 It prints the LAN URLs it detects; allow TCP 7500 through the firewall if Windows asks. The HTTP API has no
 authentication, so only do this on a trusted network.
 
+On Windows, `start-sdvk-server.cmd` starts a single detached instance (hidden console, log in `server.log`) and
+opens the UI; `stop-sdvk-server.cmd` unloads and stops it. Only one instance can bind port 7500 — a second copy
+exits immediately, which is the usual reason a freshly opened server window "closes by itself". A resident model
+is unloaded after 10 idle minutes (`--idle-unload <minutes>`, `0` disables) so closing the browser does not leave
+several GB of VRAM pinned.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | the web UI from `webui/` |

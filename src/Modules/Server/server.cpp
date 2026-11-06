@@ -331,6 +331,13 @@ static std::string gLastError;
 static EvalModel gModel;
 static std::string gLoaded;
 static std::mutex gModelMu;
+static std::atomic<uint64_t> gLastReqMs{0};
+
+static uint64_t nowMs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 static std::string newId() {
     static std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
@@ -1083,6 +1090,7 @@ static void handleAudioFile(const std::map<std::string, std::string>& q, Respons
 
 static Response dispatch(const Request& req) {
     Response r;
+    gLastReqMs.store(nowMs());
     appendCors(r);
     if (req.method == "OPTIONS") {
         r.code = 204;
@@ -1271,6 +1279,7 @@ int main(int argc, char** argv) {
     std::string spv = "shaders";
     std::string modelDir;
     std::string host = "127.0.0.1";
+    int idleUnloadMin = 10;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -1280,6 +1289,8 @@ int main(int argc, char** argv) {
             host = "0.0.0.0";
         } else if (a == "--host") {
             host = next();
+        } else if (a == "--idle-unload") {
+            idleUnloadMin = std::max(0, std::atoi(next().c_str()));
         } else if (a == "--spv") {
             spv = next();
             gSpv = spv;
@@ -1299,6 +1310,7 @@ int main(int argc, char** argv) {
                 "  -p, --port <n>        listen port (default 7500)\n"
                 "      --lan              listen on all interfaces (phone/tablet on the same Wi-Fi)\n"
                 "      --host <ipv4>      bind one address (default 127.0.0.1)\n"
+                "      --idle-unload <m>  unload the model after m idle minutes (0=off, default 10)\n"
                 "  -m, --model-dir <dir>  load this model folder on first request if unset\n"
                 "      --spv <dir>        compiled shader folder (default shaders)\n"
                 "      --web <dir>        web UI folder (default webui)\n"
@@ -1369,7 +1381,9 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
         int e = WSAGetLastError();
         std::printf("error: bind %s:%d failed (%d)%s\n", host.c_str(), port, e,
-                    e == 10013 ? " - port is reserved by the OS, pick another one" : "");
+                    e == 10013 ? " - port is reserved by the OS, pick another one"
+                    : e == 10048 ? " - another sdvk-server is already using this port; open its UI instead"
+                                 : "");
 #else
         std::printf("error: bind %s:%d failed\n", host.c_str(), port);
 #endif
@@ -1406,6 +1420,30 @@ int main(int argc, char** argv) {
         } else {
             std::printf("  model:  %s\n", e.c_str());
         }
+    }
+    // Idle unload keeps VRAM free when the browser is closed but the server keeps running.
+    // Without it a forgotten server holds the whole UNet/VAE until the process exits.
+    if (idleUnloadMin > 0) {
+        gLastReqMs.store(nowMs());
+        std::thread([idleUnloadMin] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                uint64_t last = gLastReqMs.load();
+                if (last && nowMs() - last < (uint64_t)idleUnloadMin * 60000ull) continue;
+                std::lock_guard<std::mutex> lk(gModelMu);
+                if (gLoaded.empty()) {
+                    gLastReqMs.store(nowMs());
+                    continue;
+                }
+                unloadModel(gModel);
+                gLoaded.clear();
+#ifdef _WIN32
+                SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+#endif
+                std::printf("idle %d min: model unloaded, device memory released\n", idleUnloadMin);
+            }
+        }).detach();
+        std::printf("  idle:   unload after %d min without requests\n", idleUnloadMin);
     }
     for (;;) {
         Sock c = ::accept(srv, nullptr, nullptr);
