@@ -785,7 +785,102 @@ static void loadOneTextEncoder(const GenParams& p, int phase) {
 }
 
 // VAE for the decode pass (diffusers component or the first_stage_model slice of a checkpoint).
+static void replaceAllStr(std::string& s, const std::string& a, const std::string& b) {
+    size_t p = 0;
+    while ((p = s.find(a, p)) != std::string::npos) {
+        s.replace(p, a.size(), b);
+        p += b.size();
+    }
+}
+
+// LDM VAE checkpoints name the same modules differently from diffusers: mid.block_1 ->
+// mid_block.resnets.0, attention q -> to_q, nin_shortcut -> conv_shortcut, and decoder.up is
+// stored in the opposite order. Rebuild the diffusers key the VAE walker expects.
+static std::string ldmVaeKey(const std::string& name, int upBlocks) {
+    std::string s = name;
+    auto mapBlocks = [&](const char* tag, bool reverse, const char* dst) {
+        std::string pre = std::string(tag) + ".";
+        if (s.rfind(pre, 0) != 0) return;
+        size_t p = pre.size();
+        size_t q = s.find('.', p);
+        if (q == std::string::npos) return;
+        int i = std::atoi(s.substr(p, q - p).c_str());
+        std::string rest = s.substr(q + 1);
+        int oi = reverse ? upBlocks - 1 - i : i;
+        std::string np = std::string(dst) + "_blocks." + std::to_string(oi) + ".";
+        if (rest.rfind("block.", 0) == 0) {
+            size_t r = rest.find('.', 6);
+            if (r == std::string::npos) return;
+            int j = std::atoi(rest.substr(6, r - 6).c_str());
+            s = np + "resnets." + std::to_string(j) + "." + rest.substr(r + 1);
+        } else if (rest.rfind("downsample.conv.", 0) == 0) {
+            s = np + "downsamplers.0.conv." + rest.substr(16);
+        } else if (rest.rfind("upsample.conv.", 0) == 0) {
+            s = np + "upsamplers.0.conv." + rest.substr(14);
+        }
+    };
+    mapBlocks("encoder.down", false, "encoder.down");
+    mapBlocks("decoder.up", true, "decoder.up");
+    replaceAllStr(s, "mid.block_1.", "mid_block.resnets.0.");
+    replaceAllStr(s, "mid.block_2.", "mid_block.resnets.1.");
+    replaceAllStr(s, "mid.attn_1.", "mid_block.attentions.0.");
+    replaceAllStr(s, "nin_shortcut", "conv_shortcut");
+    replaceAllStr(s, ".norm_out.", ".conv_norm_out.");
+    replaceAllStr(s, ".norm.", ".group_norm.");
+    replaceAllStr(s, ".q.", ".to_q.");
+    replaceAllStr(s, ".k.", ".to_k.");
+    replaceAllStr(s, ".v.", ".to_v.");
+    replaceAllStr(s, ".proj_out.", ".to_out.0.");
+    return s;
+}
+
 static void loadVaeWeights(const GenParams& p) {
+    bool gguf = p.models.vae.size() > 5 && p.models.vae.compare(p.models.vae.size() - 5, 5, ".gguf") == 0;
+    if (gguf) {
+        // Full-checkpoint GGUF: the VAE sits next to the UNet as first_stage_model.*.
+        GgufFile gg;
+        std::string err;
+        if (!gg.open(p.models.vae, &err)) fail("cannot open VAE " + p.models.vae + ": " + err);
+        bool full = gg.find("first_stage_model.decoder.conv_in.weight") != nullptr;
+        if (full && !gg.open(p.models.vae, &err, "first_stage_model."))
+            fail("cannot reopen VAE " + p.models.vae + ": " + err);
+        if (!full && !gg.find("decoder.conv_in.weight"))
+            fail("VAE GGUF has no decoder/first_stage_model tensors: " + p.models.vae);
+        int upBlocks = 4;
+        if (full) {
+            for (auto& t : gg.tensors()) {
+                size_t p = t.name.find("decoder.up.");
+                if (p != 0) continue;
+                size_t q = t.name.find('.', p + 11);
+                if (q != std::string::npos) upBlocks = std::max(upBlocks, std::atoi(t.name.substr(p + 11, q - p - 11).c_str()) + 1);
+            }
+        }
+        uint64_t pending = 0;
+        size_t n = 0;
+        for (auto& t : gg.tensors()) {
+            auto v = gg.readFloat(t.name, &err);
+            if (v.empty()) fail("read VAE " + t.name + ": " + err);
+            std::string key = full ? ldmVaeKey(t.name, upBlocks) : t.name;
+            uint32_t rows;
+            uint64_t cols = 1;
+            if (t.dims.size() > 2) {
+                rows = (uint32_t)t.dims.back();
+                for (size_t i = 0; i + 1 < t.dims.size(); i++) cols *= t.dims[i];
+            } else if (t.dims.size() == 2) {
+                rows = (uint32_t)t.dims[1];
+                cols = t.dims[0];
+            } else {
+                rows = (uint32_t)(t.dims.empty() ? 1 : t.dims[0]);
+            }
+            gDims[key] = {rows, (uint32_t)cols};
+            uploadF32(key, v, pending);
+            n++;
+        }
+        G.eng.flushUploads();
+        std::printf("weights loaded (vae gguf): %zu tensors, param arena %.0f MB\n", n,
+                    G.paramArena.used() / 1048576.0);
+        return;
+    }
     if (!gVae.st.ensureOpen(p.models.vae)) fail("cannot open VAE " + p.models.vae + ": " + gVae.st.error());
     if (containsPrefix(gVae.st, "first_stage_model.")) {
         loadSafetensors(gVae.st, "first_stage_model.", "", Part::Vae, "vae (checkpoint)");

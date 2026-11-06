@@ -4,6 +4,7 @@
 #include "ModelSet.hpp"
 
 #include "Modules/Diffusion/Safetensors.hpp"
+#include "Modules/Model/Gguf.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -195,6 +196,7 @@ static std::string findByNames(const std::vector<Found>& found, int cls, std::in
 bool resolveModels(GenParams& p, ModelSet& out, std::string& err) {
     ModelPaths& m = p.models;
     const std::string& dir = m.modelDir;
+    const bool vaeExplicit = !m.vae.empty();
 
     // One cheap pass up front: every later decision is made from this index, so a flat
     // export ("unet_fp16.safetensors", "vae.safetensors") resolves exactly like a
@@ -220,10 +222,20 @@ bool resolveModels(GenParams& p, ModelSet& out, std::string& err) {
     if (m.te1.empty()) m.te1 = findByNames(found, kClipL, {"text_encoder_model.safetensors", "text_encoder.safetensors"});
     if (m.te2.empty()) m.te2 = findByNames(found, kClipG, {"text_encoder_2_model.safetensors", "text_encoder_2.safetensors"});
     if (m.vae.empty()) m.vae = findByNames(found, kVae, {"vae.safetensors", "vae_model.safetensors"});
-    // tokenizers: the folder itself, or the vocab/merges pair sitting flat next to the weights
+    // tokenizers: the folder itself, the usual root layout, or a nested tokenizers/ collection
     if (!dir.empty()) {
-        if (m.tok1.empty() && fs::is_directory(join(dir, "tokenizer"))) m.tok1 = join(dir, "tokenizer");
-        if (m.tok2.empty() && fs::is_directory(join(dir, "tokenizer_2"))) m.tok2 = join(dir, "tokenizer_2");
+        auto tokDir = [&](std::initializer_list<const char*> rels) -> std::string {
+            for (const char* rel : rels) {
+                std::string p = join(dir, rel);
+                if (fs::is_regular_file(join(p, "vocab.json")) && fs::is_regular_file(join(p, "merges.txt")))
+                    return p;
+            }
+            return {};
+        };
+        if (m.tok1.empty())
+            m.tok1 = tokDir({"tokenizer", "tokenizers/tokenizer", "text_encoder/tokenizer", "tokenizer_1"});
+        if (m.tok2.empty())
+            m.tok2 = tokDir({"tokenizer_2", "tokenizers/tokenizer_2", "text_encoder_2/tokenizer"});
         if (m.tok1.empty() && exists(join(dir, "vocab.json"))) m.tok1 = dir;
     }
 
@@ -279,6 +291,14 @@ bool resolveModels(GenParams& p, ModelSet& out, std::string& err) {
         err = std::string("missing text encoder (") + (m.te1.empty() ? "CLIP-L" : "CLIP-G") +
               "); pass --te1/--te2 or keep text_encoder/ and text_encoder_2/ next to the model";
         return false;
+    }
+    // A full-checkpoint GGUF carries the VAE it was trained with. Prefer that over an unrelated
+    // external VAE unless the caller explicitly selected one.
+    if (!vaeExplicit && m.vae != m.unet && endsWith(lower(m.unet), ".gguf")) {
+        GgufFile probe;
+        std::string pe;
+        if (probe.open(m.unet, &pe) && probe.find("first_stage_model.decoder.conv_in.weight"))
+            m.vae = m.unet;
     }
     if (m.vae.empty()) {
         err = "missing VAE; pass --vae <file> or keep vae/ next to the model";
