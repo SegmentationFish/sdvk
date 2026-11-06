@@ -1125,7 +1125,9 @@ static Response dispatch(const Request& req) {
         std::string rel = path == "/" ? "index.html" : path.substr(1);
         std::string full;
         if (!safeJoin(gWebRoot, rel, full) || !serveFile(full, r, true)) {
-            setErr(r, 404, "not found: " + path);
+            setErr(r, 404, path == "/" ? "web UI not found under '" + gWebRoot +
+                                             "' (start with --web <folder containing index.html>)"
+                                       : "not found: " + path);
         }
     } else {
         setErr(r, 405, "method not allowed");
@@ -1317,6 +1319,23 @@ int main(int argc, char** argv) {
             std::printf("unknown option: %s\n", a.c_str());
             return 1;
         }
+    }
+    // The server is often launched from build/ with the default "webui"; accept the repo layout
+    // and the executable's neighbourhood instead of returning 404 for "/".
+    {
+        std::error_code wec;
+        fs::path exeDir = fs::absolute(fs::path(argv[0]), wec).parent_path();
+        std::vector<fs::path> cands = {fs::path(gWebRoot), exeDir / "webui", exeDir / ".." / "webui",
+                                       fs::path("webui"), fs::path("..") / "webui"};
+        for (auto& c : cands) {
+            if (fs::is_regular_file(c / "index.html", wec)) {
+                gWebRoot = c.string();
+                break;
+            }
+        }
+        if (!fs::is_regular_file(fs::path(gWebRoot) / "index.html", wec))
+            std::printf("warning: web UI not found (looked for index.html in %s); use --web <dir>\n",
+                        gWebRoot.c_str());
     }
     std::error_code ec;
     fs::create_directories(gOutDir, ec);
