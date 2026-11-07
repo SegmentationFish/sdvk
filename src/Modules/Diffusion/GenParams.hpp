@@ -166,8 +166,12 @@ struct GenParams {
     // ---- models
     ModelPaths models;
     uint32_t estVramMb = 0;
-    std::string lora;      // path to a LoRA safetensors file (Kohya or PEFT keys)
-    float loraScale = 1.0f;  // user multiplier on alpha/rank
+    // Multiple LoRAs merge cumulatively: W += sum_i scale_i * (alpha_i/rank_i) * B_i @ A_i.
+    struct LoraSpec {
+        std::string path;  // Kohya or PEFT safetensors
+        float scale = 1.0f;
+    };
+    std::vector<LoraSpec> loras;
 
     // ---- output
     std::string outPath = "sdvkgen.png";

@@ -330,6 +330,7 @@ static std::map<std::string, std::shared_ptr<Job>> gJobs;
 static std::string gLastError;
 static EvalModel gModel;
 static std::string gLoaded;
+static std::string gLoraSig;   // which LoRA set the resident weights were merged with
 static std::mutex gModelMu;
 static std::atomic<uint64_t> gLastReqMs{0};
 
@@ -423,8 +424,39 @@ static bool paramsFromJson(const FlatJson& j, GenParams& p, std::string& err) {
     if (j.n.count("paramMb")) p.paramMb = (uint32_t)j.n.at("paramMb");
     if (j.n.count("stepMb")) p.stepMb = (uint32_t)j.n.at("stepMb");
     if (j.n.count("scratchMb")) p.scratchMb = (uint32_t)j.n.at("scratchMb");
-    if (j.s.count("lora")) p.lora = j.s.at("lora");
-    if (j.n.count("loraScale")) p.loraScale = (float)j.n.at("loraScale");
+    // "lora" accepts either one path or a comma-separated list; each item may carry
+    // ":strength" (e.g. "a.safetensors:0.8, b.safetensors:0.5"). "loraScale" scales the
+    // single-string form for backward compatibility.
+    if (j.s.count("lora")) {
+        std::string spec = j.s.at("lora");
+        size_t pos = 0;
+        while (pos <= spec.size()) {
+            size_t comma = spec.find(',', pos);
+            if (comma == std::string::npos) comma = spec.size();
+            std::string item = spec.substr(pos, comma - pos);
+            size_t a = item.find_first_not_of(" \t");
+            size_t b = item.find_last_not_of(" \t");
+            if (a != std::string::npos) {
+                item = item.substr(a, b - a + 1);
+                GenParams::LoraSpec ls;
+                ls.path = item;
+                size_t c = ls.path.rfind(':');
+                if (c != std::string::npos && c > 1) {
+                    std::string tail = ls.path.substr(c + 1);
+                    char* end = nullptr;
+                    float f = std::strtof(tail.c_str(), &end);
+                    if (end && *end == '\0' && end != tail.c_str()) {
+                        ls.scale = f;
+                        ls.path.resize(c);
+                    }
+                }
+                p.loras.push_back(ls);
+            }
+            if (comma == spec.size()) break;
+            pos = comma + 1;
+        }
+    }
+    if (j.n.count("loraScale") && !p.loras.empty()) p.loras.front().scale = (float)j.n.at("loraScale");
     if (j.n.count("pngCompress")) p.pngCompress = (int)j.n.at("pngCompress");
     if (j.n.count("cropX")) p.cropOffsetX = (uint32_t)j.n.at("cropX");
     if (j.n.count("cropY")) p.cropOffsetY = (uint32_t)j.n.at("cropY");
@@ -519,6 +551,7 @@ static void releaseAfterError(const std::string& err) {
     try {
         unloadModel(gModel);
         gLoaded.clear();
+        gLoraSig.clear();
 #ifdef _WIN32
         SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 #endif
@@ -544,7 +577,10 @@ static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
     };
     try {
         // The model stays resident between jobs; loading it is the expensive part.
-        if (gLoaded != p.models.modelDir || gCurrentDevice != p.device) {
+        std::string loraSig;
+        for (auto& ls : p.loras)
+            loraSig += ls.path + ":" + std::to_string(ls.scale) + ";";
+        if (gLoaded != p.models.modelDir || gCurrentDevice != p.device || gLoraSig != loraSig) {
             unloadModel(gModel);
             std::string e;
             if (!loadModel(gModel, p, onProgress, e)) {
@@ -555,6 +591,7 @@ static void runJob(const std::shared_ptr<Job>& job, GenParams p) {
             }
             gLoaded = p.models.modelDir;
             gCurrentDevice = p.device;
+            gLoraSig = loraSig;
         }
         RunResult r = run(gModel, p, onProgress);
         job->error = r.error;
@@ -594,6 +631,7 @@ static void handleUnload(Response& r) {
     std::lock_guard<std::mutex> lk(gModelMu);
     unloadModel(gModel);
     gLoaded.clear();
+    gLoraSig.clear();
 #ifdef _WIN32
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 #endif
@@ -718,6 +756,7 @@ static void handleDecode(const Request& req, Response& r) {
         std::lock_guard<std::mutex> lk(gModelMu);
         unloadModel(gModel);
         gLoaded.clear();
+        gLoraSig.clear();
     }
     std::error_code ec;
     if (!safeJoin(gInputDir, base, latent) || !fs::is_regular_file(latent, ec)) {
@@ -1455,6 +1494,7 @@ int main(int argc, char** argv) {
                 }
                 unloadModel(gModel);
                 gLoaded.clear();
+                    gLoraSig.clear();
 #ifdef _WIN32
                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 #endif

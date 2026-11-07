@@ -49,8 +49,8 @@ static void usage() {
         "  --vae <file>            VAE safetensors (fp16/bf16/fp32)\n"
         "  --tok/--tok2 <dir>      tokenizer folders holding vocab.json + merges.txt\n"
         "  --taesd <file>          optional tiny decoder\n"
-        "  --lora <file>           merge a LoRA safetensors into the Q8 UNet at load\n"
-        "  --lora-scale <f>        LoRA strength multiplier (default 1.0)\n"
+        "  --lora <file[:strength]>  merge a LoRA safetensors into the Q8 UNet at load; repeatable\n"
+        "  --lora-scale <f>        strength for the most recent --lora (default 1.0)\n"
         "  --list-models <dir>     print how a folder is classified and exit\n"
         "\n"
         "sampler:\n"
@@ -183,9 +183,25 @@ static Parsed parseArgs(int argc, char** argv) {
             p.models.tok2 = val();
             i++;
         } else if (a == "--lora") {
-            p.lora = val();
+            // repeatable; each spec is "path" or "path:strength"
+            {
+                GenParams::LoraSpec ls;
+                ls.path = val();
+                size_t c = ls.path.rfind(':');
+                if (c != std::string::npos && c > 1) {
+                    std::string tail = ls.path.substr(c + 1);
+                    char* end = nullptr;
+                    float f = std::strtof(tail.c_str(), &end);
+                    if (end && *end == '\0' && end != tail.c_str()) {
+                        ls.scale = f;
+                        ls.path.resize(c);
+                    }
+                }
+                p.loras.push_back(ls);
+            }
         } else if (a == "--lora-scale") {
-            p.loraScale = std::strtof(val().c_str(), nullptr);
+            // applies to the most recent --lora (single-LoRA compatibility)
+            if (!p.loras.empty()) p.loras.back().scale = std::strtof(val().c_str(), nullptr);
         } else if (a == "--taesd") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.taesd = val();

@@ -234,10 +234,10 @@ static void clearWeights() {
 struct LoraPair {
     std::vector<float> down, up;
     float alpha = 0.f;
+    float scale = 1.0f;  // per-file user strength; deltas from several files sum at merge
     uint32_t rank = 0, in = 0, out = 0;
 };
-static std::unordered_map<std::string, LoraPair> gLora;
-static float gLoraScale = 1.0f;
+static std::unordered_map<std::string, std::vector<LoraPair>> gLora;
 static uint64_t gLoraApplied = 0;
 
 static bool loraReplace(std::string& s, const char* a, const char* b) {
@@ -458,9 +458,6 @@ static std::string loraModuleToLdm(const std::string& mod) {
 }
 
 static void loadLoraFile(const std::string& path, float userScale) {
-    gLora.clear();
-    gLoraScale = userScale;
-    gLoraApplied = 0;
     Safetensors st;
     if (!st.ensureOpen(path)) fail("cannot open LoRA " + path + ": " + st.error());
     const std::string downSuf = ".lora_down.weight";
@@ -476,6 +473,7 @@ static void loadLoraFile(const std::string& path, float userScale) {
         const STTensor* tb = st.find(mod + ".lora_up.weight");
         if (!ta || !tb || ta->shape.empty() || tb->shape.empty()) { skipped++; continue; }
         LoraPair L;
+        L.scale = userScale;
         L.rank = (uint32_t)ta->shape[0];
         uint64_t dn = st.numel(*ta), un = st.numel(*tb);
         if (L.rank == 0 || L.rank > 256 || dn % L.rank || un % L.rank) { skipped++; continue; }
@@ -492,43 +490,53 @@ static void loadLoraFile(const std::string& path, float userScale) {
             auto v = st.readF32(al->name);
             if (!v.empty()) L.alpha = v[0];
         }
-        gLora[key + ".weight"] = std::move(L);
+        gLora[key + ".weight"].push_back(std::move(L));
         pairs++;
     }
     std::printf("lora: %s -> %u modules mapped, %u skipped, scale %.2f\n", path.c_str(), pairs, skipped,
                 userScale);
 }
 
-static void loraApplyF32(std::vector<float>& w, uint32_t rows, uint32_t cols, const LoraPair& L) {
-    if (L.out != rows || L.in != cols || gLoraScale == 0.0f) return;
-    const float scale = (L.alpha > 0.f ? L.alpha / (float)L.rank : 1.0f) * gLoraScale;
-    for (uint32_t o = 0; o < rows; o++) {
-        float* wr = &w[(size_t)o * cols];
-        for (uint32_t r = 0; r < L.rank; r++) {
-            float b = L.up[(size_t)o * L.rank + r] * scale;
-            if (b == 0.0f) continue;
-            const float* a = &L.down[(size_t)r * cols];
-            for (uint32_t i = 0; i < cols; i++) wr[i] += b * a[i];
+static void loraApplyF32(std::vector<float>& w, uint32_t rows, uint32_t cols,
+                         const std::vector<LoraPair>& list) {
+    bool touched = false;
+    for (auto& L : list) {
+        if (L.out != rows || L.in != cols || L.scale == 0.0f) continue;
+        const float scale = (L.alpha > 0.f ? L.alpha / (float)L.rank : 1.0f) * L.scale;
+        for (uint32_t o = 0; o < rows; o++) {
+            float* wr = &w[(size_t)o * cols];
+            for (uint32_t r = 0; r < L.rank; r++) {
+                float b = L.up[(size_t)o * L.rank + r] * scale;
+                if (b == 0.0f) continue;
+                const float* a = &L.down[(size_t)r * cols];
+                for (uint32_t i = 0; i < cols; i++) wr[i] += b * a[i];
+            }
         }
+        touched = true;
     }
-    gLoraApplied++;
+    if (touched) gLoraApplied++;
 }
 
 static void loraApplyQ8(std::vector<int8_t>& q, std::vector<float>& sc, uint32_t rows, uint32_t cols,
-                        const LoraPair& L) {
-    if (L.out != rows || L.in != cols || gLoraScale == 0.0f) return;
-    const float scale = (L.alpha > 0.f ? L.alpha / (float)L.rank : 1.0f) * gLoraScale;
+                        const std::vector<LoraPair>& list) {
+    std::vector<const LoraPair*> use;
+    for (auto& L : list)
+        if (L.out == rows && L.in == cols && L.scale != 0.0f) use.push_back(&L);
+    if (use.empty()) return;
     std::vector<float> row(cols);
     const uint32_t blocks = cols / 32;
     for (uint32_t o = 0; o < rows; o++) {
         int8_t* qr = &q[(size_t)o * cols];
         float* sr = &sc[(size_t)o * blocks];
         for (uint32_t i = 0; i < cols; i++) row[i] = (float)qr[i] * sr[i >> 5];
-        for (uint32_t r = 0; r < L.rank; r++) {
-            float b = L.up[(size_t)o * L.rank + r] * scale;
-            if (b == 0.0f) continue;
-            const float* a = &L.down[(size_t)r * cols];
-            for (uint32_t i = 0; i < cols; i++) row[i] += b * a[i];
+        for (auto* L : use) {
+            const float scale = (L->alpha > 0.f ? L->alpha / (float)L->rank : 1.0f) * L->scale;
+            for (uint32_t r = 0; r < L->rank; r++) {
+                float b = L->up[(size_t)o * L->rank + r] * scale;
+                if (b == 0.0f) continue;
+                const float* a = &L->down[(size_t)r * cols];
+                for (uint32_t i = 0; i < cols; i++) row[i] += b * a[i];
+            }
         }
         for (uint32_t b = 0; b < blocks; b++) {
             float mx = 0.0f;
@@ -2950,7 +2958,7 @@ bool loadModel(EvalModel& m, const GenParams& in, const ProgressFn& onProgress, 
     if (!ofc::sdxl::resolveModels(p, set, err)) return false;
     if (!ensureDevice(p.spvDir, err, p.device)) return false;
     gLora.clear();
-    if (!p.lora.empty()) loadLoraFile(p.lora, p.loraScale);
+    for (auto& ls : p.loras) loadLoraFile(ls.path, ls.scale);
     gS.spvDir = p.spvDir;
     gS.tok.ready = false;
     m.warnings = set.warn;

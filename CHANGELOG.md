@@ -3,6 +3,20 @@
 All notable changes to sdvk. The project is pre-1.0; the format follows
 [Keep a Changelog](https://keepachangelog.com/) and versions are approximate.
 
+## 2026-11-07
+
+### Added
+
+- **Multi-LoRA**: `--lora` is now repeatable and each spec accepts an inline strength
+  (`--lora a.safetensors:0.8 --lora b.safetensors:0.5`). Deltas from all files merge
+  cumulatively (`W += sum_i scale_i * (alpha_i/rank_i) * B_i @ A_i`); Q8 tensors are
+  dequantized once, all deltas applied, then requantized once per row. The server API
+  takes the same syntax as a comma-separated `"lora"` string, and `"loraScale"` still
+  scales a single-path request. Fixed the resident-server behavior where a LoRA change
+  between jobs was silently ignored: the LoRA set now participates in the reload decision
+  alongside `modelDir`/`device`. `--lora-scale` keeps its old meaning (strength of the
+  most recent `--lora`).
+
 ## 2026-11-06
 
 ### Added
