@@ -7,6 +7,11 @@ All notable changes to sdvk. The project is pre-1.0; the format follows
 
 ### Added
 
+- **Full-checkpoint converter** (`tools/sdxl_q8_convert.py`): turns an SDXL full-checkpoint
+  safetensors into the Q8_0 GGUF the engine loads (CPU-only, streams one tensor at a time,
+  ~2.6 GB out). Mirrors the ComfyUI-GGUF conventions the loader expects: interleaved
+  `[fp16 scale][32 x int8]` blocks over the flat tensor, `comfy.gguf.orig_shape.*` u64 arrays
+  for every tensor, small biases/norms kept in F32. Round-trip error ~0.4%.
 - **Multi-LoRA**: `--lora` is now repeatable and each spec accepts an inline strength
   (`--lora a.safetensors:0.8 --lora b.safetensors:0.5`). Deltas from all files merge
   cumulatively (`W += sum_i scale_i * (alpha_i/rank_i) * B_i @ A_i`); Q8 tensors are
