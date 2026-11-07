@@ -2958,7 +2958,24 @@ bool loadModel(EvalModel& m, const GenParams& in, const ProgressFn& onProgress, 
     if (!ofc::sdxl::resolveModels(p, set, err)) return false;
     if (!ensureDevice(p.spvDir, err, p.device)) return false;
     gLora.clear();
-    for (auto& ls : p.loras) loadLoraFile(ls.path, ls.scale);
+    for (auto& ls : p.loras) {
+        // bare filenames resolve against the model library, same as the other components:
+        // <modelDir>/loras/<name> first, then <modelDir>/<name>
+        std::string path = ls.path;
+        std::error_code ec;
+        if (!path.empty() && !std::filesystem::exists(path, ec)) {
+            std::string base = std::filesystem::path(ls.path).filename().string();
+            std::string dir = p.models.modelDir;
+            if (!dir.empty() && !base.empty()) {
+                if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+                for (const char* rel : {"loras/", ""}) {
+                    std::string cand = dir + rel + base;
+                    if (std::filesystem::exists(cand, ec)) { path = cand; break; }
+                }
+            }
+        }
+        loadLoraFile(path, ls.scale);
+    }
     gS.spvDir = p.spvDir;
     gS.tok.ready = false;
     m.warnings = set.warn;
