@@ -172,6 +172,8 @@ struct GenParams {
         float scale = 1.0f;
     };
     std::vector<LoraSpec> loras;
+    bool weightsHost = false;  // keep UNet weights in host memory; GPU streams them over PCIe
+                               // (slower per step, but VRAM only holds activations -- big canvases)
 
     // ---- output
     std::string outPath = "sdvkgen.png";

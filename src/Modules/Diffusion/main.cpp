@@ -49,6 +49,8 @@ static void usage() {
         "  --vae <file>            VAE safetensors (fp16/bf16/fp32)\n"
         "  --tok/--tok2 <dir>      tokenizer folders holding vocab.json + merges.txt\n"
         "  --taesd <file>          optional tiny decoder\n"
+        "  --weights-host          keep UNet weights in host memory (PCIe-streamed): slower steps,\n"
+        "                          but VRAM only holds activations -- use for 768x1024+ canvases\n"
         "  --lora <file[:strength]>  merge a LoRA safetensors into the Q8 UNet at load; repeatable\n"
         "  --lora-scale <f>        strength for the most recent --lora (default 1.0)\n"
         "  --list-models <dir>     print how a folder is classified and exit\n"
@@ -174,6 +176,10 @@ static Parsed parseArgs(int argc, char** argv) {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.vae = val();
             i++;
+        } else if (a == "--weights-host") {
+            // UNet weights live in host memory; the GPU streams them over PCIe each step.
+            // Slower per step, but VRAM only holds activations -- what big canvases need.
+            p.weightsHost = true;
         } else if (a == "--tok") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.tok1 = val();

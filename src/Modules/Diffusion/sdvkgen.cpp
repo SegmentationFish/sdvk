@@ -2997,8 +2997,9 @@ bool loadModel(EvalModel& m, const GenParams& in, const ProgressFn& onProgress, 
         clearWeights();
         G.paramBytes = unetParamBytes(p);
         G.eng.initArenas(256ull << 20, 256ull << 20);
-        G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
-        std::printf("unet arena: %.0f MB\n", G.paramBytes / 1048576.0);
+        G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, !p.weightsHost, p.weightsHost);
+        std::printf("unet arena: %.0f MB (%s)\n", G.paramBytes / 1048576.0,
+                    p.weightsHost ? "host memory, PCIe-streamed" : "device-local");
         auto t0 = std::chrono::steady_clock::now();
         loadUnet(p);
         gS.unetMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -3628,7 +3629,7 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         G.paramBytes = unetParamBytes(p);
         G.paramArena.destroy();
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
+        G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, !p.weightsHost, p.weightsHost);
         loadUnet(p);
         uint32_t Lw = width / 8, Lh = height / 8;
         uint32_t stepMB = p.stepMb ? p.stepMb : (width >= 768 || height >= 768 ? 1500u : 900u);
