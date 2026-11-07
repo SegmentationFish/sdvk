@@ -58,7 +58,17 @@ static int classifyFile(const std::string& path, const std::string& leaf) {
         if (n.rfind("input_blocks.", 0) == 0 || n.rfind("middle_block.", 0) == 0 ||
             n.rfind("output_blocks.", 0) == 0 || n.rfind("unet.", 0) == 0 || n.rfind("down_blocks.", 0) == 0)
             unet = true;
-        if (n.rfind("decoder.", 0) == 0 || n.rfind("vae.", 0) == 0) vae = true;
+        if (n.rfind("decoder.", 0) == 0 || n.rfind("vae.", 0) == 0) {
+            // a bare "decoder." prefix also matches seq2seq transformers (T5 emits
+            // decoder.block.*), which then steals the VAE slot and OOMs the weight arena;
+            // a diffusion VAE decoder always carries up_blocks/mid_block/conv_norm_out
+            if (n.rfind("decoder.", 0) == 0 && n.find("up_blocks.") == std::string::npos &&
+                n.find("mid_block.") == std::string::npos && n.find("conv_norm_out") == std::string::npos &&
+                n.find("conv_in.") == std::string::npos)
+                ;
+            else
+                vae = true;
+        }
         if (n.rfind("text_model.", 0) == 0 || n.rfind("text_encoder.", 0) == 0 ||
             n.rfind("embeddings.token_embedding.", 0) == 0) {
             bool g = false;
