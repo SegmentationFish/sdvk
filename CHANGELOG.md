@@ -5,6 +5,29 @@ All notable changes to sdvk. The project is pre-1.0; the format follows
 
 ## 2026-11-21
 
+### Added
+
+- **IP-Adapter (image prompt)**: `--ip-adapter <file> --ip-image <png|ppm> [--ip-scale 0.6]
+  [--ip-encoder <file>]`. The reference image is encoded by the CLIP ViT-H/14 vision tower (Q8_0 at
+  load, fp32 with `OFC_IP_FP32=1`), resized/centre-cropped/normalized like `CLIPImageProcessor`,
+  projected by `image_proj` (Linear 1024 -> 4*2048 + LayerNorm) into 4 tokens, and those are
+  projected per cross-attention layer by `to_k_ip`/`to_v_ip` once per run (5 MB of K/V tables,
+  reused by every step and both CFG branches). Sampling pays a second 4-token attention per layer
+  and adds it to the text attention output before `to_out` (new `add_scaled` kernel): 512x640 cost
+  went 2.35 -> 2.38 s/step. `--ip-check` runs the tower and adapter alone and prints the embedding
+  statistics. Matches diffusers semantics exactly (`IPAdapterAttnProcessor2_0`, including the
+  zero-image negative branch, so it is stronger than ComfyUI at the same scale), and the layer
+  mapping follows the checkpoint's down/up/mid processor order rather than our down/mid/up walk.
+  Validated against torch on CPU: patch-embed/block31/CLS embedding cos 0.9997/0.99972/0.99997,
+  image tokens cos 0.99996, per-layer K/V cos 0.999994. Visually: same seed/prompt, scale 0.3 keeps
+  the render and adds the reference palette, 0.6 shifts the character design toward the reference
+  without losing the composition.
+- `OFC_IP_KV_DUMP=<prefix>` writes the 4-token K/V tables (`<prefix>_k/_v.f32` + `_layers.txt`) for
+  `tools/ip_kv_cmp.py`; `OFC_IP_SKIP_ATTN=1` loads the adapter but skips the branch (A/B);
+  `OFC_IP_SLOWATTN=1` computes the IP attention with the unfused kernel.
+- `tools/ip_ref.py` (torch CLIP tower + image projection reference for `--ip-check` dumps) and
+  `tools/ip_kv_cmp.py` (per-layer K/V comparison).
+
 ### Fixed
 
 - **VAE encode wrote past the 48 MB im2col buffer**: `im2col_s2` generated the whole stride-2 column
@@ -43,6 +66,18 @@ All notable changes to sdvk. The project is pre-1.0; the format follows
   (outside equals the VAE roundtrip loss, i.e. 30.5 dB against the resampled source).
 - text2img 30 steps at 512x640 (29.9 -> clean) and 768x1024 (clean), so the earlier "mushy 30-step
   render" no longer reproduces.
+- IP-Adapter 512x640/30 steps: 0.3 and 0.6 both keep the composition (0.6 pulls the character design
+  toward the reference); 768x768 WAI at 0.5 renders cleanly.
+- One-step latent deviation is linear in `--ip-scale` (rel 0.038 / 0.178 / 0.540 / 1.29 at
+  0.02 / 0.1 / 0.3 / 0.6) and bit-identical to a plain run with the branch skipped.
+
+### Notes
+
+- Building `add_scaled` cost a debugging session: it was dispatched as `{a, b, a}` while the shader
+  binds `C, A, B`, so it computed `ip + scale * text` and silently discarded the text attention. The
+  symptom was an image prompt taking over at *any* scale; the giveaway was that one-step latents at
+  scale 0.02 and 0.6 were 96% correlated while both were orthogonal to a skip-the-branch run. Print
+  the buffer order next to the shader's binding order when a kernel "works" but the result is wrong.
 
 ## 2026-11-20
 

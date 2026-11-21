@@ -57,6 +57,10 @@ static void usage() {
         "                          but VRAM only holds activations -- use for 768x1024+ canvases\n"
         "  --lora <file[:strength]>  merge a LoRA safetensors into the Q8 UNet at load; repeatable\n"
         "  --lora-scale <f>        strength for the most recent --lora (default 1.0)\n"
+        "  --ip-adapter <file>     IP-Adapter SDXL safetensors (image_proj.* + ip_adapter.*)\n"
+        "  --ip-image <image>      reference image for the IP-Adapter (PNG or PPM)\n"
+        "  --ip-scale <f>          IP-Adapter strength (default 0.6; 0 disables the branch)\n"
+        "  --ip-encoder <file>     CLIP ViT-H/14 image tower; auto-detected next to the adapter\n"
         "  --list-models <dir>     print how a folder is classified and exit\n"
         "\n"
         "sampler:\n"
@@ -111,6 +115,7 @@ static void usage() {
         "  --check                 report device, heaps and canvas suggestions\n"
         "  --bench                 --check plus bandwidth and GEMM benchmarks\n"
         "  --textcheck/--clipdbg/--unetdbg/--dbgstage/--probe/--probe-x/--probe-t   debug hooks\n"
+        "  --ip-check              load the image tower + adapter, print the embedding stats, exit\n"
         "  -h, --help              this text\n"
         "  --version               version\n"
         "\n"
@@ -129,7 +134,7 @@ static bool isFlag(const std::string& a) { return !a.empty() && a[0] == '-'; }
 struct Parsed {
     GenParams p;
     bool help = false, version = false, listModels = false;
-    bool check = false, bench = false;
+    bool check = false, bench = false, ipCheck = false;
     std::string listDir;
     std::string decodeIn;
     std::string metaIn;
@@ -217,6 +222,22 @@ static Parsed parseArgs(int argc, char** argv) {
         } else if (a == "--lora-scale") {
             // applies to the most recent --lora (single-LoRA compatibility)
             if (!p.loras.empty()) p.loras.back().scale = std::strtof(val().c_str(), nullptr);
+        } else if (a == "--ip-adapter") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.ipAdapter = val();
+            i++;
+        } else if (a == "--ip-image") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.ipImage = val();
+            i++;
+        } else if (a == "--ip-scale") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.ipScale = std::strtof(val().c_str(), nullptr);
+            i++;
+        } else if (a == "--ip-encoder") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            p.ipEncoder = val();
+            i++;
         } else if (a == "--taesd") {
             if (!need(i, argc, a.c_str(), o)) break;
             p.models.taesd = val();
@@ -416,6 +437,8 @@ static Parsed parseArgs(int argc, char** argv) {
             i++;
         } else if (a == "--textcheck") {
             p.textcheck = true;
+        } else if (a == "--ip-check") {
+            o.ipCheck = true;
         } else if (a == "--clipdbg") {
             p.clipdbg = true;
         } else if (a == "--unetdbg") {
@@ -451,6 +474,9 @@ static Parsed parseArgs(int argc, char** argv) {
     if (!p.seedGiven) p.seed = std::random_device{}();
     if (p.useInit && p.initImage.empty()) o.err = "--init needs a path";
     if (!p.maskImage.empty() && p.initImage.empty()) o.err = "--mask needs --init";
+    if (!p.ipAdapter.empty() && p.ipImage.empty()) o.err = "--ip-adapter needs --ip-image";
+    if (p.ipAdapter.empty() && !p.ipImage.empty()) o.err = "--ip-image needs --ip-adapter";
+    if (p.ipScale < 0.0f || p.ipScale > 3.0f) o.err = "--ip-scale expects 0 .. 3";
     return o;
 }
 
@@ -617,6 +643,15 @@ int main(int argc, char** argv) {
 
     if (o.check) {
         std::printf("%s", deviceCheck(p.spvDir.empty() ? "shaders" : p.spvDir, o.bench).c_str());
+        return 0;
+    }
+
+    if (o.ipCheck) {
+        std::string err;
+        if (!ipAdapterCheck(p, err)) {
+            std::printf("error: %s\n", err.c_str());
+            return 1;
+        }
         return 0;
     }
 

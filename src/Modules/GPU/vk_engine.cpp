@@ -121,6 +121,7 @@ static const KernelDef KERNELS[] = {
     {"upsample2x", 2, 12, 0x2},
     {"bias_add", 2, 8, 0x1},
     {"add2", 3, 4, 0x4},
+    {"add_scaled", 3, 8, 0x4},
     {"fused_attn", 4, 36, 0x8},
     // 49,920 B of shared memory: some drivers report a lower limit but accept the pipeline,
     // so load it opportunistically and fall back to fused_attn when creation fails.

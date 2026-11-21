@@ -33,6 +33,9 @@ MIT license; that notice is kept in `volk.h`.
 - **img2img and inpaint on a real VAE encoder**: the encoder half of the VAE is loaded and run
   (`conv_in → down blocks → mid → conv_out → quant_conv`), so a seed image becomes a latent the
   sampler understands; `--mask` blends the untouched region back every step
+- **IP-Adapter (SDXL image prompt)**: CLIP ViT-H/14 vision tower + `image_proj` → 4 tokens, projected
+  per cross-attention layer once per run and injected as a second attention branch (`--ip-adapter`,
+  `--ip-image`, `--ip-scale`); diffusers semantics, ~0.03 s/step overhead at 512×640
 - **Audio workflow (host CPU)**: WAV read/write at 16/24/32-bit, peak/RMS normalise, fades, silence
   trim, Kaiser-windowed-sinc resample, FFT convolution reverb, STFT spectrogram → PNG. This is audio
   *processing*; the engine has no mel-VAE/DiT, so there is nothing to generate from a prompt
@@ -124,6 +127,10 @@ through the same Q8 GEMM path (about 20 s extra load for a 2.6 GB UNet on the RX
 | `--vpred` / `--zsnr` / `--dynthresh` / `--rescale <f>` | schedule and guidance options |
 | `--seed <n>` | noise seed |
 | `--lora <file>` / `--lora-scale <f>` | merge a LoRA safetensors at load time (default scale 1.0; repeatable, `file:strength` syntax) |
+| `--ip-adapter <file> --ip-image <img>` | IP-Adapter (SDXL image prompt): reference image -> CLIP ViT-H/14 -> 4 tokens injected into every cross-attention layer |
+| `--ip-scale <f>` | IP-Adapter weight (default 0.6; 0 disables the branch; diffusers semantics, so it reads stronger than ComfyUI at the same value) |
+| `--ip-encoder <file>` | CLIP ViT-H/14 image tower; auto-detected next to the adapter (`image_encoder*/model.safetensors`) |
+| `--ip-check` | load the image tower + adapter only, print embedding statistics, exit |
 | `--unet-q8` | encode UNet weights to Q8_0 at load (safetensors, or GGUF F16/F32 tensors; fits fp32 SD1.5 / large SDXL checkpoints on 8 GB) |
 | `--init <img.png> --denoise <f>` | img2img (the source is VAE-encoded, not pixel-seeded) |
 | `--mask <mask.png> --mask-feather <n>` | inpaint; white = repaint, needs `--init` |
@@ -146,6 +153,18 @@ sdvk --line output/sdvk_xxx.png -m E:/sdvkmodel
 # latent -> PNG: only a VAE is needed
 sdvk --decode output/sdvk_latent.bin --vae E:/sdvkmodel/vae/noobai_vae_diffusers.safetensors --out out.png
 ```
+
+IP-Adapter needs the SDXL adapter (`ip-adapter_sdxl*.safetensors`) plus its CLIP ViT-H/14 image tower;
+both are loaded into a temporary arena before the UNet, so sampling only keeps the 5 MB of image K/V:
+
+```bash
+sdvk -m E:/sdvkmodel --ip-adapter E:/sdvkmodel/ipadapter/ip-adapter_sdxl_vit-h.safetensors \
+     --ip-image ref.png --ip-scale 0.5 --steps 30 --cfg 3 --vpred --width 512 --height 640 "your prompt"
+```
+
+`--ip-scale` follows diffusers (`hidden += scale * attention(q, image_tokens)` in both CFG branches, the
+negative branch running the zero-image projection), which reads stronger than the ComfyUI default at the
+same value; 0.3-0.6 is the useful range on the checkpoints tested here.
 
 `--line` reproduces the recorded model/prompt/negative/size/steps/cfg/seed/sampler/spacing and
 `vpred`/`zsnr`. LoRA strength, `--weights-host` and hires settings are not stored in the metadata.
@@ -322,6 +341,8 @@ webui/        static web front end
 - [x] K-quant GGUF (Q2_K–Q6_K) load-time conversion to Q8_0
 - [x] Hotspot optimization: fused tiled attention, vectorised q8 GEMM loads, bias epilogue
 - [x] LoRA key mapping and merge (Kohya / PEFT / LDM, UNet + text encoder); numerically verified
+- [x] IP-Adapter SDXL (CLIP ViT-H/14 + image_proj, 70 cross-attention layers); numerically verified
+- [ ] IP-Adapter in the web UI / server API, multiple adapters, `ip_adapter_masks`, Plus variants
 - [ ] DoRA magnitude application
 - [ ] int4 weight variant / Winograd 3×3
 

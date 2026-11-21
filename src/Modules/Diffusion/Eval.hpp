@@ -70,6 +70,10 @@ RunResult run(EvalModel& m, const GenParams& p, const ProgressFn& onProgress);
 // Needs only --vae (or a model dir containing vae/); no UNet, text encoders or tokenizers.
 RunResult decodeLatentFile(EvalModel& m, const GenParams& p, const std::string& latentPath, const ProgressFn& onProgress);
 
+// Diagnostic: load the CLIP image tower and the IP-Adapter, project the reference image and
+// print the embedding/token statistics without touching the UNet. Returns false on error.
+bool ipAdapterCheck(const GenParams& p, std::string& err);
+
 // Prints the PNG text metadata (tEXt/zTXt/iTXt) embedded by sdvk or other tools.
 // Returns 0 for a readable PNG (even without text chunks), 1 otherwise.
 int printPngMeta(const std::string& path);

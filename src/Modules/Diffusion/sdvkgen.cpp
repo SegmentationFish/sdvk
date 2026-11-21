@@ -38,6 +38,7 @@ using ofc::sdxl::RunResult;
 #include <map>
 #include <random>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -1380,6 +1381,17 @@ static BufRef add2(const BufRef& a, const BufRef& b, uint64_t n) {
     return add2Into(a, b, n, allocN(n));
 }
 
+// a += s*b. IP-Adapter adds its scaled attention branch to the text attention output before
+// the output projection; one pass instead of a scale copy plus an add. Bindings follow the
+// shader order (C, A, B): writing into A is fine, the same pattern add2 uses for residuals.
+static void addScaledInPlace(const BufRef& a, const BufRef& b, uint64_t n, float s) {
+    struct {
+        uint32_t n;
+        float s;
+    } pc{(uint32_t)n, s};
+    gDisp("add_scaled", {a, a, b}, &pc, ceilDiv(n, 256), 1, 1);
+}
+
 static BufRef mul2(const BufRef& a, const BufRef& b, uint64_t n) {
     BufRef c = allocN(n);
     struct {
@@ -1705,8 +1717,32 @@ struct XKvEntry {
 };
 static std::unordered_map<std::string, XKvEntry> gXKv;
 
+// ---------------------------------------------------------------- IP-Adapter state
+// The adapter is projected once per run: 4 image tokens per cross-attention layer, for the
+// conditional and the zero-image unconditional branch (diffusers feeds zeros through the same
+// projection for CFG).
+//
+// Layer order: diffusers enumerates attn processors in module registration order, which for
+// UNet2DConditionModel is down_blocks, up_blocks, mid_block (up_blocks is registered before
+// mid_block). The checkpoint's ip_adapter.N indices follow that order, while our forward walks
+// down, mid, up -- so the N-th attn2 call is NOT ip_adapter.N. order[] maps the traversal
+// position to the adapter index and is built once the UNet weights are resident.
+struct IpState {
+    uint32_t layers = 0, tokens = 4, dim = 2048;  // dim = width of the projected image tokens
+    std::vector<uint32_t> layerDim;               // hidden size of each cross-attention layer
+    std::vector<uint32_t> order;                  // traversal position -> adapter layer index
+    std::vector<uint64_t> kOff, vOff;             // element offsets into k / v
+    std::vector<float> k, v;                      // [layer][branch][token][layerDim]
+    BufRef kDev, vDev;                            // param-arena copies, uploaded after the UNet load
+};
+static IpState gIp;
+static uint32_t gIpLayerIdx = 0;
+static int gIpBranch = 0;  // 0 = conditional, 1 = zero-image unconditional
+static float gIpScale = 0.0f;
+
 static BufRef crossAttention(const BufRef& xq, const BufRef& xkv, const std::string& p, uint32_t Tq, uint32_t Tk,
-                             uint32_t C, uint32_t heads) {
+                             uint32_t C, uint32_t heads, const BufRef* ipK = nullptr, const BufRef* ipV = nullptr,
+                             float ipScale = 0.0f) {
     BufRef q = linear(xq, p + ".to_q", Tq);
     static int noXkv = -1;
     if (noXkv < 0) noXkv = std::getenv("OFC_NO_XKV") ? 1 : 0;
@@ -1737,6 +1773,18 @@ static BufRef crossAttention(const BufRef& xq, const BufRef& xkv, const std::str
         v = linear(xkv, p + ".to_v", Tk);
     }
     BufRef o = attnCore(q, k, v, Tq, Tk, C, heads);
+    // diffusers IPAdapterAttnProcessor2_0: hidden += scale * attention(q, to_k_ip(ip), to_v_ip(ip)).
+    // The image branch is a separate softmax over the 4 image tokens, not extra K/V rows in the
+    // text softmax, so the text attention keeps its full weight.
+    static int skipIp = -1;
+    if (skipIp < 0) skipIp = std::getenv("OFC_IP_SKIP_ATTN") ? 1 : 0;
+    if (ipK && ipV && ipScale != 0.0f && !skipIp) {
+        static int slowIp = -1;
+        if (slowIp < 0) slowIp = std::getenv("OFC_IP_SLOWATTN") ? 1 : 0;
+        BufRef ipo = slowIp ? attnCoreSlow(q, *ipK, *ipV, Tq, gIp.tokens, C, heads, false)
+                            : attnCore(q, *ipK, *ipV, Tq, gIp.tokens, C, heads);
+        addScaledInPlace(o, ipo, (uint64_t)Tq * C, ipScale);
+    }
     return linear(o, p + ".to_out.0", Tq);
 }
 
@@ -2208,7 +2256,28 @@ static BufRef spatialTransformer(const BufRef& x, const std::string& p, const Bu
         { P2 pa{(uint32_t)((uint64_t)P * C), 0}; gDisp("add2", {t, t, a}, &pa, ceilDiv((uint64_t)P * C, 256), 1, 1); }
         n = layernorm(t, tp + ".norm2", P, C);
         if (l0) dt("_ln2", n, (uint64_t)P * C);
-        a = crossAttention(n, ctx, tp + ".attn2", P, 77, C, heads);
+        BufRef ipk, ipv;
+        const BufRef* ipKp = nullptr;
+        const BufRef* ipVp = nullptr;
+        float ipS = 0.0f;
+        if (gIp.layers) {
+            if (gIpLayerIdx >= gIp.order.size())
+                fail("IP-Adapter has fewer layers than the UNet cross-attention stack (" +
+                     std::to_string(gIpLayerIdx) + ")");
+            uint32_t idx = gIp.order[gIpLayerIdx++];
+            if (gIp.layerDim[idx] != C)
+                fail("IP-Adapter layer " + std::to_string(idx) + " expects " + std::to_string(gIp.layerDim[idx]) +
+                     " channels but the UNet block has " + std::to_string(C));
+            uint64_t stride = (uint64_t)gIp.tokens * C * 4;
+            uint64_t off = (gIp.kOff[idx] + (uint64_t)gIpBranch * gIp.tokens * C) * 4;
+            uint64_t voff = (gIp.vOff[idx] + (uint64_t)gIpBranch * gIp.tokens * C) * 4;
+            ipk = BufRef{gIp.kDev.buf, gIp.kDev.offset + off, stride};
+            ipv = BufRef{gIp.vDev.buf, gIp.vDev.offset + voff, stride};
+            ipKp = &ipk;
+            ipVp = &ipv;
+            ipS = gIpScale;
+        }
+        a = crossAttention(n, ctx, tp + ".attn2", P, 77, C, heads, ipKp, ipVp, ipS);
         if (l0) dt("_a2", a, (uint64_t)P * C);
         { P2 pa{(uint32_t)((uint64_t)P * C), 0}; gDisp("add2", {t, t, a}, &pa, ceilDiv((uint64_t)P * C, 256), 1, 1); }
         n = layernorm(t, tp + ".norm3", P, C);
@@ -2335,6 +2404,7 @@ static BufRef unetForwardSd15(const BufRef& lat, const BufRef& temb, const BufRe
 }
 
 static BufRef unetForward(const BufRef& lat, const BufRef& temb, const BufRef& ctx, uint32_t H, uint32_t Wd) {
+    gIpLayerIdx = 0;  // cross-attention layers are visited in checkpoint order
     if (gArch == 1) return unetForwardSd15(lat, temb, ctx, H, Wd);
     // stage tags mirror ref/unet_stages.py so dbg_<tag>.f32 files line up 1:1
     static const char* kDnRes[6] = {"d0_r0", "d0_r1", "d1_r0", "d1_r1", "d2_r0", "d2_r1"};
@@ -4035,6 +4105,567 @@ static std::vector<float> buildLatentMask(const std::string& path, uint32_t cw, 
     return m;
 }
 
+// ================================================================ IP-Adapter
+// The reference image goes through the CLIP ViT-H/14 vision tower (the encoder the SDXL
+// adapter was trained against), then through image_proj (Linear 1024 -> 4*2048 + LayerNorm)
+// to four 2048-wide tokens. Every cross-attention layer projects those tokens with its own
+// to_k_ip / to_v_ip; the K/V are computed once per run and reused by every step and by both
+// CFG branches, so sampling pays only two 4-token attentions per layer.
+//
+// The vision tower and the adapter weights are each loaded into a temporary arena, used, and
+// dropped before the UNet goes in: the two together are ~1.1 GB, which does not fit next to
+// a 2.9 GB Q8 UNet on an 8 GB card.
+
+static ModelFile gIpEnc, gIpAd;
+static std::vector<uint32_t> gIpLayerKeys;  // checkpoint indices, in cross-attention order
+
+static uint64_t stBytesAsQ8(Safetensors& st, const std::string& prefix) {
+    uint64_t need = 0;
+    for (auto& t : st.tensors()) {
+        if (!prefix.empty() && t.name.rfind(prefix, 0) != 0) continue;
+        uint64_t ne = st.numel(t);
+        bool q8 = t.shape.size() >= 2 && ne >= 1024 && ne % 32 == 0;
+        need += q8 ? ne + (ne / 32) * 4 : ne * 4;
+    }
+    return need;
+}
+
+static uint64_t stBytesF32(Safetensors& st, const std::string& prefix) {
+    uint64_t need = 0;
+    for (auto& t : st.tensors()) {
+        if (!prefix.empty() && t.name.rfind(prefix, 0) != 0) continue;
+        need += st.numel(t) * 4;
+    }
+    return need;
+}
+
+// Same teardown/rebuild dance as loadOneTextEncoder: the driver keeps the old pages alive for
+// a moment, so the arena is destroyed, the device idles briefly, then the new one is taken.
+static void beginTempArena(uint64_t paramBytes, uint64_t stepBytes, uint64_t scratchBytes) {
+    clearWeights();
+    G.paramBytes = paramBytes;
+    G.paramArena.destroy();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    G.eng.initArenas(stepBytes, scratchBytes);
+    G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
+}
+
+// linear() over a row slice of a fused projection. Unused by the ViT-H tower (its q/k/v are
+// separate matrices) but kept for the bigG variant, whose attention packs them into one weight.
+static BufRef linearRows(const BufRef& x, const std::string& wn, uint32_t rows, uint32_t rowOff, uint32_t nout) {
+    uint32_t R, K;
+    linearDims(wn, R, K);
+    if (rowOff + nout > R) fail("linearRows: slice past the end of " + wn);
+    BufRef y = allocN((uint64_t)rows * nout);
+    if (isQ8(wn)) {
+        const BufRef& bq = WQ(wn);
+        const BufRef& bs = WS(wn);
+        BufRef q{bq.buf, bq.offset + (uint64_t)rowOff * K, bq.size - (uint64_t)rowOff * K};
+        BufRef s{bs.buf, bs.offset + (uint64_t)(rowOff * K / 32) * 4, bs.size - (uint64_t)(rowOff * K / 32) * 4};
+        gemmNtQ8(x, q, y, s, rows, nout, K);
+    } else {
+        const BufRef& b = W(wn);
+        BufRef w{b.buf, b.offset + (uint64_t)rowOff * K * 4, b.size - (uint64_t)rowOff * K * 4};
+        gemmNt(x, w, y, rows, nout, K);
+    }
+    return y;
+}
+
+static void biasSlice(const BufRef& y, const std::string& bn, uint32_t rowOff, uint32_t n, uint32_t rows) {
+    if (!hasW(bn)) return;
+    const BufRef& b = W(bn);
+    BufRef s{b.buf, b.offset + (uint64_t)rowOff * 4, (uint64_t)n * 4};
+    biasAddLast(y, s, rows, n);
+}
+
+// PIL/CLIP bicubic kernel (a = -0.5).
+static float cubicWeight(float x) {
+    const float a = -0.5f;
+    x = std::fabs(x);
+    if (x <= 1.0f) return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+    if (x < 2.0f) return (((x - 5.0f) * x + 8.0f) * x - 4.0f) * a;
+    return 0.0f;
+}
+
+// CLIPImageProcessor: resize the shortest edge to 224 (bicubic), center crop 224, rescale and
+// normalize with the OpenAI CLIP constants. The crop is folded into the resample so a single
+// separable pass covers both.
+static void clipPreprocess(const std::string& path, std::vector<float>& out) {
+    std::vector<uint8_t> rgb;
+    uint32_t w = 0, h = 0;
+    if (!readPng(path, rgb, w, h) && !readPpm(path, rgb, w, h))
+        fail("cannot read IP-Adapter reference image " + path + " (PNG or PPM)");
+    if (!w || !h) fail("IP-Adapter reference image is empty: " + path);
+    const uint32_t S = 224;
+    uint32_t side = std::min(w, h);
+    uint32_t ox = (w - side) / 2, oy = (h - side) / 2;
+    float scale = (float)side / (float)S;
+    float fs = std::max(1.0f, scale);
+    float support = 2.0f * fs;
+    auto axis = [&](uint32_t off, std::vector<std::vector<std::pair<int, float>>>& ws) {
+        ws.resize(S);
+        for (uint32_t i = 0; i < S; i++) {
+            float center = (float)off + ((float)i + 0.5f) * scale;
+            int lo = (int)std::floor(center - support - 0.5f);
+            int hi = (int)std::ceil(center + support - 0.5f);
+            float sum = 0;
+            for (int j = lo; j <= hi; j++) {
+                float wgt = cubicWeight(((float)j + 0.5f - center) / fs);
+                if (wgt == 0.0f) continue;
+                int idx = std::min<int>(std::max<int>(j, (int)off), (int)(off + side - 1));
+                ws[i].push_back({idx, wgt});
+                sum += wgt;
+            }
+            if (sum != 0.0f)
+                for (auto& e : ws[i]) e.second /= sum;
+        }
+    };
+    std::vector<std::vector<std::pair<int, float>>> wx, wy;
+    axis(ox, wx);
+    axis(oy, wy);
+    const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+    const float sd[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+    out.assign((size_t)3 * S * S, 0.0f);
+    for (uint32_t y = 0; y < S; y++) {
+        for (uint32_t x = 0; x < S; x++) {
+            float acc[3] = {0, 0, 0};
+            for (auto& yw : wy[y]) {
+                const uint8_t* row = &rgb[((size_t)yw.first * w) * 3];
+                for (auto& xw : wx[x]) {
+                    const uint8_t* px = row + (size_t)xw.first * 3;
+                    float ww = xw.second * yw.second;
+                    acc[0] += ww * px[0];
+                    acc[1] += ww * px[1];
+                    acc[2] += ww * px[2];
+                }
+            }
+            for (int c = 0; c < 3; c++)
+                out[(size_t)c * S * S + (size_t)y * S + x] = (acc[c] / 255.0f - mean[c]) / sd[c];
+        }
+    }
+}
+
+// Conv2d(3 -> D, 14, stride 14) has no kernel here, and the input is a single 224x224 image:
+// doing the 192 M MAC patch embedding on the host costs a fraction of a second once per run.
+static void patchEmbedHost(const std::vector<float>& img, const std::vector<float>& pw,
+                           const std::vector<float>& pb, const std::vector<float>& pos,
+                           const std::vector<float>& cls, uint32_t D, std::vector<float>& tok) {
+    const uint32_t P = 14, G = 16, K = 3 * P * P;
+    tok.assign((size_t)(1 + G * G) * D, 0.0f);
+    std::vector<float> patch(K);
+    for (uint32_t py = 0; py < G; py++) {
+        for (uint32_t px = 0; px < G; px++) {
+            for (uint32_t c = 0; c < 3; c++)
+                for (uint32_t ky = 0; ky < P; ky++)
+                    for (uint32_t kx = 0; kx < P; kx++)
+                        patch[(c * P + ky) * P + kx] =
+                            img[(size_t)c * 224 * 224 + (size_t)(py * P + ky) * 224 + px * P + kx];
+            uint32_t t = 1 + py * G + px;
+            float* dst = &tok[(size_t)t * D];
+            for (uint32_t c = 0; c < D; c++) {
+                const float* wc = &pw[(size_t)c * K];
+                float acc = pb[c];
+                for (uint32_t k = 0; k < K; k++) acc += wc[k] * patch[k];
+                dst[c] = acc + pos[(size_t)t * D + c];
+            }
+        }
+    }
+    for (uint32_t c = 0; c < D; c++) tok[c] = cls[c] + pos[c];
+}
+
+static std::string findIpEncoder(const GenParams& p) {
+    std::error_code ec;
+    std::vector<std::string> cands;
+    if (!p.ipAdapter.empty()) {
+        std::filesystem::path ad(p.ipAdapter);
+        std::string dir = ad.parent_path().string();
+        if (!dir.empty()) {
+            for (const char* rel : {"image_encoder/model.safetensors", "image_encoder_vith/model.safetensors",
+                                    "../image_encoder/model.safetensors", "../image_encoder_vith/model.safetensors",
+                                    "../models/image_encoder/model.safetensors"})
+                cands.push_back((std::filesystem::path(dir) / rel).string());
+        }
+    }
+    if (!p.models.modelDir.empty()) {
+        for (const char* rel : {"ipadapter/image_encoder/model.safetensors",
+                                "ipadapter/image_encoder_vith/model.safetensors",
+                                "image_encoder/model.safetensors", "ip-adapter/image_encoder/model.safetensors"})
+            cands.push_back((std::filesystem::path(p.models.modelDir) / rel).string());
+    }
+    for (auto& c : cands)
+        if (std::filesystem::is_regular_file(c, ec)) return c;
+    fail("IP-Adapter needs the CLIP ViT-H/14 image tower; pass --ip-encoder <model.safetensors> "
+         "(no image_encoder/model.safetensors found next to the adapter)");
+    return "";
+}
+
+// CLIP ViT-H/14 forward, returning the 1024-wide projected CLS embedding (image_embeds).
+// The h94 encoder is in transformers CLIPVisionModel layout: vision_model.* plus a separate
+// visual_projection head, with q/k/v projections stored one per matrix.
+static std::vector<float> clipVisionForward(const std::string& encPath, const std::vector<float>& pixels) {
+    Safetensors& st = gIpEnc.st;
+    if (!st.ensureOpen(encPath)) fail("cannot open image encoder " + encPath + ": " + st.error());
+    // the four host-side tensors the patch embedding needs, read before the GPU upload
+    auto readOpt = [&](const char* n) {
+        return st.find(n) ? st.readF32(n) : std::vector<float>();
+    };
+    std::vector<float> pw = readOpt("vision_model.embeddings.patch_embedding.weight");
+    std::vector<float> pb = readOpt("vision_model.embeddings.patch_embedding.bias");
+    std::vector<float> pos = readOpt("vision_model.embeddings.position_embedding.weight");
+    std::vector<float> cls = readOpt("vision_model.embeddings.class_embedding");
+    if (pw.empty() || pos.empty() || cls.empty())
+        fail("image encoder lacks vision_model.embeddings.patch_embedding/position_embedding");
+    if (pb.empty()) pb.assign(cls.size(), 0.0f);  // OpenCLIP's patch conv has no bias
+
+    bool fp32Enc = std::getenv("OFC_IP_FP32") != nullptr;
+    uint64_t need = fp32Enc ? stBytesF32(st, "vision_model.") + stBytesF32(st, "visual_projection.")
+                            : stBytesAsQ8(st, "vision_model.") + stBytesAsQ8(st, "visual_projection.");
+    beginTempArena(need + (160ull << 20), 256ull << 20, 256ull << 20);
+    std::printf("image encoder arena: %.0f MB (%s)\n", G.paramBytes / 1048576.0, fp32Enc ? "fp32" : "Q8");
+    auto t0 = std::chrono::steady_clock::now();
+    loadSafetensors(st, "vision_model.", "vis.", Part::All, "image encoder", !fp32Enc);
+    loadSafetensors(st, "visual_projection.", "vis.proj.", Part::All, "image encoder head", !fp32Enc);
+    gSTs.push_back({"", &st});
+    std::printf("image encoder loaded in %.1f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+
+    uint32_t D = wdimT("vis.pre_layrnorm.weight");
+    uint32_t ffn = wdimT("vis.encoder.layers.0.mlp.fc1.weight");
+    uint32_t heads = 16;
+    uint32_t layers = 0;
+    while (hasAnyW("vis.encoder.layers." + std::to_string(layers) + ".layer_norm1.weight")) layers++;
+    uint32_t projDim = 0, projCols = 0;
+    linearDims("vis.proj.weight", projDim, projCols);
+    const uint32_t T = 257;
+    // The h94 conversion declares hidden_act "gelu" (erf), not CLIP's original quick_gelu;
+    // measured against transformers the erf variant matches to cos 0.99997, quick_gelu only 0.91.
+    uint32_t act = 4;
+    if (const char* e = std::getenv("OFC_IP_ACT")) act = (uint32_t)std::atoi(e);
+    std::printf("clip vision: %u layers, D %u, ffn %u, heads %u, %u tokens, act %u\n", layers, D, ffn, heads, T, act);
+
+    std::vector<float> tok;
+    patchEmbedHost(pixels, pw, pb, pos, cls, D, tok);
+    const char* stageDump = std::getenv("OFC_IP_STAGE_DUMP");
+    if (stageDump) {
+        std::string p = std::string(stageDump) + "_tok.f32";
+        if (FILE* f = std::fopen(p.c_str(), "wb")) {
+            std::fwrite(tok.data(), 4, tok.size(), f);
+            std::fclose(f);
+        }
+    }
+    BufRef x = G.scratchArena.alloc((uint64_t)T * D * 4);
+    G.eng.uploadNow(x, tok.data(), tok.size() * 4);
+
+    G.eng.beginStep();
+    uint64_t mark = G.eng.stepArena().used();
+    BufRef dump0, dumpLast;
+    if (stageDump) {
+        dump0 = G.scratchArena.alloc((uint64_t)T * D * 4);
+        dumpLast = G.scratchArena.alloc((uint64_t)T * D * 4);
+    }
+    BufRef h = layernorm(x, "vis.pre_layrnorm", T, D);
+    copyInto(x, 0, h, (uint64_t)T * D * 4);  // the tower's residual stream starts after pre_layrnorm
+    arenaRewind(mark);
+    for (uint32_t l = 0; l < layers; l++) {
+        std::string lp = "vis.encoder.layers." + std::to_string(l) + ".";
+        BufRef n = layernorm(x, lp + "layer_norm1", T, D);
+        BufRef q = linear(n, lp + "self_attn.q_proj", T);
+        BufRef k = linear(n, lp + "self_attn.k_proj", T);
+        BufRef v = linear(n, lp + "self_attn.v_proj", T);
+        BufRef o = attnCore(q, k, v, T, T, D, heads);
+        o = linear(o, lp + "self_attn.out_proj", T);
+        BufRef x1 = add2(x, o, (uint64_t)T * D);
+        n = layernorm(x1, lp + "layer_norm2", T, D);
+        n = linear(n, lp + "mlp.fc1", T);
+        n = unary(n, (uint64_t)T * ffn, act);
+        n = linear(n, lp + "mlp.fc2", T);
+        BufRef x2 = add2(x1, n, (uint64_t)T * D);
+        copyInto(x, 0, x2, (uint64_t)T * D * 4);
+        if (stageDump && (l == 0 || l + 1 == layers))
+            copyInto(l == 0 ? dump0 : dumpLast, 0, x2, (uint64_t)T * D * 4);
+        arenaRewind(mark);
+    }
+    BufRef pooled = layernorm(x, "vis.post_layernorm", 1, D);
+    BufRef out = allocN(projDim);
+    if (isQ8("vis.proj.weight"))
+        gemmNtQ8(pooled, WQ("vis.proj.weight"), out, WS("vis.proj.weight"), 1, projDim, projCols);
+    else
+        gemmNt(pooled, W("vis.proj.weight"), out, 1, projDim, projCols);
+    G.eng.endStep();
+    G.eng.waitStep();
+    if (stageDump) {
+        std::vector<float> v((size_t)T * D);
+        const char* names[2] = {"_l0.f32", "_l31.f32"};
+        for (int i = 0; i < 2; i++) {
+            G.eng.downloadNow(i == 0 ? dump0 : dumpLast, v.data(), v.size() * 4);
+            std::string p = std::string(stageDump) + names[i];
+            if (FILE* f = std::fopen(p.c_str(), "wb")) {
+                std::fwrite(v.data(), 4, v.size(), f);
+                std::fclose(f);
+            }
+        }
+    }
+    std::vector<float> emb(projDim);
+    G.eng.downloadNow(out, emb.data(), emb.size() * 4);
+    double rms = 0;
+    for (float v : emb) rms += (double)v * v;
+    std::printf("image embedding: %u dims, rms %.4f\n", projDim, std::sqrt(rms / (double)emb.size()));
+    return emb;
+}
+
+// ImageProjModel: Linear(1024 -> 4*2048), reshape to 4 tokens, LayerNorm(2048).
+static std::vector<float> imageProjForward(const std::vector<float>& emb, bool zero) {
+    std::vector<float> in = emb;
+    if (zero) std::fill(in.begin(), in.end(), 0.0f);
+    BufRef x = G.scratchArena.alloc((uint64_t)in.size() * 4);
+    G.eng.uploadNow(x, in.data(), in.size() * 4);
+    G.eng.beginStep();
+    BufRef y = linear(x, "image_proj.proj", 1);
+    BufRef n = layernorm(y, "image_proj.norm", 4, 2048);
+    G.eng.endStep();
+    G.eng.waitStep();
+    std::vector<float> out((size_t)4 * 2048);
+    G.eng.downloadNow(n, out.data(), out.size() * 4);
+    return out;
+}
+
+// to_k_ip / to_v_ip for every cross-attention layer, both branches, into host K/V tables.
+// Each layer projects the 2048-wide image tokens down to that block's hidden size (320/640/1280),
+// so the tables are a packed sequence of per-layer slices rather than a rectangular array.
+static void projectIpLayers(const std::vector<float>& cond, const std::vector<float>& uncond) {
+    uint32_t L = (uint32_t)gIpLayerKeys.size();
+    gIp.layerDim.assign(L, 0);
+    gIp.kOff.assign(L, 0);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < L; i++) {
+        uint32_t r = 0, c = 0;
+        linearDims("ip_adapter." + std::to_string(gIpLayerKeys[i]) + ".to_k_ip.weight", r, c);
+        if (c != gIp.dim)
+            fail("IP-Adapter layer " + std::to_string(i) + " expects " + std::to_string(c) +
+                 "-wide tokens, image_proj produced " + std::to_string(gIp.dim));
+        gIp.layerDim[i] = r;
+        gIp.kOff[i] = total;
+        total += (uint64_t)2 * gIp.tokens * r;
+    }
+    gIp.vOff = gIp.kOff;
+    gIp.k.assign(total, 0.0f);
+    gIp.v.assign(total, 0.0f);
+    BufRef aC = G.scratchArena.alloc((uint64_t)gIp.tokens * gIp.dim * 4);
+    BufRef aU = G.scratchArena.alloc((uint64_t)gIp.tokens * gIp.dim * 4);
+    G.eng.uploadNow(aC, cond.data(), cond.size() * 4);
+    G.eng.uploadNow(aU, uncond.data(), uncond.size() * 4);
+    BufRef kAll = G.scratchArena.alloc(total * 4);
+    BufRef vAll = G.scratchArena.alloc(total * 4);
+    G.eng.beginStep();
+    for (uint32_t i = 0; i < L; i++) {
+        std::string base = "ip_adapter." + std::to_string(gIpLayerKeys[i]) + ".";
+        uint32_t h = gIp.layerDim[i];
+        uint64_t stride = (uint64_t)gIp.tokens * h * 4;
+        for (int br = 0; br < 2; br++) {
+            BufRef in = br ? aU : aC;
+            uint64_t off = (gIp.kOff[i] + (uint64_t)br * gIp.tokens * h) * 4;
+            BufRef ko{kAll.buf, kAll.offset + off, stride};
+            BufRef vo{vAll.buf, vAll.offset + off, stride};
+            gemmNtQ8(in, WQ(base + "to_k_ip.weight"), ko, WS(base + "to_k_ip.weight"), gIp.tokens, h, gIp.dim);
+            gemmNtQ8(in, WQ(base + "to_v_ip.weight"), vo, WS(base + "to_v_ip.weight"), gIp.tokens, h, gIp.dim);
+        }
+    }
+    G.eng.endStep();
+    G.eng.waitStep();
+    G.eng.downloadNow(kAll, gIp.k.data(), total * 4);
+    G.eng.downloadNow(vAll, gIp.v.data(), total * 4);
+    std::printf("ip-adapter: %u layers x %u tokens projected (%.1f MB K/V)\n", L, gIp.tokens,
+                2.0 * (double)total * 4 / 1048576.0);
+    // OFC_IP_KV_DUMP=<prefix> writes <prefix>_k.f32 / <prefix>_v.f32 (cond branch then zero
+    // branch per layer, see kOff) plus <prefix>_layers.txt so tools/ip_ref.py can check the
+    // per-layer projections against torch.
+    if (const char* df = std::getenv("OFC_IP_KV_DUMP")) {
+        auto dump = [&](const char* suffix, const float* src) {
+            std::string p = std::string(df) + suffix;
+            if (FILE* f = std::fopen(p.c_str(), "wb")) {
+                std::fwrite(src, 4, total, f);
+                std::fclose(f);
+            }
+        };
+        dump("_k.f32", gIp.k.data());
+        dump("_v.f32", gIp.v.data());
+        std::string pl = std::string(df) + "_layers.txt";
+        if (FILE* f = std::fopen(pl.c_str(), "w")) {
+            std::fprintf(f, "%u %u %u\n", L, gIp.tokens, gIp.dim);
+            for (uint32_t i = 0; i < L; i++)
+                std::fprintf(f, "%u %u %llu\n", gIpLayerKeys[i], gIp.layerDim[i],
+                             (unsigned long long)gIp.kOff[i]);
+            std::fclose(f);
+        }
+        std::printf("ip-adapter: K/V dumped to %s{k,v}.f32\n", df);
+    }
+}
+
+// Loads both halves of the adapter, runs the reference image through the tower, and fills gIp.
+static void prepareIpAdapter(const GenParams& p) {
+    gIp = IpState();
+    gIpLayerKeys.clear();
+    if (p.ipAdapter.empty() || p.ipImage.empty()) return;
+    if (gArch == 1) fail("IP-Adapter needs SDXL cross-attention; the SD1.5 forward is not wired for it");
+    if (p.ipScale <= 0.0f) {
+        std::printf("ip-adapter: scale 0, adapter skipped\n");
+        return;
+    }
+    std::string encPath = p.ipEncoder.empty() ? findIpEncoder(p) : p.ipEncoder;
+
+    std::vector<float> pixels;
+    if (const char* pf = std::getenv("OFC_IP_PIXELS")) {
+        FILE* f = std::fopen(pf, "rb");
+        if (!f) fail(std::string("cannot open OFC_IP_PIXELS ") + pf);
+        pixels.resize((size_t)3 * 224 * 224);
+        if (std::fread(pixels.data(), 4, pixels.size(), f) != pixels.size()) fail("short OFC_IP_PIXELS file");
+        std::fclose(f);
+        std::printf("ip-adapter: pixels from %s\n", pf);
+    } else {
+        clipPreprocess(p.ipImage, pixels);
+    }
+    if (const char* df = std::getenv("OFC_IP_PIX_DUMP")) {
+        if (FILE* f = std::fopen(df, "wb")) {
+            std::fwrite(pixels.data(), 4, pixels.size(), f);
+            std::fclose(f);
+            std::printf("ip-adapter: pixels dumped to %s\n", df);
+        }
+    }
+
+    std::vector<float> emb = clipVisionForward(encPath, pixels);
+    if (const char* df = std::getenv("OFC_IP_EMB_DUMP")) {
+        if (FILE* f = std::fopen(df, "wb")) {
+            std::fwrite(emb.data(), 4, emb.size(), f);
+            std::fclose(f);
+            std::printf("ip-adapter: embedding dumped to %s\n", df);
+        }
+    }
+
+    // ---- adapter weights
+    Safetensors& ad = gIpAd.st;
+    if (!ad.ensureOpen(p.ipAdapter)) fail("cannot open IP-Adapter " + p.ipAdapter + ": " + ad.error());
+    if (!containsPrefix(ad, "ip_adapter.") || !containsPrefix(ad, "image_proj."))
+        fail("not an IP-Adapter checkpoint (needs image_proj.* and ip_adapter.*): " + p.ipAdapter);
+    uint64_t need = stBytesAsQ8(ad, "");
+    beginTempArena(need + (96ull << 20), 128ull << 20, 128ull << 20);
+    std::printf("ip-adapter arena: %.0f MB\n", G.paramBytes / 1048576.0);
+    loadSafetensors(ad, "", "", Part::All, "ip-adapter", true);
+
+    uint32_t r = 0, c = 0;
+    linearDims("image_proj.proj.weight", r, c);
+    gIp.dim = r / 4;
+    gIp.tokens = 4;
+    if (gIp.dim != 2048) fail("IP-Adapter cross-attention width is " + std::to_string(gIp.dim) + ", expected 2048 (SDXL)");
+
+    // checkpoint indices are the attn_processor enumeration: odd entries are the cross-attn
+    // layers, so the list is sorted and consumed in traversal order
+    for (auto& kv : gWQ) {
+        const std::string& k = kv.first;
+        if (k.rfind("ip_adapter.", 0) != 0 || k.find(".to_k_ip.weight") == std::string::npos) continue;
+        uint32_t idx = (uint32_t)std::atoi(k.c_str() + std::strlen("ip_adapter."));
+        gIpLayerKeys.push_back(idx);
+    }
+    std::sort(gIpLayerKeys.begin(), gIpLayerKeys.end());
+    gIp.layers = (uint32_t)gIpLayerKeys.size();
+    if (!gIp.layers) fail("IP-Adapter checkpoint has no ip_adapter.N.to_k_ip tensors");
+
+    std::vector<float> cond = imageProjForward(emb, false);
+    std::vector<float> uncond = imageProjForward(emb, true);
+    if (const char* df = std::getenv("OFC_IP_TOK_DUMP")) {
+        if (FILE* f = std::fopen(df, "wb")) {
+            std::fwrite(cond.data(), 4, cond.size(), f);
+            std::fwrite(uncond.data(), 4, uncond.size(), f);
+            std::fclose(f);
+            std::printf("ip-adapter: tokens dumped to %s\n", df);
+        }
+    }
+    double rms = 0;
+    for (float v : cond) rms += (double)v * v;
+    std::printf("ip tokens: rms %.4f (cond), scale %.2f\n", std::sqrt(rms / (double)cond.size()), p.ipScale);
+    projectIpLayers(cond, uncond);
+    gIpScale = p.ipScale;
+}
+
+// Maps our down/mid/up traversal onto the checkpoint's down/up/mid index order. Called once the
+// UNet weights are loaded, so the real cross-attention stack is available to verify the widths.
+static void buildIpOrder() {
+    gIp.order.clear();
+    if (!gIp.layers) return;
+    struct Ent {
+        int cat, blk, tb;  // traversal category: 0 = input, 1 = middle, 2 = output
+        std::string key;
+    };
+    std::vector<Ent> tr;
+    auto consider = [&](const std::string& k) {
+        static const char* suffix = ".attn2.to_k.weight";
+        const size_t sl = std::strlen(suffix);
+        if (k.size() <= sl || k.compare(k.size() - sl, sl, suffix) != 0) return;
+        int blk = 0, tb = 0;
+        if (std::sscanf(k.c_str(), "input_blocks.%d.1.transformer_blocks.%d.", &blk, &tb) == 2)
+            tr.push_back({0, blk, tb, k});
+        else if (std::sscanf(k.c_str(), "middle_block.1.transformer_blocks.%d.", &tb) == 1)
+            tr.push_back({1, 0, tb, k});
+        else if (std::sscanf(k.c_str(), "output_blocks.%d.1.transformer_blocks.%d.", &blk, &tb) == 2)
+            tr.push_back({2, blk, tb, k});
+    };
+    // GGUF-only models populate gWQ/gW but not gDims; safetensors fill all three.
+    for (auto& kv : gWQ) consider(kv.first);
+    for (auto& kv : gW) consider(kv.first);
+    if (tr.size() != gIp.layers)
+        fail("IP-Adapter has " + std::to_string(gIp.layers) + " layers but the UNet has " +
+             std::to_string(tr.size()) + " cross-attention layers");
+    std::sort(tr.begin(), tr.end(),
+              [](const Ent& a, const Ent& b) { return std::tie(a.cat, a.blk, a.tb) < std::tie(b.cat, b.blk, b.tb); });
+
+    // adapter index order: input blocks, then output blocks, then the middle block
+    auto arank = [](const Ent& e) { return std::make_tuple(e.cat == 1 ? 2 : (e.cat == 2 ? 1 : 0), e.blk, e.tb); };
+    std::vector<uint32_t> byAdapter(tr.size());
+    for (uint32_t i = 0; i < tr.size(); i++) byAdapter[i] = i;
+    std::sort(byAdapter.begin(), byAdapter.end(),
+              [&](uint32_t a, uint32_t b) { return arank(tr[a]) < arank(tr[b]); });
+    gIp.order.assign(tr.size(), 0);
+    for (uint32_t ai = 0; ai < byAdapter.size(); ai++) {
+        uint32_t pos = byAdapter[ai];
+        gIp.order[pos] = ai;
+        uint32_t w = wdimT(tr[pos].key);
+        if (gIp.layerDim[ai] != w)
+            fail("IP-Adapter layer " + std::to_string(ai) + " is " + std::to_string(gIp.layerDim[ai]) +
+                 " wide but " + tr[pos].key + " expects " + std::to_string(w));
+    }
+}
+
+// Copies the host K/V tables into the UNet's parameter arena; called right after loadUnet().
+static void uploadIpLayers() {
+    if (!gIp.layers) return;
+    buildIpOrder();
+    uint64_t n = gIp.k.size();
+    gIp.kDev = G.paramArena.alloc(n * 4);
+    gIp.vDev = G.paramArena.alloc(n * 4);
+    G.eng.uploadNow(gIp.kDev, gIp.k.data(), n * 4);
+    G.eng.uploadNow(gIp.vDev, gIp.v.data(), n * 4);
+    std::printf("ip-adapter: %.1f MB K/V resident\n", 2.0 * (double)n * 4 / 1048576.0);
+}
+
+// Diagnostic entry point: run the image tower and the adapter without a UNet.
+bool ipAdapterCheck(const GenParams& in, std::string& err) {
+    GenParams p = in;
+    if (p.spvDir.empty()) p.spvDir = "shaders";
+    if (p.ipAdapter.empty() || p.ipImage.empty()) {
+        err = "--ip-check needs --ip-adapter and --ip-image";
+        return false;
+    }
+    try {
+        if (!ensureDevice(p.spvDir, err, p.device)) return false;
+        gArch = 2;  // the check only exists for the SDXL adapter
+        prepareIpAdapter(p);
+        std::printf("ip-check: ok, %u layers x %u tokens, dim %u\n", gIp.layers, gIp.tokens, gIp.dim);
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
 // ================================================================ generate
 
 // Peek at the UNet file before any text encoding: the TE stage needs to know whether a CLIP-G
@@ -4217,6 +4848,14 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             return res;
         }
 
+        // ---------------- IP-Adapter reference image
+        // Runs before the UNet goes back in: the ViT-H tower and the adapter weights each take
+        // a temporary arena of their own, and only the 4-token K/V tables survive (~9 MB).
+        if (!p.ipAdapter.empty() && !p.ipImage.empty()) {
+            report(onProgress, Progress::Kind::Encode, 0, 0, 0.16, 0.0, "ip-adapter: encoding reference image");
+            prepareIpAdapter(p);
+        }
+
         // ---------------- img2img / inpaint: real VAE encode
         // The old path wrote pixels * scaling_factor straight into the latent (all four channels a
         // copy of one image), which is why anything below denoise 0.7 came out washed out and only
@@ -4314,6 +4953,7 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, !p.weightsHost, p.weightsHost);
         loadUnet(p);
+        uploadIpLayers();
         uint32_t Lw = width / 8, Lh = height / 8;
         uint32_t stepMB = p.stepMb ? p.stepMb : (width >= 768 || height >= 768 ? 1500u : 900u);
         uint32_t scratchMB = p.scratchMb ? p.scratchMb : (width >= 768 || height >= 768 ? 900u : 420u);
@@ -4487,7 +5127,8 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         }
         G.eng.uploadNow(xLat, lat.data(), lat.size() * 4);
 
-        auto runPass = [&](const BufRef& pool, const BufRef& ctx, float t, std::vector<float>& epsOut) {
+        auto runPass = [&](const BufRef& pool, const BufRef& ctx, float t, std::vector<float>& epsOut, int branch) {
+            gIpBranch = branch;
             auto te = timeEmbHost(t, 320);
             G.eng.uploadNow(embHost, te.data(), te.size() * 4);
             G.eng.beginStep();
@@ -4551,8 +5192,8 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 for (uint64_t k = 0; k < latFloats; k++) scaled[k] = xIn[k] * invEv;
                 G.eng.uploadNow(xLat, scaled.data(), scaled.size() * 4);
                 auto ta = std::chrono::steady_clock::now();
-                runPass(poolCB, ctxC, tEv, epsC);
-                if (needCfg) runPass(poolUB, ctxU, tEv, epsU);
+                runPass(poolCB, ctxC, tEv, epsC, 0);
+                if (needCfg) runPass(poolUB, ctxU, tEv, epsU, 1);
                 auto tb = std::chrono::steady_clock::now();
                 double passMs = std::chrono::duration<double, std::milli>(tb - ta).count();
                 stepMs += passMs;

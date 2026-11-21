@@ -175,6 +175,14 @@ struct GenParams {
     bool weightsHost = false;  // keep UNet weights in host memory; GPU streams them over PCIe
                                // (slower per step, but VRAM only holds activations -- big canvases)
 
+    // ---- IP-Adapter (image prompt)
+    // The reference image is encoded by the CLIP ViT-H/14 vision tower, projected to 4 tokens
+    // and injected into every cross-attention layer as an extra attention branch.
+    std::string ipAdapter;  // ip-adapter_sdxl*.safetensors (image_proj.* + ip_adapter.N.*)
+    std::string ipImage;    // reference image, PNG or PPM
+    std::string ipEncoder;  // CLIP ViT-H/14 image tower; empty = look next to the adapter
+    float ipScale = 0.6f;   // IP branch weight, 0 disables it without unloading the weights
+
     // ---- output
     std::string outPath = "sdvkgen.png";
     int pngCompress = 1;  // 0 = stored, 1 = fixed-Huffman LZ77
