@@ -67,6 +67,9 @@ Targets:
 
 Turn either front end off with `-DSDVK_BUILD_CLI=OFF` / `-DSDVK_BUILD_SERVER=OFF`.
 
+The Windows launchers in `bin/` (`sdvk`, `sdvkgen`, `sdvk-server`) pin the absolute shader directory; the server
+also pins `webui/` and `output/`. Put `bin/` on `PATH` once and they work from any cwd (new terminals only).
+
 ## Usage
 
 Point it at a model folder and nothing else:
@@ -100,10 +103,15 @@ $ build/sdvkgen.exe --models -m model
 
 Override any single component when the layout is unusual: `--unet`, `--te1`, `--te2`, `--vae`, `--tok`, `--tok2`.
 A full single-file checkpoint (`.safetensors` holding `model.diffusion_model.*`, `conditioner.embedders.*`,
-`first_stage_model.*`) can supply the UNet, both text encoders and the VAE at once. A full-checkpoint
+`first_stage_model.*`) can supply the UNet, both text encoders and the VAE at once. The original
+OpenCLIP bigG tower (`transformer.resblocks.*` with fused `in_proj`) is converted to the diffusers
+layout on load. Add `--unet-q8` to encode the UNet to Q8_0 (a 6.9 GB fp16 SDXL checkpoint fits an
+8 GB card); tokenizer files are still needed via `--tok/--tok2` or a model folder. A full-checkpoint
 **GGUF** works too: the loader keeps only the `model.diffusion_model.*` tensors for the UNet (CLIP/VAE
 still come from `--te1/--te2/--vae`), sizes the arena from the UNet subset instead of the whole file,
-and dequantizes 1-D Q8 biases/norms to fp32.
+and dequantizes 1-D Q8 biases/norms to fp32. Q8_0, F16, BF16 and Q4_0 are read directly; **K-quants
+(Q2_K–Q6_K) are dequantized and re-encoded to Q8_0 at load**, so a Q4_K_M/Q5_K_M/Q6_K UNet runs
+through the same Q8 GEMM path (about 20 s extra load for a 2.6 GB UNet on the RX 580).
 
 ### Common flags
 
@@ -115,15 +123,33 @@ and dequantizes 1-D Q8 biases/norms to fp32.
 | `--sampler <name>` | `euler`, `euler_a`, `heun`, `lms`, `dpm2`, `dpm2_a`, `dpmpp_2m`, `dpmpp_2s_a`, `ddim` (`heun`/`dpm2`/`dpm2_a` use 2 model evals per step and run ~2x slower) |
 | `--vpred` / `--zsnr` / `--dynthresh` / `--rescale <f>` | schedule and guidance options |
 | `--seed <n>` | noise seed |
-| `--lora <file>` / `--lora-scale <f>` | merge a LoRA safetensors at load time (default scale 1.0) |
+| `--lora <file>` / `--lora-scale <f>` | merge a LoRA safetensors at load time (default scale 1.0; repeatable, `file:strength` syntax) |
+| `--unet-q8` | encode UNet weights to Q8_0 at load (safetensors, or GGUF F16/F32 tensors; fits fp32 SD1.5 / large SDXL checkpoints on 8 GB) |
 | `--init <img.png> --denoise <f>` | img2img (the source is VAE-encoded, not pixel-seeded) |
 | `--mask <mask.png> --mask-feather <n>` | inpaint; white = repaint, needs `--init` |
 | `--mask-invert` | black = repaint |
 | `--roundtrip` | encode then decode the seed image, no sampling; prints PSNR |
 | `--out <file>` | `.png` (default) or `.ppm` |
 | `--no-vae` | stop after sampling, keep the latent only |
-| `--decode <latent.bin>` | VAE-only: decode a saved latent to an image |
+| `--decode <latent.bin> --vae <file>` | VAE-only: decode a saved `.ofcl` latent; no UNet/CLIP/tokenizer (`-m` can find `vae/`) |
+| `--meta <image.png>` | print the parameters embedded in a generated PNG (no GPU) |
+| `--line <image.png> [-m <dir>]` | print a runnable `sdvk ...` command reconstructed from the PNG metadata; `-m` resolves the recorded model name |
 | `-v` | per-step timing |
+
+```bash
+# inspect a generated PNG (model, prompt, seed, sampler, ...)
+sdvk --meta output/sdvk_xxx.png
+
+# print a rerunnable command from an image (resolves the model under the library root)
+sdvk --line output/sdvk_xxx.png -m E:/sdvkmodel
+
+# latent -> PNG: only a VAE is needed
+sdvk --decode output/sdvk_latent.bin --vae E:/sdvkmodel/vae/noobai_vae_diffusers.safetensors --out out.png
+```
+
+`--line` reproduces the recorded model/prompt/negative/size/steps/cfg/seed/sampler/spacing and
+`vpred`/`zsnr`. LoRA strength, `--weights-host` and hires settings are not stored in the metadata.
+The model name is resolved recursively under `-m` (`.gguf` preferred); pass `--unet` to override.
 
 Recommended recipe for a v-pred checkpoint at 768 on an 8 GB card:
 
@@ -220,7 +246,10 @@ build/sdvk-server.exe --port 7500 --spv build/shaders --web webui --out-dir outp
 Open `http://127.0.0.1:7500/` and set the model directory at the top. **扫描** walks that folder and fills the
 component pickers — UNet/checkpoint, CLIP-L, CLIP-G, VAE and LoRA — while `（自动）` keeps the server-side
 heuristics. Pick any file explicitly to override them, set a LoRA strength, then generate; settings and the last
-prompt are kept in `localStorage`. The layout is a three-column direct-prompt studio:
+prompt are kept in `localStorage`. The v-pred toggle is off by default and follows the selected UNet filename
+(`vpred`/`v-pred` turns it on), so epsilon models such as WAI-Illustrious are not sampled with the wrong
+prediction; check it manually only for a v-pred checkpoint whose filename has no marker. Scan counts just
+`.gguf`/`.safetensors` files toward its 4000-file cap. The layout is a three-column direct-prompt studio:
 
 - left rail: model components, LoRA (merged into Q8 at load), sampler/size, and the **Latent → PNG** card;
 - centre: prompts, canvas with per-step progress, generate/cancel and download;
@@ -256,20 +285,26 @@ src/Modules/
               main.cpp (CLI), Safetensors reader
   Server/     sdvk-server: HTTP + JSON, no dependencies
   GPU/        Vulkan engine (arenas, barrier tracking, kernel table, profiler) + 70 compute shaders + volk
-  Model/      GGUF reader (Q8_0)
+  Model/      GGUF reader (Q8_0, F16/BF16/Q4_0, K-quant dequant)
   Core/       tensor buffer helpers
 webui/        static web front end
 ```
 
 ## Known issues
 
-- **Hassaku XL Lightning Q8 GGUF** (in the local model library) loads and decodes, including its embedded
-  VAE, but the images are noise. Its UNet `input_blocks` weights do not match the repository's fp16
-  safetensors (correlation ≈ 0), so the model file needs a verified re-export. Marked `experimental` in
-  the library manifest.
-- **LoRA merging is not production-ready.** LDM/diffusers keys and text-encoder deltas are mapped and
-  applied, but outputs were still corrupted even at low strength on WAI and NoobAI. A layer-by-layer
-  comparison against a reference implementation is required before enabling LoRA for real images.
+- **Hassaku XL Lightning Q8 GGUF** (in the local model library) is marked `experimental` but no
+  longer looks corrupted: 512² is outside its 1024² training distribution and produces kaleidoscope
+  noise, while **768² with 4 steps / cfg 1.5 / eps is coherent** (with or without `--unet-q8`).
+  Its recommended 1024² plan needs about 2950 MB weights + 1.5 GB step arena; on a 16 GB box with
+  ~1.5 GB free system RAM the final scratch allocation fails, so close background apps (or add RAM)
+  before testing 1024².
+- **LoRA merging is numerically verified, but full strength is not universal.** Merges (linear and
+  conv/LoCon) match a Python reference within 1.5e-8, and scale 0 is bit-identical to the base model.
+  On WAI v170, RICH_BG at 0.3–0.5 is clean; at 1.0 with cfg 5 it can produce texture, while a NoobAI
+  LoRA (x3d) behaves the same way on a mismatched base. Prefer 0.3–0.6 and test per base model.
+- **SD1.5 sampling is not verified**: the fp32 checkpoint now loads (with `--unet-q8`) and reaches
+  the sampler, but the first UNet step crashes inside `amdvlk64.dll` (hd=40/80 generic attention
+  path). Loading/arena sizing is fixed; kernel-level debugging is still required.
 - 8 GB cards are tight at 768² with full-checkpoint UNets; use 512–640² or lower `--step-mb`/`--scratch-mb`.
 - The mobile web layout is functional but not fully redesigned; LAN access is intended for trusted networks
   (the HTTP API has no authentication).
@@ -283,9 +318,10 @@ webui/        static web front end
 - [x] Nine samplers including DPM++ 2M/2S and DPM2
 - [x] Full-checkpoint GGUF (UNet subset + embedded VAE, LDM→diffusers VAE keys)
 - [ ] In-engine VAE decode at 768 (step-arena budget / chunked decode)
-- [ ] `--ckpt`: single-file fp checkpoint loading (on-the-fly rank-2 quantization to Q8_0)
+- [x] `--unet-q8`: single-file fp checkpoint UNet with on-the-fly Q8_0 encoding
+- [x] K-quant GGUF (Q2_K–Q6_K) load-time conversion to Q8_0
 - [x] Hotspot optimization: fused tiled attention, vectorised q8 GEMM loads, bias epilogue
-- [x] LoRA key mapping (Kohya / PEFT, UNet + text encoder); visual correctness still under investigation
+- [x] LoRA key mapping and merge (Kohya / PEFT / LDM, UNet + text encoder); numerically verified
 - [ ] DoRA magnitude application
 - [ ] int4 weight variant / Winograd 3×3
 

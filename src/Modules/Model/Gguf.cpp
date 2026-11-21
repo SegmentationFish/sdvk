@@ -3,6 +3,8 @@
 // sdvk - see LICENSE at the repository root. No warranty.
 // GGUF reader (format: magic GGUF / version / counts / KV metadata / tensor table / aligned data section)
 #include "Gguf.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 
@@ -67,6 +69,11 @@ uint64_t ggmlTypeBlockElems(GgmlType t) {
         case GgmlType::Q5_1:
         case GgmlType::Q8_0:
         case GgmlType::Q8_1: return 32;
+        case GgmlType::Q2_K:
+        case GgmlType::Q3_K:
+        case GgmlType::Q4_K:
+        case GgmlType::Q5_K:
+        case GgmlType::Q6_K: return 256;
         default: return 1;
     }
 }
@@ -82,6 +89,12 @@ uint64_t ggmlTypeBlockBytes(GgmlType t) {
         case GgmlType::Q5_1: return 2 + 2 + 4 + 16;
         case GgmlType::Q8_0: return 2 + 32;
         case GgmlType::Q8_1: return 2 + 2 + 32;
+        // K-quants pack 256 values per super-block (llama.cpp block_q*_K layouts).
+        case GgmlType::Q2_K: return 2 + 2 + 16 + 64;
+        case GgmlType::Q3_K: return 2 + 12 + 32 + 64;
+        case GgmlType::Q4_K: return 2 + 2 + 12 + 128;
+        case GgmlType::Q5_K: return 2 + 2 + 12 + 32 + 128;
+        case GgmlType::Q6_K: return 2 + 16 + 64 + 128;
         default: return 1;
     }
 }
@@ -470,6 +483,185 @@ bool GgufFile::readRaw(const GgufTensor& t, std::vector<uint8_t>& out) const {
     return true;
 }
 
+// ---------------------------------------------------------------- K-quants
+// Super-block layouts and the 6-bit scale/min unpacking mirror llama.cpp's
+// ggml-quants.c (block_q*_K). The engine does not run K-quant GEMMs: these
+// tensors are dequantized on load and requantized to the Q8_0 path.
+
+static inline void getScaleMinK4(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+    if (j < 4) {
+        sc = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        sc = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+static void dequantQ2K(const uint8_t* p, float* y, uint64_t ne) {
+    for (uint64_t b = 0; b < ne / 256; b++) {
+        const uint8_t* blk = p + b * 84;
+        const uint8_t* scales = blk;
+        const uint8_t* q = blk + 16;
+        float d = fp16ToFp32(readU16(blk + 80));
+        float dmin = fp16ToFp32(readU16(blk + 82));
+        float* out = y + b * 256;
+        int is = 0;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++];
+                float dl = d * (float)(sc & 0x0F), ml = dmin * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    out[n + j * 32 + l] = dl * (float)((q[l] >> shift) & 3) - ml;
+                sc = scales[is++];
+                dl = d * (float)(sc & 0x0F);
+                ml = dmin * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    out[n + j * 32 + 16 + l] = dl * (float)((q[l + 16] >> shift) & 3) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+static void dequantQ3K(const uint8_t* p, float* y, uint64_t ne) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    for (uint64_t b = 0; b < ne / 256; b++) {
+        const uint8_t* blk = p + b * 110;
+        const uint8_t* hm = blk;
+        const uint8_t* q = blk + 32;
+        const uint8_t* scalesRaw = blk + 96;
+        float d_all = fp16ToFp32(readU16(blk + 108));
+        uint32_t aux[4];
+        std::memcpy(aux, scalesRaw, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t* scales = (const int8_t*)aux;
+        uint8_t m = 1;
+        int is = 0;
+        float* out = y + b * 256;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                float dl = d_all * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; l++)
+                    out[n + j * 32 + l] = dl * (float)((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                dl = d_all * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; l++)
+                    out[n + j * 32 + 16 + l] = dl * (float)((int)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
+static void dequantQ4K(const uint8_t* p, float* y, uint64_t ne) {
+    for (uint64_t b = 0; b < ne / 256; b++) {
+        const uint8_t* blk = p + b * 144;
+        float d = fp16ToFp32(readU16(blk));
+        float dmin = fp16ToFp32(readU16(blk + 2));
+        const uint8_t* scales = blk + 4;
+        const uint8_t* q = blk + 16;
+        float* out = y + b * 256;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            getScaleMinK4(is + 0, scales, sc, m);
+            float d1 = d * (float)sc, m1 = dmin * (float)m;
+            getScaleMinK4(is + 1, scales, sc, m);
+            float d2 = d * (float)sc, m2 = dmin * (float)m;
+            for (int l = 0; l < 32; l++) out[j + l] = d1 * (float)(q[l] & 0x0F) - m1;
+            for (int l = 0; l < 32; l++) out[j + 32 + l] = d2 * (float)(q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
+static void dequantQ5K(const uint8_t* p, float* y, uint64_t ne) {
+    for (uint64_t b = 0; b < ne / 256; b++) {
+        const uint8_t* blk = p + b * 176;
+        float d = fp16ToFp32(readU16(blk));
+        float dmin = fp16ToFp32(readU16(blk + 2));
+        const uint8_t* scales = blk + 4;
+        const uint8_t* qh = blk + 16;
+        const uint8_t* ql = blk + 48;
+        float* out = y + b * 256;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            getScaleMinK4(is + 0, scales, sc, m);
+            float d1 = d * (float)sc, m1 = dmin * (float)m;
+            getScaleMinK4(is + 1, scales, sc, m);
+            float d2 = d * (float)sc, m2 = dmin * (float)m;
+            for (int l = 0; l < 32; l++)
+                out[j + l] = d1 * (float)((ql[l] & 0x0F) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++)
+                out[j + 32 + l] = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+static void dequantQ6K(const uint8_t* p, float* y, uint64_t ne) {
+    for (uint64_t b = 0; b < ne / 256; b++) {
+        const uint8_t* blk = p + b * 210;
+        const uint8_t* ql = blk;
+        const uint8_t* qh = blk + 128;
+        const int8_t* scales = (const int8_t*)(blk + 192);
+        float d = fp16ToFp32(readU16(blk + 208));
+        float* out = y + b * 256;
+        for (int n = 0; n < 256; n += 128) {
+            const uint8_t* ql2 = ql + n / 2;
+            const uint8_t* qh2 = qh + n / 4;
+            const int8_t* sc = scales + n / 16;
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int q1 = (int)((ql2[l] & 0x0F) | (((qh2[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql2[l + 32] & 0x0F) | (((qh2[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql2[l] >> 4) | (((qh2[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql2[l + 32] >> 4) | (((qh2[l] >> 6) & 3) << 4)) - 32;
+                out[n + l] = d * (float)sc[is + 0] * (float)q1;
+                out[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                out[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                out[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+        }
+    }
+}
+
+bool ggmlTypeIsKQuant(GgmlType t) {
+    return t == GgmlType::Q2_K || t == GgmlType::Q3_K || t == GgmlType::Q4_K ||
+           t == GgmlType::Q5_K || t == GgmlType::Q6_K;
+}
+
+void quantizeQ8_0(const float* x, int8_t* q, float* scales, uint64_t n) {
+    for (uint64_t b = 0; b < n / 32; b++) {
+        const float* xb = x + b * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; i++) amax = std::max(amax, std::fabs(xb[i]));
+        float d = amax / 127.0f;
+        float id = d > 0.0f ? 1.0f / d : 0.0f;
+        scales[b] = d;
+        for (int i = 0; i < 32; i++) {
+            int v = (int)std::lrint(xb[i] * id);
+            q[b * 32 + i] = (int8_t)std::max(-127, std::min(127, v));
+        }
+    }
+}
+
 std::vector<float> GgufFile::readFloat(const std::string& name, std::string* err) const {
     const GgufTensor* tp = find(name);
     if (!tp) {
@@ -518,6 +710,24 @@ std::vector<float> GgufFile::readFloat(const std::string& name, std::string* err
                 float d = fp16ToFp32(readU16(blk));
                 const int8_t* qs = (const int8_t*)(blk + 2);
                 for (uint64_t i = 0; i < 32; i++) out[(size_t)(b * 32 + i)] = d * (float)qs[i];
+            }
+            return out;
+        }
+        case GgmlType::Q2_K:
+        case GgmlType::Q3_K:
+        case GgmlType::Q4_K:
+        case GgmlType::Q5_K:
+        case GgmlType::Q6_K: {
+            if (ne % 256) {
+                if (err) *err = std::string("K-quant tensor with non-256-multiple length: ") + name;
+                return {};
+            }
+            switch (t.type) {
+                case GgmlType::Q2_K: dequantQ2K(p, out.data(), ne); break;
+                case GgmlType::Q3_K: dequantQ3K(p, out.data(), ne); break;
+                case GgmlType::Q4_K: dequantQ4K(p, out.data(), ne); break;
+                case GgmlType::Q5_K: dequantQ5K(p, out.data(), ne); break;
+                default: dequantQ6K(p, out.data(), ne); break;
             }
             return out;
         }

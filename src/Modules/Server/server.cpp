@@ -687,11 +687,11 @@ static void handleScan(const std::map<std::string, std::string>& q, Response& r)
     uint32_t scanned = 0;
     for (auto fit = fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied);
          fit != fs::recursive_directory_iterator(); ++fit) {
-        if (++scanned > 4000) break;
         if (!fit->is_regular_file(ec)) continue;
         std::string ext = fit->path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
         if (ext != ".gguf" && ext != ".safetensors") continue;
+        if (++scanned > 4000) break;
         std::string full = fit->path().string();
         if (!seen.emplace(full, true).second) continue;
         std::string rel = fs::relative(fit->path(), dir, ec).string();

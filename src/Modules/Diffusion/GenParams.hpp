@@ -186,9 +186,10 @@ struct GenParams {
 
     // ---- runtime
     uint32_t stepMb = 0, scratchMb = 0, vStepMb = 0;
-    uint32_t vaeTile = 48;    // tile edge in latent px; 0 forces the full-image pass
+    uint32_t vaeTile = 0;     // 0 = auto: full image up to 896², 48-px tiles above
     uint32_t vaeOverlap = 8;  // latent px of overlap between VAE tiles
     uint32_t paramMb = 0;    // UNet weight arena, 0 = auto from the file size
+    bool unetQ8 = false;     // safetensors UNet: encode 2D/4D weights to Q8_0 at load
     uint32_t teParamMb = 0;  // text encoder arena, 0 = auto from the file sizes
     std::string spvDir = "shaders";
 

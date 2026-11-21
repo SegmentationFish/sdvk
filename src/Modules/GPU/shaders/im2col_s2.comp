@@ -2,17 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
-// 3x3 stride2 im2col (NCHW, batch=1): OH=H/2, OW=W/2.
+// 3x3 stride2 im2col (NCHW, batch=1): OH=H/2, OW=W/2. Writes one band of output rows,
+// [row0, row0+rows), as col[k*np + p] with np = rows*OW, so the caller can walk a full-resolution
+// stage through a fixed-size column buffer instead of needing K*OH*OW at once.
 // off=-1 : symmetric pad 1 on both sides (LDM/UNet downsamplers)
 // off= 0 : pad only right/bottom (diffusers AutoencoderKL Downsample2D passes padding=0 and
 //          prepends F.pad((0,1,0,1))); the bounds test drops the padded ring.
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer IN { float inx[]; };
 layout(binding = 1) writeonly buffer COL { float col[]; };
-layout(push_constant) uniform PC { uint C; uint H; uint W; uint OH; uint OW; int off; } pc;
+layout(push_constant) uniform PC { uint C; uint H; uint W; uint OH; uint OW; int off; uint row0; uint rows; } pc;
 
 void main(){
-    uint P = pc.OH * pc.OW;
+    uint P = pc.rows * pc.OW;
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.C * 9u * P) return;
     uint k = i / P;
@@ -21,8 +23,8 @@ void main(){
     uint rr = k - c * 9u;
     uint ky = rr / 3u;
     uint kx = rr - ky * 3u;
-    uint oh = p / pc.OW;
-    uint ow = p - oh * pc.OW;
+    uint oh = pc.row0 + p / pc.OW;
+    uint ow = p - (p / pc.OW) * pc.OW;
     int ih = int(oh * 2u) + int(ky) + pc.off;
     int iw = int(ow * 2u) + int(kx) + pc.off;
     float v = 0.0;

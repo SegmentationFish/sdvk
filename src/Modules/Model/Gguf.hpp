@@ -4,6 +4,7 @@
 #pragma once
 // GGUF reader: the llama.cpp-ecosystem model container (input format for the compat layer)
 // supports: v2/v3 headers, all metadata KV types, tensor table, F32/F16/BF16/Q4_0/Q8_0 dequantization
+// plus Q2_K/Q3_K/Q4_K/Q5_K/Q6_K (dequantized to f32; the UNet loader requantizes them to Q8_0)
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -34,6 +35,9 @@ enum class GgmlType : uint32_t {
 const char* ggmlTypeName(GgmlType t);
 uint64_t ggmlTypeBlockElems(GgmlType t);  // elements per block (scalars = 1)
 uint64_t ggmlTypeBlockBytes(GgmlType t);  // bytes per block (scalars = element size)
+bool ggmlTypeIsKQuant(GgmlType t);
+// Flat Q8_0 encoder (32-element blocks, 1/127 max-abs scale), matching the engine's GEMM layout.
+void quantizeQ8_0(const float* x, int8_t* q, float* scales, uint64_t n);
 
 struct GgufTensor {
     std::string name;

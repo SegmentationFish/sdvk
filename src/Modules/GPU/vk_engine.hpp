@@ -124,6 +124,7 @@ public:
     bool replayActive() const { return replayMode_; }
     uint64_t lastCmdCount() const { return lastCmds_; }  // command count inside the most recently recorded graph
     const std::unordered_map<std::string, uint64_t>& cmdHist() const { return hist_; }
+    bool hasKernel(const char* name) const { return kernels_.count(name) != 0; }
 
     // GPU phase timing (OFC_TIMESTAMPS=1): mark() inside the step, readable after waitStep
     void mark(const char* label);
@@ -164,6 +165,11 @@ public:
     VkPhysicalDevice physDevice() const { return phys_; }
     const std::string& deviceName() const { return deviceName_; }
     uint64_t deviceLocalMb() const { return deviceLocalMb_; }
+    // Vulkan subgroup properties; the fused-attention kernels assume >=32-wide groups.
+    uint32_t subgroupSize() const { return subgroupSize_; }
+    bool subgroupCompute() const { return subgroupCompute_; }
+    uint32_t maxComputeSharedMemory() const { return maxComputeSharedMemory_; }
+    uint32_t maxComputeWorkGroupInvocations() const { return maxComputeWorkGroupInvocations_; }
     uint64_t lastStepMs() const { return lastStepMs_; }
     // Human-readable device/heap/API/driver report (one line per fact), used by --check.
     std::string deviceReport() const;
@@ -201,6 +207,10 @@ private:
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
+    uint32_t subgroupSize_ = 0;
+    bool subgroupCompute_ = false;
+    uint32_t maxComputeSharedMemory_ = 0;
+    uint32_t maxComputeWorkGroupInvocations_ = 0;
     VkDevice dev_ = VK_NULL_HANDLE;
     uint32_t qfam_ = 0;
     VkQueue queue_ = VK_NULL_HANDLE;

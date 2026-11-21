@@ -44,7 +44,12 @@ void fusedAttention(Engine& eng, const FusedAttnArgs& a) {
     }
     uint32_t hd = a.C / a.heads;
     const char* simple = std::getenv("SDVK_ATTN_SIMPLE");
-    bool tiled = (hd == 64) && a.Tk >= 256 && !(simple && simple[0] == '1');
+    // fused_attn_tiled is loaded opportunistically (some drivers report a conservative shared
+    // memory limit but accept the pipeline). SDVK_ATTN_TILED=0 forces the smaller kernel.
+    const char* forceTiled = std::getenv("SDVK_ATTN_TILED");
+    bool wantTiled = (hd == 64) && a.Tk >= 256 && !(simple && simple[0] == '1');
+    if (forceTiled) wantTiled = forceTiled[0] == '1';
+    bool tiled = wantTiled && eng.hasKernel("fused_attn_tiled");
     FaPush pc{};
     pc.Tq = a.Tq;
     pc.Tk = a.Tk;

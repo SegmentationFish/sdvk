@@ -67,7 +67,15 @@ bool ensureDevice(const std::string& spvDir, std::string& err);
 RunResult run(EvalModel& m, const GenParams& p, const ProgressFn& onProgress);
 
 // VAE-only path: read an .ofcl latent, decode it with p.models.vae, write p.outPath.
+// Needs only --vae (or a model dir containing vae/); no UNet, text encoders or tokenizers.
 RunResult decodeLatentFile(EvalModel& m, const GenParams& p, const std::string& latentPath, const ProgressFn& onProgress);
+
+// Prints the PNG text metadata (tEXt/zTXt/iTXt) embedded by sdvk or other tools.
+// Returns 0 for a readable PNG (even without text chunks), 1 otherwise.
+int printPngMeta(const std::string& path);
+
+// Returns the sdvk tEXt block of a PNG (legacy keyword-less chunks included).
+bool readPngMetaText(const std::string& path, std::string& text, std::string& err);
 
 // Standalone PNG writer (also used by the CLI's --decode path and by tests).
 bool writePngFile(const std::string& path, const std::vector<float>& rgbChw, uint32_t w, uint32_t h, int compress,

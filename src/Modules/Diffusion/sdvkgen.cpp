@@ -126,12 +126,25 @@ static void fail(const std::string& m) { throw std::runtime_error(m); }
 
 // ================================================================ weight access
 
+static const BufRef& wTeGguf(const std::string& key);
+static void teGgDims(const std::string& key, uint32_t& rows, uint32_t& cols, bool* known);
+
 static const BufRef& W(const std::string& name) {
     auto it = gW.find(name);
-    if (it == gW.end()) fail("missing fp32 weight " + name);
+    if (it == gW.end()) {
+        if (name.rfind("te1.", 0) == 0 || name.rfind("te2.", 0) == 0) return wTeGguf(name);
+        fail("missing fp32 weight " + name);
+    }
     return it->second;
 }
-static bool hasW(const std::string& name) { return gW.count(name) != 0; }
+static bool hasW(const std::string& name) {
+    uint32_t r, c;
+    bool known = false;
+    if (name.rfind("te1.text_model.", 0) == 0 || name.rfind("te2.text_model.", 0) == 0 ||
+        name.rfind("te2.text_projection", 0) == 0)
+        teGgDims(name, r, c, &known);
+    return known || gW.count(name) != 0;
+}
 
 static const BufRef& WQ(const std::string& name) {
     auto it = gWQ.find(name);
@@ -207,7 +220,11 @@ static void linearDims(const std::string& name, uint32_t& rows, uint32_t& cols) 
         return;
     }
     if (gUNet.gg.find(name)) ggdims(name, rows, cols);
-    else sdims(name, rows, cols);
+    else {
+        bool known = false;
+        teGgDims(name, rows, cols, &known);
+        if (!known) sdims(name, rows, cols);
+    }
 }
 static uint32_t wdimT(const std::string& name) {
     uint32_t r, c;
@@ -554,40 +571,111 @@ static void loraApplyQ8(std::vector<int8_t>& q, std::vector<float>& sc, uint32_t
     gLoraApplied++;
 }
 
-static void loadGgufUnet() {
+// OFC_LORA_DUMP=<tensor name> writes the post-merge f32 tensor, for reference comparisons.
+static void dumpMergedIfRequested(const std::string& name, const float* data, uint64_t n) {
+    const char* dump = std::getenv("OFC_LORA_DUMP");
+    if (!dump || name != dump) return;
+    if (FILE* f = std::fopen((std::string(dump) + ".f32").c_str(), "wb")) {
+        std::fwrite(data, 4, (size_t)n, f);
+        std::fclose(f);
+        std::printf("lora dump: %s (%llu floats)\n", name.c_str(), (unsigned long long)n);
+    }
+}
+
+// OFC_WEIGHT_HASH=1 logs a per-tensor checksum of the payload actually uploaded.
+static void hashWeightsIfRequested(const std::string& name, const void* a, uint64_t an,
+                                   const void* b = nullptr, uint64_t bn = 0) {
+    if (!std::getenv("OFC_WEIGHT_HASH")) return;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* p, uint64_t n) {
+        const uint8_t* q = (const uint8_t*)p;
+        for (uint64_t i = 0; i < n; i++) {
+            h ^= q[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(a, an);
+    if (b) mix(b, bn);
+    std::printf("whash %s %016llx\n", name.c_str(), (unsigned long long)h);
+}
+
+static void loadGgufUnet(bool q8Convert) {
     GgufFile& gg = gUNet.gg;
     gLoraApplied = 0;
-    uint64_t pending = 0, q8n = 0, f32n = 0;
+    uint64_t pending = 0, q8n = 0, f32n = 0, kqn = 0;
     for (auto& t : gg.tensors()) {
         // tensors are written straight into the mapped staging ring: a separate host vector per
         // tensor would double the commit footprint of a 2.5 GB upload on a 16 GB box
         auto lora = gLora.find(t.name);
         // 1-D Q8 tensors are biases/norms. The conv/linear paths read those from the fp32 map,
         // and dequantizing a few hundred values is cheaper than teaching every kernel a Q8 bias.
-        bool q8Vector = t.type == GgmlType::Q8_0 && t.dims.size() <= 1;
-        if (t.type == GgmlType::Q8_0 && !q8Vector) {
+        bool vectorLike = t.dims.size() <= 1;
+        bool kQuant = ggmlTypeIsKQuant(t.type);
+        uint64_t ne0 = t.nElems();
+        bool f16q8 = q8Convert && !vectorLike && t.type != GgmlType::Q8_0 && !kQuant &&
+                     ne0 >= 1024 && ne0 % 32 == 0;
+        // K-quant and (with --unet-q8) F16/BF16/F32 UNet weights are re-encoded as Q8_0, so the
+        // existing Q8 GEMM path can run them; storing them as f32 would not fit an 8 GB card.
+        bool asQ8 = !vectorLike && (t.type == GgmlType::Q8_0 || kQuant || f16q8);
+        if (asQ8) {
             uint64_t ne = t.nElems(), nb = ne / 32;
+            if (ne % 32) fail("quantized tensor is not 32-aligned: " + t.name);
             BufRef bq = G.paramArena.alloc((ne + 255) & ~255ull);
             BufRef bs = G.paramArena.alloc((nb * 4 + 255) & ~255ull);
-            if (lora != gLora.end()) {
-                uint32_t rows = 0, cols = 0;
-                ggdims(t.name, rows, cols);
+            if (t.type == GgmlType::Q8_0) {
+                if (lora != gLora.end()) {
+                    uint32_t rows = 0, cols = 0;
+                    ggdims(t.name, rows, cols);
+                    std::vector<int8_t> q(ne);
+                    std::vector<float> sc(nb);
+                    std::string err;
+                    if (!gg.readQ8(t.name, q, sc, &err)) fail(err + " (" + t.name + ")");
+                    loraApplyQ8(q, sc, rows, cols, lora->second);
+                    {
+                        std::vector<float> dv((size_t)ne);
+                        for (uint64_t i = 0; i < ne; i++)
+                            dv[(size_t)i] = (float)q[(size_t)i] * sc[(size_t)(i / 32)];
+                        dumpMergedIfRequested(t.name, dv.data(), ne);
+                    }
+                    // stageUpload copies immediately; the two beginUpload slots below can be
+                    // invalidated by a staging flush between the calls, which silently zeroed
+                    // parts of the merged payload even at --lora-scale 0.
+                    hashWeightsIfRequested(t.name, q.data(), ne, sc.data(), nb * 4);
+                    G.eng.stageUpload(bq, q.data(), (uint64_t)ne);
+                    G.eng.stageUpload(bs, sc.data(), (uint64_t)nb * 4);
+                } else {
+                    // Do not use beginUpload twice here: the second reservation can flush the
+                    // first (still unwritten) slot when the ring is near capacity, uploading stale
+                    // bytes for that tensor. stageUpload writes before anything can flush.
+                    std::vector<int8_t> q(ne);
+                    std::vector<float> sc(nb);
+                    std::string err;
+                    if (!gg.readQ8(t.name, q, sc, &err)) fail(err + " (" + t.name + ")");
+                    hashWeightsIfRequested(t.name, q.data(), ne, sc.data(), nb * 4);
+                    G.eng.stageUpload(bq, q.data(), (uint64_t)ne);
+                    G.eng.stageUpload(bs, sc.data(), (uint64_t)nb * 4);
+                }
+            } else {
+                std::string err;
+                auto v = gg.readFloat(t.name, &err);
+                if (v.empty()) fail(err + " (" + t.name + ")");
+                if (lora != gLora.end()) {
+                    uint32_t rows = 0, cols = 0;
+                    ggdims(t.name, rows, cols);
+                    if (v.size() == (size_t)rows * cols) loraApplyF32(v, rows, cols, lora->second);
+                }
+                dumpMergedIfRequested(t.name, v.data(), ne);
                 std::vector<int8_t> q(ne);
                 std::vector<float> sc(nb);
-                std::string err;
-                if (!gg.readQ8(t.name, q, sc, &err)) fail(err + " (" + t.name + ")");
-                loraApplyQ8(q, sc, rows, cols, lora->second);
-                // stageUpload copies immediately; the two beginUpload slots below can be
-                // invalidated by a staging flush between the calls, which silently zeroed
-                // parts of the merged payload even at --lora-scale 0.
+                quantizeQ8_0(v.data(), q.data(), sc.data(), ne);
+                hashWeightsIfRequested(t.name, q.data(), ne, sc.data(), nb * 4);
                 G.eng.stageUpload(bq, q.data(), (uint64_t)ne);
                 G.eng.stageUpload(bs, sc.data(), (uint64_t)nb * 4);
-            } else {
-                int8_t* qd = (int8_t*)G.eng.beginUpload(bq, ne);
-                float* sd = (float*)G.eng.beginUpload(bs, nb * 4);
-                std::string err;
-                if (!gg.readQ8Into(t.name, qd, sd, &err)) fail(err + " (" + t.name + ")");
+                kqn++;
             }
+            if (std::getenv("OFC_WEIGHT_HASH"))
+                std::printf("woff %s %llu %llu\n", t.name.c_str(), (unsigned long long)bq.offset,
+                            (unsigned long long)bs.offset);
             gWQ[t.name] = bq;
             gWS[t.name] = bs;
             q8n++;
@@ -601,7 +689,11 @@ static void loadGgufUnet() {
                 ggdims(t.name, rows, cols);
                 if (v.size() == (size_t)rows * cols) loraApplyF32(v, rows, cols, lora->second);
             }
+            dumpMergedIfRequested(t.name, v.data(), v.size());
+            hashWeightsIfRequested(t.name, v.data(), v.size() * 4);
             BufRef b = G.paramArena.alloc((v.size() * 4 + 255) & ~255ull);
+            if (std::getenv("OFC_WEIGHT_HASH"))
+                std::printf("woff %s %llu 0\n", t.name.c_str(), (unsigned long long)b.offset);
             G.eng.stageUpload(b, v.data(), v.size() * 4);
             gW[t.name] = b;
             f32n++;
@@ -613,8 +705,41 @@ static void loadGgufUnet() {
         }
     }
     G.eng.flushUploads();
-    std::printf("unet weights: %llu Q8_0 + %llu fp (param arena %.0f MB)\n", (unsigned long long)q8n,
-                (unsigned long long)f32n, G.paramArena.used() / 1048576.0);
+    if (std::getenv("OFC_DEV_WEIGHT_HASH")) {
+        auto dh = [&](const char* tag, const std::unordered_map<std::string, BufRef>& m) {
+            std::vector<std::pair<std::string, uint64_t>> rows;
+            for (auto& kv : m) {
+                std::vector<uint8_t> v((size_t)kv.second.size);
+                G.eng.downloadNow(kv.second, v.data(), kv.second.size);
+                uint64_t h = 1469598103934665603ull;
+                for (uint8_t c : v) {
+                    h ^= c;
+                    h *= 1099511628211ull;
+                }
+                rows.push_back({kv.first, h});
+            }
+            std::sort(rows.begin(), rows.end());
+            for (auto& r : rows) std::printf("dhash %s %s %016llx\n", tag, r.first.c_str(), (unsigned long long)r.second);
+            const char* dumpName = std::getenv("OFC_DEV_WEIGHT_DUMP");
+            if (dumpName) {
+                for (auto& kv : m) {
+                    if (kv.first != dumpName) continue;
+                    std::vector<uint8_t> v((size_t)kv.second.size);
+                    G.eng.downloadNow(kv.second, v.data(), kv.second.size);
+                    if (FILE* f = std::fopen((std::string("devdump_") + tag + ".bin").c_str(), "wb")) {
+                        std::fwrite(v.data(), 1, v.size(), f);
+                        std::fclose(f);
+                    }
+                }
+            }
+        };
+        dh("q", gWQ);
+        dh("s", gWS);
+        dh("f", gW);
+    }
+    std::printf("unet weights: %llu Q8_0 (%llu from K-quant) + %llu fp (param arena %.0f MB)\n",
+                (unsigned long long)q8n, (unsigned long long)kqn, (unsigned long long)f32n,
+                G.paramArena.used() / 1048576.0);
     if (!gLora.empty()) std::printf("lora: applied to %llu tensors\n", (unsigned long long)gLoraApplied);
 }
 
@@ -665,8 +790,10 @@ static bool wantTensor(const std::string& n, Part part) {
     return false;
 }
 
+static std::string ldmVaeKey(const std::string& name, int upBlocks);
+
 static void loadSafetensors(Safetensors& st, const std::string& from, const std::string& to, Part part,
-                            const std::string& label) {
+                            const std::string& label, bool q8 = false, bool ldmVae = false, int upBlocks = 4) {
     uint64_t pending = 0, n = 0;
     // `from` is a real slice prefix only when the file actually carries it (checkpoints); for
     // diffusers components the caller passes a virtual alias ("vae." on decoder.* keys), and the
@@ -691,6 +818,7 @@ static void loadSafetensors(Safetensors& st, const std::string& from, const std:
         }
         std::string key = t.name;
         if (!from.empty() && key.rfind(from, 0) == 0) key = to + key.substr(from.size());
+        if (ldmVae) key = ldmVaeKey(key, upBlocks);
         uint32_t rows = t.shape.empty() ? 1u : (uint32_t)t.shape[0];
         uint64_t cols = 1;
         for (size_t i = 1; i < t.shape.size(); i++) cols *= t.shape[i];
@@ -704,7 +832,26 @@ static void loadSafetensors(Safetensors& st, const std::string& from, const std:
         if (loraIt == gLora.end() && key.rfind("te2.text_model.", 0) == 0)
             loraIt = gLora.find("te2." + key.substr(std::strlen("te2.text_model.")));
         if (loraIt != gLora.end() && t.shape.size() == 2) loraApplyF32(v, rows, (uint32_t)cols, loraIt->second);
-        uploadF32(key, v, pending);
+        bool q8able = q8 && t.shape.size() >= 2 && v.size() >= 1024 && v.size() % 32 == 0;
+        if (q8able) {
+            uint64_t ne = v.size(), nb = ne / 32;
+            BufRef bq = G.paramArena.alloc((ne + 255) & ~255ull);
+            BufRef bs = G.paramArena.alloc((nb * 4 + 255) & ~255ull);
+            std::vector<int8_t> q(ne);
+            std::vector<float> sc(nb);
+            quantizeQ8_0(v.data(), q.data(), sc.data(), ne);
+            G.eng.stageUpload(bq, q.data(), ne);
+            G.eng.stageUpload(bs, sc.data(), nb * 4);
+            gWQ[key] = bq;
+            gWS[key] = bs;
+            pending += ne + nb * 4;
+            if (pending >= (96ull << 20)) {
+                G.eng.flushUploads();
+                pending = 0;
+            }
+        } else {
+            uploadF32(key, v, pending);
+        }
         n++;
     }
     G.eng.flushUploads();
@@ -735,7 +882,7 @@ static void loadUnet(const GenParams& p) {
         gUNet.path = f;
         std::printf("unet: %s (%zu tensors, gguf%s)\n", f.c_str(), gUNet.gg.tensorCount(),
                     full ? ", full checkpoint" : "");
-        loadGgufUnet();
+        loadGgufUnet(p.unetQ8);
         gArch = hasAnyW("label_emb.0.0.weight") ? 2 : 1;
         std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
         return;
@@ -747,7 +894,7 @@ static void loadUnet(const GenParams& p) {
     std::printf("unet: %s (%zu tensors, safetensors%s)\n", f.c_str(), gUNet.st.tensors().size(),
                 checkpoint ? ", full checkpoint" : "");
     loadSafetensors(gUNet.st, checkpoint ? "model.diffusion_model." : "", "", checkpoint ? Part::Unet : Part::All,
-                    "unet");
+                    "unet", p.unetQ8);
     gArch = hasAnyW("label_emb.0.0.weight") ? 2 : 1;
     std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
 }
@@ -755,15 +902,207 @@ static void loadUnet(const GenParams& p) {
 // Text encoders, one at a time. `phase` 0 = CLIP-L, 1 = CLIP-G; whichever pass runs rebinds the
 // weight arena first, because both encoders together do not fit in the memory an 8 GB card leaves
 // free. Every pass also registers its file in gSTs, which is only used for shape lookups.
+// OpenCLIP bigG checkpoints store the text tower as transformer.resblocks.* with a fused
+// in_proj. The engine's clipEncode expects the diffusers layout (encoder.layers.*, separate
+// q/k/v). Convert on the fly, splitting the fused projection into its three row blocks.
+static void loadClipGCheckpoint(Safetensors& st) {
+    const std::string pre = "conditioner.embedders.1.model.";
+    auto read = [&](const std::string& n) -> std::vector<float> {
+        try {
+            return st.readF32(n);
+        } catch (const std::exception& e) {
+            fail("read " + n + ": " + e.what());
+        }
+        return {};
+    };
+    const STTensor* tok = st.find(pre + "token_embedding.weight");
+    const STTensor* pos = st.find(pre + "positional_embedding");
+    if (!tok || tok->shape.size() != 2 || !pos || pos->shape.size() != 2)
+        fail("bigG checkpoint is missing token_embedding/positional_embedding");
+    const uint32_t D = (uint32_t)tok->shape[1];
+    const uint32_t V = (uint32_t)tok->shape[0];
+    const uint32_t T = (uint32_t)pos->shape[0];
+    uint64_t pending = 0;
+    size_t n = 0;
+    auto put = [&](const std::string& key, std::vector<float> v, uint32_t rows, uint64_t cols) {
+        auto it = gLora.find(key);
+        if (it != gLora.end() && v.size() == (size_t)rows * cols)
+            loraApplyF32(v, rows, (uint32_t)cols, it->second);
+        gDims[key] = {rows, (uint32_t)cols};
+        uploadF32(key, v, pending);
+        n++;
+    };
+    put("te2.text_model.embeddings.token_embedding.weight", read(pre + "token_embedding.weight"), V, D);
+    put("te2.text_model.embeddings.position_embedding.weight", read(pre + "positional_embedding"), T, D);
+    put("te2.text_model.final_layer_norm.weight", read(pre + "ln_final.weight"), D, 1);
+    put("te2.text_model.final_layer_norm.bias", read(pre + "ln_final.bias"), D, 1);
+    put("te2.text_projection.weight", read(pre + "text_projection"), D, D);
+
+    for (uint32_t l = 0;; l++) {
+        std::string lp = pre + "transformer.resblocks." + std::to_string(l) + ".";
+        const STTensor* inw = st.find(lp + "attn.in_proj_weight");
+        if (!inw) break;
+        std::string dp = "te2.text_model.encoder.layers." + std::to_string(l) + ".";
+        put(dp + "layer_norm1.weight", read(lp + "ln_1.weight"), D, 1);
+        put(dp + "layer_norm1.bias", read(lp + "ln_1.bias"), D, 1);
+        put(dp + "layer_norm2.weight", read(lp + "ln_2.weight"), D, 1);
+        put(dp + "layer_norm2.bias", read(lp + "ln_2.bias"), D, 1);
+
+        std::vector<float> w = read(lp + "attn.in_proj_weight");
+        std::vector<float> b = read(lp + "attn.in_proj_bias");
+        if (w.size() != (size_t)3 * D * D || b.size() != (size_t)3 * D) fail("bad bigG in_proj shape");
+        const char* names[3] = {"q", "k", "v"};
+        for (int part = 0; part < 3; part++) {
+            std::vector<float> sw(w.begin() + (size_t)part * D * D, w.begin() + (size_t)(part + 1) * D * D);
+            std::vector<float> sb(b.begin() + (size_t)part * D, b.begin() + (size_t)(part + 1) * D);
+            put(dp + "self_attn." + names[part] + "_proj.weight", std::move(sw), D, D);
+            put(dp + "self_attn." + names[part] + "_proj.bias", std::move(sb), D, 1);
+        }
+        put(dp + "self_attn.out_proj.weight", read(lp + "attn.out_proj.weight"), D, D);
+        put(dp + "self_attn.out_proj.bias", read(lp + "attn.out_proj.bias"), D, 1);
+        const STTensor* fc1 = st.find(lp + "mlp.c_fc.weight");
+        uint32_t ffn = fc1 && fc1->shape.size() == 2 ? (uint32_t)fc1->shape[0] : 4 * D;
+        put(dp + "mlp.fc1.weight", read(lp + "mlp.c_fc.weight"), ffn, D);
+        put(dp + "mlp.fc1.bias", read(lp + "mlp.c_fc.bias"), ffn, 1);
+        put(dp + "mlp.fc2.weight", read(lp + "mlp.c_proj.weight"), D, ffn);
+        put(dp + "mlp.fc2.bias", read(lp + "mlp.c_proj.bias"), D, 1);
+    }
+    G.eng.flushUploads();
+    std::printf("weights loaded (clip-g checkpoint bigG): %zu tensors, param arena %.0f MB\n", n,
+                G.paramArena.used() / 1048576.0);
+}
+
+// CLIP inside a full-checkpoint GGUF (ComfyUI single-file export): cond_stage_model.transformer.*
+// for CLIP-L and cond_stage_model.1.transformer.* for CLIP-G, stored Q8_0. The encode pass reads
+// the te1./te2. keys as fp32, so the tensors are dequantized on first use instead of all at once;
+// keeping the GgufFile open lets the matmuls run straight off the file.
+static GgufFile gTeGg;
+static std::string gTeGgPath;
+static int gTeGgPhase = -1;
+static const char* gTeGgPre[2] = {"cond_stage_model.transformer.text_model.",
+                                 "cond_stage_model.1.transformer.text_model."};
+
+static void openTeGguf(const std::string& file, int phase, const char* what) {
+    if (gTeGgPhase == phase && gTeGgPath == file) return;
+    std::string err;
+    gTeGgPhase = -1;
+    if (!gTeGg.open(file, &err)) fail(std::string("cannot open ") + what + " " + file + ": " + err);
+    gW.clear();
+    gTeGgPath = file;
+    gTeGgPhase = phase;
+}
+
+// fp32 map entry for a tensor that lives in the open text-encoder GGUF: dequantize on first use
+static const BufRef& wTeGguf(const std::string& key) {
+    auto it = gW.find(key);
+    if (it != gW.end()) return it->second;
+    if (gTeGgPhase < 0) fail("text encoder GGUF is not open (" + key + ")");
+    std::string bare = key.rfind("te2.text_projection", 0) == 0 ? std::string("text_projection")
+                                                                : key.substr(std::string("te1.text_model.").size());
+    for (int i = 0; i < 2; i++) {
+        if (gTeGg.find(gTeGgPre[i] + bare)) {
+            std::string err;
+            auto v = gTeGg.readFloat(gTeGgPre[i] + bare, &err);
+            if (v.empty()) fail("read " + key + ": " + err);
+            uint32_t rows = 1, cols = 1;
+            bool known = false;
+            teGgDims(key, rows, cols, &known);
+            BufRef b = G.paramArena.alloc((v.size() * 4 + 255) & ~255ull);
+            G.eng.stageUpload(b, v.data(), v.size() * 4);
+            G.eng.flushUploads();
+            gW[key] = b;
+            return gW[key];
+        }
+    }
+    fail("missing text-encoder tensor " + bare);
+    return gW.begin()->second;
+}
+
+// (rows, cols) of a text-encoder tensor from the open GGUF, without dequantizing it
+static void teGgDims(const std::string& key, uint32_t& rows, uint32_t& cols, bool* known) {
+    if (known) *known = false;
+    if (gTeGgPhase < 0) return;
+    std::string bare = key.rfind("te2.text_projection", 0) == 0
+                           ? std::string("text_projection")
+                           : key.substr(std::string("te1.text_model.").size());
+    for (int i = 0; i < 2; i++) {
+        const ofc::GgufTensor* t = gTeGg.find(gTeGgPre[i] + bare);
+        if (!t) continue;
+        if (t->dims.size() == 2) {
+            rows = (uint32_t)t->dims[1];
+            cols = (uint32_t)t->dims[0];
+        } else if (t->dims.size() > 2) {
+            rows = (uint32_t)t->dims.back();
+            uint64_t c = 1;
+            for (size_t k = 0; k + 1 < t->dims.size(); k++) c *= t->dims[k];
+            cols = (uint32_t)c;
+        } else {
+            rows = (uint32_t)t->dims[0];
+            cols = 1;
+        }
+        if (known) *known = true;
+        return;
+    }
+}
+
+static size_t loadOneTextEncoderGguf(const std::string& file, int phase, const char* what) {
+    openTeGguf(file, phase, what);
+    size_t n = 0;
+    for (auto& t : gTeGg.tensors()) {
+        if (t.dims.size() > 2) continue;
+        std::string key = (phase == 0 ? "te1.text_model." : "te2.text_model.") + t.name;
+        if (t.dims.size() == 2) gDims[key] = {(uint32_t)t.dims[1], (uint32_t)t.dims[0]};
+        else gDims[key] = {(uint32_t)(t.dims.empty() ? 1 : t.dims[0]), 1};
+        n++;
+    }
+    GgufFile probe;
+    std::string err;
+    if (probe.open(file, &err, "cond_stage_model.1.transformer.") && probe.find("text_model.text_projection") != nullptr)
+        gDims["te2.text_projection"] = {1280, 1280};
+    return n;
+}
+
 static void loadOneTextEncoder(const GenParams& p, int phase) {
     const std::string& path = phase == 0 ? p.models.te1 : p.models.te2;
     const char* what = phase == 0 ? "CLIP-L" : "CLIP-G";
     Safetensors& st = phase == 0 ? gTe1.st : gTe2.st;
-    if (!st.ensureOpen(path)) fail(std::string("cannot open ") + what + " " + path + ": " + st.error());
+    bool ggufFile = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
+    if (!ggufFile && !st.ensureOpen(path)) fail(std::string("cannot open ") + what + " " + path + ": " + st.error());
     std::error_code ec;
     uint64_t fileBytes = std::filesystem::file_size(path, ec);
     if (ec) fileBytes = 0;
-    G.paramBytes = std::min<uint64_t>(std::max<uint64_t>(fileBytes * 2 / 1048576 + 512, 512), phase == 0 ? 2048 : 6144) << 20;
+    // A single-file SD1.5/SDXL checkpoint is mostly UNet + VAE; sizing the text-encoder arena
+    // from the whole file burns ~1.5 GB of an 8 GB card for nothing. Sum only the encoder that
+    // this phase will load.
+    uint64_t teBytes = 0;
+    bool teKnown = false;
+    auto sumTe = [&](const char* pre) {
+        for (auto& t : st.tensors()) {
+            if (t.name.rfind(pre, 0) != 0) continue;
+            teKnown = true;
+            teBytes += st.numel(t) * 4;
+        }
+    };
+    // A full-checkpoint GGUF carries the encoders as Q8_0; they land in the arena as fp32, so the
+    // on-disk size says nothing about what this pass needs.
+    if (ggufFile) {
+        GgufFile teGg;
+        std::string gerr;
+        if (!teGg.open(path, &gerr)) fail(std::string("cannot open ") + what + " " + path + ": " + gerr);
+        const char* tePre = phase == 0 ? "cond_stage_model.transformer." : "cond_stage_model.1.transformer.";
+        for (auto& t : teGg.tensors()) {
+            if (t.name.rfind(tePre, 0) != 0) continue;
+            teKnown = true;
+            teBytes += t.nElems() * 4;
+        }
+    } else {
+        if (containsPrefix(st, "cond_stage_model.transformer.")) sumTe("cond_stage_model.transformer.");
+        else if (containsPrefix(st, "text_encoder.")) sumTe(phase == 0 ? "text_encoder." : "text_encoder_2.");
+        else if (containsPrefix(st, "conditioner.embedders."))
+            sumTe(phase == 0 ? "conditioner.embedders.0.transformer." : "conditioner.embedders.1.model.");
+    }
+    uint64_t teMb = teKnown ? (teBytes >> 20) + 256 : fileBytes * 2 / 1048576 + 512;
+    G.paramBytes = std::min<uint64_t>(std::max<uint64_t>(teMb, 512), phase == 0 ? 2048 : 6144) << 20;
     clearWeights();
     // Destroy the old arena explicitly and give the AMD driver a moment to reclaim the
     // device-local pages. Otherwise UNet (2.9 GB) and CLIP-G (3.1 GB) can overlap in the
@@ -774,7 +1113,9 @@ static void loadOneTextEncoder(const GenParams& p, int phase) {
     G.paramArena.init(G.eng.device(), G.eng.physDevice(), G.paramBytes, true, false);
     std::printf("%s arena: %.0f MB\n", what, G.paramBytes / 1048576.0);
 
-    if (containsPrefix(st, "cond_stage_model.transformer.")) {
+    if (ggufFile) {
+        loadOneTextEncoderGguf(path, phase, what);
+    } else if (containsPrefix(st, "cond_stage_model.transformer.")) {
         // SD1.5 single-file checkpoint: a bare CLIP-L under the LDM prefix (one extra segment).
         // Must be tested before the text_model.* branch: containsPrefix is a substring match and
         // "text_model." is inside "cond_stage_model.transformer.text_model.".
@@ -783,14 +1124,32 @@ static void loadOneTextEncoder(const GenParams& p, int phase) {
     } else if (containsPrefix(st, "text_encoder.")) {
         loadSafetensors(st, phase == 0 ? "text_encoder." : "text_encoder_2.", phase == 0 ? "te1." : "te2.",
                         phase == 0 ? Part::ClipL : Part::ClipG, what);
+    } else if (containsPrefix(st, "cond_stage_model.1.")) {
+        // SDXL checkpoints keep CLIP-G next to CLIP-L as cond_stage_model.1.transformer.text_model.*,
+        // with text_projection under the same prefix. Only phase 1 may take these keys: phase 0
+        // already consumed the CLIP-L slice of the same file.
+        if (phase != 1) fail("this checkpoint puts CLIP-G first; CLIP-L must be loaded before it");
+        loadSafetensors(st, "cond_stage_model.1.transformer.text_model.", "te2.text_model.", Part::All, what);
+        if (containsPrefix(st, "cond_stage_model.1.transformer.text_model.text_projection"))
+            loadSafetensors(st, "cond_stage_model.1.transformer.text_model.text_projection", "te2.text_projection",
+                            Part::All, "clip-g projection");
     } else if (containsPrefix(st, "text_model.")) {
         loadSafetensors(st, "text_model.", phase == 0 ? "te1.text_model." : "te2.text_model.", Part::All, what);
         if (phase == 1 && containsPrefix(st, "text_projection."))
             loadSafetensors(st, "text_projection.", "te2.text_projection.", Part::Projection, "clip-g projection");
     } else if (containsPrefix(st, "conditioner.embedders.0.")) {
-        loadSafetensors(st, "conditioner.embedders.0.transformer.", "te1.", Part::ClipL, "clip-l (checkpoint)");
-        if (phase == 1) loadSafetensors(st, "conditioner.embedders.1.model.", "te2.text_model.", Part::ClipGSingleFile,
-                                        "clip-g (checkpoint)");
+        // Single-file SDXL checkpoint: phase 0 loads CLIP-L, phase 1 loads only CLIP-G. Both live
+        // in the same file, so the phase check is what keeps one encoder's weights out of the
+        // other encoder's arena. The slice prefix already isolates the encoder; Part::ClipL would
+        // filter on the original text_encoder.* name and drop every tensor.
+        if (phase == 0) {
+            loadSafetensors(st, "conditioner.embedders.0.transformer.", "te1.", Part::All, "clip-l (checkpoint)");
+        } else if (containsPrefix(st, "conditioner.embedders.1.model.transformer.resblocks.")) {
+            loadClipGCheckpoint(st);
+        } else {
+            loadSafetensors(st, "conditioner.embedders.1.model.", "te2.text_model.", Part::ClipGSingleFile,
+                            "clip-g (checkpoint)");
+        }
     } else {
         fail(std::string("don't know how to read ") + what + " from " + path +
              " (expected text_encoder.*, text_model.* or conditioner.embedders.* keys)");
@@ -897,7 +1256,18 @@ static void loadVaeWeights(const GenParams& p) {
     }
     if (!gVae.st.ensureOpen(p.models.vae)) fail("cannot open VAE " + p.models.vae + ": " + gVae.st.error());
     if (containsPrefix(gVae.st, "first_stage_model.")) {
-        loadSafetensors(gVae.st, "first_stage_model.", "", Part::Vae, "vae (checkpoint)");
+        // LDM checkpoints store the VAE as decoder.mid.block_1 / decoder.up.N; the walker wants
+        // diffusers names. The GGUF path already mapped them, the safetensors path did not.
+        int upBlocks = 4;
+        for (auto& t : gVae.st.tensors()) {
+            size_t q0 = t.name.find("decoder.up.");
+            if (q0 == std::string::npos) continue;
+            size_t q = t.name.find('.', q0 + 11);
+            if (q != std::string::npos)
+                upBlocks = std::max(upBlocks, std::atoi(t.name.substr(q0 + 11, q - q0 - 11).c_str()) + 1);
+        }
+        bool ldm = containsPrefix(gVae.st, "first_stage_model.decoder.mid.block_1.");
+        loadSafetensors(gVae.st, "first_stage_model.", "", Part::Vae, "vae (checkpoint)", false, ldm, upBlocks);
     } else {
         loadSafetensors(gVae.st, "vae.", "", Part::Vae, "vae");
     }
@@ -973,7 +1343,9 @@ static void copyInto(const BufRef& dst, uint64_t dstOff, const BufRef& src, uint
 // device-side trace: snapshot a buffer into the scratch arena (copy recorded in order),
 // downloaded after waitStep by flushTrace()
 static bool gTrace = false;
+static uint32_t gTraceLayer = 0;
 static bool gVaeTraceSub = false;  // OFC_VAE_TRACE_SUB=1: dump the first resnet's sub-steps
+static bool gVaeNoReuse = false;   // OFC_ENC_NOREUSE=1: never write a resnet back into its input span
 static const char* gDbSel = "";  // dump the internals of this one stage only
 struct TrEnt {
     std::string name;
@@ -1140,6 +1512,11 @@ static const uint64_t kColFloats = 12000000;  // 48 MB reusable im2col buffer
 
 static BufRef conv3RawInto(const BufRef& in, const std::string& wt, uint32_t cin, uint32_t cout, uint32_t H,
                            uint32_t Wd, const BufRef& out) {
+    // The im2col buffer is shared by every convolution, so writing `out` while `in` is the same
+    // span would make each row chunk clobber input rows the next chunk still reads; the encoder's
+    // first stage (128 channels at full resolution) fits exactly in those rows and took this path.
+    if (in.buf == out.buf && in.offset < out.offset + out.size && out.offset < in.offset + in.size)
+        fail("conv3RawInto: input and output overlap in the same arena buffer");
     uint32_t P = H * Wd, K = cin * 9;
     uint32_t rows = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(H, kColFloats / (uint64_t)K / Wd));
     for (uint32_t r0 = 0; r0 < H; r0 += rows) {
@@ -1173,14 +1550,24 @@ static BufRef conv3s2(const BufRef& in, const std::string& p, uint32_t H, uint32
     uint32_t cin = kCols / 9;
     uint32_t OH = H / 2, OW = Wd / 2, K = cin * 9, P = OH * OW;
     BufRef out = allocN((uint64_t)cout * P);
-    struct {
-        uint32_t C, H, W, OH, OW;
-        int off;
-    } pc{cin, H, Wd, OH, OW, off};
-    BufRef col{gCol.buf, gCol.offset, (uint64_t)K * P * 4};
-    gDisp("im2col_s2", {in, col}, &pc, ceilDiv((uint64_t)K * P, 256), 1, 1);
-    if (isQ8(p + ".weight")) gemmNnQ8(WQ(p + ".weight"), WS(p + ".weight"), col, out, cout, P, K, P);
-    else gemmNn(W(p + ".weight"), col, out, cout, P, K, P);
+    // The column buffer is 48 MB and a full-resolution downsample needs K*OH*OW, which is 360 MB
+    // for 128 channels at 640x512. Running the whole stage in one dispatch walked ~300 MB past the
+    // end of the scratch arena and silently corrupted whatever the driver had put there, so the
+    // stage is walked in output-row bands sized to fit, the same way conv3RawInto does it.
+    uint32_t rows = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(OH, kColFloats / (uint64_t)K / OW));
+    for (uint32_t r0 = 0; r0 < OH; r0 += rows) {
+        uint32_t rr = std::min(rows, OH - r0), np = rr * OW;
+        struct {
+            uint32_t C, H, W, OH, OW;
+            int off;
+            uint32_t row0, rows;
+        } pc{cin, H, Wd, OH, OW, off, r0, rr};
+        BufRef col{gCol.buf, gCol.offset, (uint64_t)K * np * 4};
+        gDisp("im2col_s2", {in, col}, &pc, ceilDiv((uint64_t)K * np, 256), 1, 1);
+        BufRef cs{out.buf, out.offset + (uint64_t)r0 * OW * 4, out.size - (uint64_t)r0 * OW * 4};
+        if (isQ8(p + ".weight")) gemmNnQ8(WQ(p + ".weight"), WS(p + ".weight"), col, cs, cout, np, K, P);
+        else gemmNn(W(p + ".weight"), col, cs, cout, np, K, P);
+    }
     biasAddCh(out, W(p + ".bias"), cout, P);
     return out;
 }
@@ -1231,19 +1618,9 @@ static void headsMergeInto(const BufRef& dst, const BufRef& x, uint32_t T, uint3
     gDisp("copy_nd", {d, x}, &pc, ceilDiv((uint64_t)hCnt * T * hd, 256), 1, 1);
 }
 
-static BufRef attnCore(const BufRef& q, const BufRef& k, const BufRef& v, uint32_t Tq, uint32_t Tk, uint32_t C,
-                       uint32_t heads, bool causal = false) {
+static BufRef attnCoreSlow(const BufRef& q, const BufRef& k, const BufRef& v, uint32_t Tq, uint32_t Tk, uint32_t C,
+                           uint32_t heads, bool causal) {
     uint32_t hd = C / heads;
-    static int fusedEnv = -1;
-    if (fusedEnv < 0) { const char* e = std::getenv("SDVK_ATTN_FUSED"); fusedEnv = (e && e[0] == '1') ? 1 : 0; }
-    if (hd <= 64 && (hd == 64 || fusedEnv)) {
-        BufRef out = allocN((uint64_t)Tq * C);
-        if (!gArenaPlan) {
-            ofc::gpu::FusedAttnArgs a{q, k, v, out, Tq, Tk, C, heads, causal};
-            ofc::gpu::fusedAttention(G.eng, a);
-        }
-        return out;
-    }
     uint64_t perHead = (uint64_t)Tq * Tk;
     uint32_t chunk = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(16, 16000000ull / perHead));
     // A single head over a large token count does not fit either (the VAE mid-block attends over
@@ -1288,11 +1665,77 @@ static BufRef attnCore(const BufRef& q, const BufRef& k, const BufRef& v, uint32
     return out;
 }
 
+
+static bool gAttnRef = std::getenv("OFC_ATTN_REF") != nullptr;
+
+static BufRef attnCore(const BufRef& q, const BufRef& k, const BufRef& v, uint32_t Tq, uint32_t Tk, uint32_t C,
+                       uint32_t heads, bool causal = false) {
+    uint32_t hd = C / heads;
+    static int fusedEnv = -1;
+    if (fusedEnv < 0) { const char* e = std::getenv("SDVK_ATTN_FUSED"); fusedEnv = (e && e[0] == '1') ? 1 : 0; }
+    static int fusedCap = -1;
+    if (fusedCap < 0) {
+        fusedCap = (G.eng.subgroupCompute() && G.eng.subgroupSize() >= 32 &&
+                    G.eng.maxComputeWorkGroupInvocations() >= 256 &&
+                    G.eng.maxComputeSharedMemory() >= 16384)
+                       ? 1
+                       : 0;
+        if (!fusedCap)
+            std::printf("fused attention disabled: subgroup %u / shared %u B / wg %u\n",
+                        G.eng.subgroupSize(), G.eng.maxComputeSharedMemory(),
+                        G.eng.maxComputeWorkGroupInvocations());
+    }
+    if (fusedCap && hd <= 64 && (hd == 64 || fusedEnv) && !gAttnRef) {
+        BufRef out = allocN((uint64_t)Tq * C);
+        if (!gArenaPlan) {
+            ofc::gpu::FusedAttnArgs a{q, k, v, out, Tq, Tk, C, heads, causal};
+            ofc::gpu::fusedAttention(G.eng, a);
+        }
+        return out;
+    }
+    return attnCoreSlow(q, k, v, Tq, Tk, C, heads, causal);
+}
+
+// Cross-attention K/V depend only on the text context, not on the latent. They are therefore
+// identical for every sampler step and both CFG branches. Cache them in the persistent param
+// arena on first use; a 20-step CFG run otherwise re-projects the 77 context tokens ~40 times.
+// Entries are keyed by the transformer block and the ctx buffer, and cleared per run().
+struct XKvEntry {
+    BufRef k, v;
+};
+static std::unordered_map<std::string, XKvEntry> gXKv;
+
 static BufRef crossAttention(const BufRef& xq, const BufRef& xkv, const std::string& p, uint32_t Tq, uint32_t Tk,
                              uint32_t C, uint32_t heads) {
     BufRef q = linear(xq, p + ".to_q", Tq);
-    BufRef k = linear(xkv, p + ".to_k", Tk);
-    BufRef v = linear(xkv, p + ".to_v", Tk);
+    static int noXkv = -1;
+    if (noXkv < 0) noXkv = std::getenv("OFC_NO_XKV") ? 1 : 0;
+    bool isCross = xkv.buf != xq.buf || xkv.offset != xq.offset;
+    BufRef k, v;
+    if (isCross && !gArenaPlan && !noXkv) {
+        char id[64];
+        std::snprintf(id, sizeof id, "%p:%llu", (void*)xkv.buf, (unsigned long long)xkv.offset);
+        std::string key = p + "#" + id;
+        auto it = gXKv.find(key);
+        if (it != gXKv.end()) {
+            k = it->second.k;
+            v = it->second.v;
+        } else {
+            BufRef tk = linear(xkv, p + ".to_k", Tk);
+            BufRef tv = linear(xkv, p + ".to_v", Tk);
+            uint64_t bytes = (uint64_t)Tk * C * 4;
+            BufRef pk = G.paramArena.alloc((bytes + 255) & ~255ull);
+            BufRef pv = G.paramArena.alloc((bytes + 255) & ~255ull);
+            copyInto(pk, 0, tk, bytes);
+            copyInto(pv, 0, tv, bytes);
+            gXKv[key] = {pk, pv};
+            k = pk;
+            v = pv;
+        }
+    } else {
+        k = linear(xkv, p + ".to_k", Tk);
+        v = linear(xkv, p + ".to_v", Tk);
+    }
     BufRef o = attnCore(q, k, v, Tq, Tk, C, heads);
     return linear(o, p + ".to_out.0", Tq);
 }
@@ -1618,6 +2061,10 @@ static void clipEncode(const std::string& pfx, const std::string& proj, const Bu
         P2 pg{T, D};
         gDisp("gather_rows", {W(pfx + "embeddings.token_embedding.weight"), idx, tok}, &pg,
                        ceilDiv((uint64_t)T * D, 256), 1, 1);
+        if (gTrace && pfx == "te1.text_model.") {
+            tr("emb_tok", tok, (uint64_t)T * D);
+            tr("emb_pos", W(pfx + "embeddings.position_embedding.weight"), (uint64_t)T * D);
+        }
         BufRef x0 = add2(tok, W(pfx + "embeddings.position_embedding.weight"), (uint64_t)T * D);
         if (gTrace && pfx == "te1.text_model.") tr("emb", x0, (uint64_t)T * D);
         copyInto(xSlot, 0, x0, (uint64_t)T * D * 4);
@@ -1627,13 +2074,15 @@ static void clipEncode(const std::string& pfx, const std::string& proj, const Bu
     for (uint32_t l = 0; l < layers; l++) {
         std::string lp = pfx + "encoder.layers." + std::to_string(l) + ".";
         std::string tp = (pfx == "te1.text_model.") ? "t1_" : "t2_";
-        bool tl = gTrace && l == 0;
+        bool tl = gTrace && l == gTraceLayer;
         BufRef h = layernorm(xSlot, lp + "layer_norm1", T, D);
         if (tl) tr(tp + "ln1", h, (uint64_t)T * D);
         BufRef q = linear(h, lp + "self_attn.q_proj", T);
         if (tl) tr(tp + "q", q, (uint64_t)T * D);
         BufRef k = linear(h, lp + "self_attn.k_proj", T);
+        if (tl) tr(tp + "k", k, (uint64_t)T * D);
         BufRef v = linear(h, lp + "self_attn.v_proj", T);
+        if (tl) tr(tp + "v", v, (uint64_t)T * D);
         BufRef o = attnCore(q, k, v, T, T, D, heads, true);
         if (tl) tr(tp + "attn", o, (uint64_t)T * D);
         o = linear(o, lp + "self_attn.out_proj", T);
@@ -1657,16 +2106,21 @@ static void clipEncode(const std::string& pfx, const std::string& proj, const Bu
     bool needPool = !proj.empty() && hasW(proj + ".weight");
     if (proj.empty() && hasW(pfx + "final_layer_norm.weight")) needPool = true;
     if (needPool) {
+        if (gTrace) tr(pfx == "te1.text_model." ? "t1_fin" : "t2_fin", xSlot, (uint64_t)T * D);
         BufRef f = layernorm(xSlot, pfx + "final_layer_norm", T, D);
+        if (gTrace) tr(pfx == "te1.text_model." ? "t1_fout" : "t2_fout", f, (uint64_t)T * D);
         uint32_t am = 0;
         for (uint32_t i = 1; i < T; i++)
             if (ids[i] > ids[am]) am = i;
         BufRef row{f.buf, f.offset + (uint64_t)am * D * 4, (uint64_t)D * 4};
         // CLIP-L has no projection head: its pooled embedding is the EOS hidden state as-is, so
-        // only run the matmul when a projection weight actually exists
+        // only run the matmul when a projection weight actually exists. The bare key check is
+        // deliberate: SDXL checkpoints store the head as <tag>.text_projection.weight and the
+        // pooled vector has always been the unprojected EOS row; projecting it desaturates the
+        // UNet's pooled conditioning (measured: pooled 31.4 -> 8.2, image -> noise).
         BufRef p = row;
-        if (hasW(proj.empty() ? pfx + "text_projection" : proj))
-            p = linear(row, proj.empty() ? pfx + "text_projection" : proj, 1);
+        std::string pk = proj.empty() ? pfx + "text_projection" : proj;
+        if (gW.count(pk) != 0) p = linear(row, pk, 1);
         copyInto(pooledOut, 0, p, (uint64_t)D * 4);
         arenaRewind(xSlot.offset + xSlot.size);
     }
@@ -2030,7 +2484,7 @@ static BufRef vaeResnet(const BufRef& x, const std::string& p, uint32_t cin, uin
     // When the block narrows (512 -> 256) or keeps its width, the input's own span is big enough to
     // hold the result, so the block writes back into it. That removes one 452 MB tensor from the
     // peak at 1152x768, which is the difference between decoding and dying on the last up-block.
-    bool reuse = !shortcut && x.size >= (uint64_t)cout * P * 4;
+    bool reuse = !gVaeNoReuse && !shortcut && x.size >= (uint64_t)cout * P * 4;
     BufRef slot = reuse ? BufRef{x.buf, x.offset, (uint64_t)cout * P * 4} : allocN((uint64_t)cout * P);
     // Two reusable scratch slots, alternating: the chain below is a straight line where each result
     // only needs to outlive the next op, but every op allocates its output, so a 128-channel block
@@ -2349,12 +2803,13 @@ static void prepareVaeArena(const GenParams& p) {
 
 static std::vector<float> vaeDecode(const GenParams& p, const std::vector<float>& lat, uint32_t H, uint32_t Wd) {
     prepareVaeArena(p);
-    // Large canvases decode in tiles by default: a full 96x96 pass asks for ~3 GB in one
-    // device-local allocation, and this driver kills the process outright (no error return)
-    // when that allocation cannot be satisfied. Tiles keep every pass small; --vae-tile 0
-    // forces the full-image pass back on.
-    uint32_t tile = (H * Wd > 64u * 64u) ? p.vaeTile : 0;
-    if (tile) return vaeDecodeTiled(p, lat, H, Wd, tile, p.vaeOverlap);
+    // Auto: a full 768² decode is 2.4x faster than the 48-px tiling (3.8 s vs 9.3 s) and needs
+    // ~3.0 GB of step arena, which fits once the UNet is gone. Keep the tiled path above 896²
+    // because a 1024² pass approaches 5.4 GB in one allocation and this driver can kill the
+    // process when that fails. --vae-tile N forces N; 0 keeps the automatic choice.
+    uint32_t tile = p.vaeTile;
+    if (tile == 0) tile = ((uint64_t)H * Wd <= 112ull * 112ull) ? 0 : 48;
+    if (tile && H * Wd > 64u * 64u) return vaeDecodeTiled(p, lat, H, Wd, tile, p.vaeOverlap);
     try {
         return vaeDecodeChain(p, lat, H, Wd);
     } catch (const std::exception& e) {
@@ -2383,6 +2838,8 @@ static std::vector<float> vaeEncodeChain(const GenParams& p, const std::vector<f
     uint64_t autoVStep = (need >> 20) * 115 / 100 + 96;
     if (std::getenv("OFC_NO_AUTOSIZE")) autoVStep = 0;
     uint64_t vStepMB = std::max<uint64_t>(p.vStepMb, autoVStep);
+    gVaeNoReuse = std::getenv("OFC_ENC_NOREUSE") != nullptr;
+    if (gVaeNoReuse) vStepMB = std::max<uint64_t>(vStepMB, ((need >> 20) * 160 / 100) + 256);
     if (vStepMB > 4200) {
         char msg[288];
         std::snprintf(msg, sizeof msg,
@@ -2390,9 +2847,29 @@ static std::vector<float> vaeEncodeChain(const GenParams& p, const std::vector<f
                       Wd, H, need / 1048576.0);
         fail(msg);
     }
-    G.eng.initArenas(vStepMB << 20, 220ull << 20);
-    gResizeScratch(220ull << 20);
+    // OFC_VAE_ENC_DUMP=1: write every encoder stage (dbg_enc_<tag>.f32) plus the final latent for
+    // a numeric A/B against tools/refencode.py, which dumps the same tags as .npy.
+    // OFC_VAE_TRACE instead grows the scratch arena on demand (tr() allocates there) and keeps the
+    // caller's step arena: a 1024px canvas stacks 1.3 GB of dumps, far past the 220 MB default.
+    bool vaeTrace = std::getenv("OFC_VAE_TRACE") != nullptr;
+    bool encDump = std::getenv("OFC_VAE_ENC_DUMP") != nullptr;
+    if (vaeTrace || encDump) gTrace = true;
+    uint64_t scratchMB = 220;
+    if (encDump) {
+        // one full stage tensor is the largest thing a dump holds; size the arena for two of them
+        // (a down stage and the post-down resnet can both be live) plus the encoder's working set
+        uint64_t stageMB = (uint64_t)H * Wd * 512 * 4 >> 20;
+        scratchMB = std::min<uint64_t>(stageMB * 2 + 512, 4096);
+        if (std::getenv("OFC_ENC_DUMP_SMALL")) scratchMB = 700;  // only the small stages get dumped
+    } else if (vaeTrace) {
+        scratchMB = 640;
+    }
+    if (const char* sm = std::getenv("OFC_ENC_SCRATCH_MB")) scratchMB = std::strtoull(sm, nullptr, 10);
+    G.eng.initArenas(vStepMB << 20, scratchMB << 20);
+    gResizeScratch(scratchMB << 20);
     gCol = G.scratchArena.alloc(kColFloats * 4);
+    std::printf("[enc] arenas vstep=%lluMB scratch=%lluMB col=%lluKB\n", (unsigned long long)vStepMB,
+                (unsigned long long)scratchMB, (unsigned long long)(gCol.size >> 10));
     gSCap = 0;
     auto t0 = std::chrono::steady_clock::now();
     G.eng.beginStep();
@@ -2403,8 +2880,39 @@ static std::vector<float> vaeEncodeChain(const GenParams& p, const std::vector<f
         if (x.offset != 0) G.eng.compactStepArena(0, x.offset, x.size);
         x.offset = 0;
     };
+    bool encTrace = std::getenv("OFC_VAE_ENC_DUMP") != nullptr || std::getenv("OFC_VAE_TRACE") != nullptr;
+    int encNo = 0;
+    auto esnap = [&](const char* tag) {
+        if (!encTrace) return;
+        // OFC_ENC_DUMP_SMALL=1 skips tensors over 64 MB, which keeps the dump arena at its default
+        // size: the full-resolution stages alone are ~900 MB and will not fit next to a big step pool.
+        static const bool smallOnly = std::getenv("OFC_ENC_DUMP_SMALL") != nullptr;
+        static const char* tagFilter = std::getenv("OFC_ENC_DUMP_TAG");
+        if (smallOnly && x.size > (64ull << 20)) return;
+        if (tagFilter && !std::strstr(tag, tagFilter)) return;
+        char nm[96];
+        std::snprintf(nm, sizeof nm, "enc_%02d_%s", ++encNo, tag);
+        tr(nm, x, x.size / 4);
+    };
     x = conv3Raw(x, "encoder.conv_in.weight", 3, 128, H, Wd);
+    esnap("conv_in");
     compact();
+    // From here on the output of a stage can be exactly as large as its input (128 channels at
+    // full resolution), and allocN hands back the freed span right where the input was. Park the
+    // input at the top of the arena so the resnet's ping-pong slots cannot alias it. The data has
+    // to be copied there: moving only the BufRef pointed the first resnet at uninitialised arena
+    // memory, which is what made every encode with resnet reuse produce a scrambled latent.
+    if (H * Wd * 4 >= (UINT64_C(1) << 31)) fail("init image too large for the encoder arena plan");
+    if (!gArenaPlan && !gVaeNoReuse) {
+        uint64_t tail = std::max<uint64_t>(srcFloats * 4, x.size) + 256;
+        uint64_t parkOff = (G.eng.stepArena().cap() - tail) & ~255ull;
+        if (parkOff > x.offset + x.size) {
+            BufRef parked{x.buf, parkOff, x.size};
+            copyInto(parked, 0, x, x.size);
+            gBar();
+            x = parked;
+        }
+    }
     uint32_t cin = 128;
     char pfx[96];
     for (int b = 0; b < 4; b++) {
@@ -2413,6 +2921,8 @@ static std::vector<float> vaeEncodeChain(const GenParams& p, const std::vector<f
             std::snprintf(pfx, sizeof pfx, "encoder.down_blocks.%d.resnets.%d", b, i);
             x = vaeResnet(x, pfx, cin, cout, H, Wd, i == 0 && cin != cout);
             cin = cout;
+            std::snprintf(pfx, sizeof pfx, "down%d_res%d", b, i);
+            esnap(pfx);
             compact();
         }
         if (b < 3) {
@@ -2420,23 +2930,32 @@ static std::vector<float> vaeEncodeChain(const GenParams& p, const std::vector<f
             x = conv3s2(x, pfx, H, Wd, 0);  // diffusers pads right/bottom, not both sides
             H /= 2;
             Wd /= 2;
+            std::snprintf(pfx, sizeof pfx, "down%d_down", b);
+            esnap(pfx);
             compact();
         }
     }
     uint32_t P = H * Wd;
     x = vaeResnet(x, "encoder.mid_block.resnets.0", 512, 512, H, Wd, false);
+    esnap("mid_res0");
     compact();
     x = vaeAttn(x, "encoder.mid_block.attentions.0", 512, H, Wd);
+    esnap("mid_attn");
     compact();
     x = vaeResnet(x, "encoder.mid_block.resnets.1", 512, 512, H, Wd, false);
+    esnap("mid_res1");
     compact();
     x = gnSilu(x, "encoder.conv_norm_out", 512, P, 32, 1e-6f);
+    esnap("norm_out");
     compact();
     x = conv3Raw(x, "encoder.conv_out.weight", 512, 8, H, Wd);
+    esnap("conv_out");
     compact();
     x = conv1(x, "quant_conv", 8, 8, P);
+    esnap("quant");
     G.eng.endStep();
     G.eng.waitStep();
+    if (encTrace) flushTrace();
     std::vector<float> raw((size_t)8 * P);
     G.eng.downloadNow(x, raw.data(), raw.size() * 4);
     // encoder output lives in VAE space; vaeDecodeChain divides the sampler latent by this same
@@ -2596,7 +3115,13 @@ static bool pngWriteRaw(const std::string& path, const std::vector<uint8_t>& rgb
     ihdr[11] = 0;
     ihdr[12] = 0;
     pngChunk(f, "IHDR", ihdr, 13);
-    if (!info.empty()) pngChunk(f, "tEXt", (const uint8_t*)info.data(), (uint32_t)info.size());
+    if (!info.empty()) {
+        // tEXt needs a keyword and a NUL separator; older sdvk builds wrote the raw block.
+        std::string text = "sdvk";
+        text.push_back('\0');
+        text += info;
+        pngChunk(f, "tEXt", (const uint8_t*)text.data(), (uint32_t)text.size());
+    }
     size_t stride = (size_t)w * 3 + 1, rows = h;
     std::vector<uint8_t> raw((size_t)h * stride);
     for (uint32_t y = 0; y < h; y++) {
@@ -2772,44 +3297,21 @@ static Euler buildEuler(int steps, const char* spacing, int numTrain, int offset
     return e;
 }
 
-// sigma levels for a partial (img2img / inpainting) run: start from the level that matches the
-// requested strength and keep `steps` evenly spaced sigmas down to zero
-static Euler buildPartial(const Euler& full, int steps, float denoise, bool zsnr) {
+// Partial (img2img / inpainting) run: diffusers' strength handling keeps the *tail* of the full
+// schedule, starting at the timestep that leaves `denoise * totalSteps` steps. Scaling sigma_max
+// by the strength instead looked plausible but starts the run far too noisy: at strength 0.6 the
+// first sigma came out ~8.8 while the seed latent has rms ~1.1, so the noise buried the image and
+// only the coarsest layout (a red disc on black) survived no matter how many steps ran.
+static Euler buildPartial(const Euler& full, int totalSteps, float denoise, bool zsnr) {
     Euler e;
     e.initNoiseSigma = full.initNoiseSigma;
-    float smax = full.sigmas[0];
-    std::vector<float> inv;
-    for (float s : full.sigmas) inv.push_back(s);
-    std::vector<float> target(inv.rbegin(), inv.rend());  // ascending, 0 .. smax
-    float s0 = smax * denoise;
-    int n = std::max(1, steps);
-    e.sigmas.assign(n + 1, 0.0f);
-    for (int i = 0; i < n; i++) {
-        float want = s0 * (1.0f - (float)i / (float)n);
-        size_t k = 0;
-        while (k + 1 < target.size() && target[k + 1] <= want) k++;
-        float frac = 0.0f;
-        if (k + 1 < target.size() && target[k + 1] > target[k]) frac = (want - target[k]) / (target[k + 1] - target[k]);
-        e.sigmas[i] = target[k] + (target[std::min(k + 1, target.size() - 1)] - target[k]) * frac;
-    }
-    e.sigmas[n] = 0.0f;
-    // t fed to the model must follow the same sigma, so map back through the schedule
-    e.timesteps.assign(n, 0.0f);
-    for (int i = 0; i < n; i++) {
-        float s = e.sigmas[i];
-        size_t best = 0;
-        float bd = 1e30f;
-        for (size_t k = 0; k < full.sigmas.size(); k++) {
-            float d = std::fabs(full.sigmas[k] - s);
-            if (d < bd) {
-                bd = d;
-                best = k;
-            }
-        }
-        e.timesteps[i] = full.timesteps[std::min(best, full.timesteps.size() - 1)];
-        if (i > 0 && e.timesteps[i] > e.timesteps[i - 1]) e.timesteps[i] = e.timesteps[i - 1];
-    }
-    if (zsnr) e.timesteps[0] = std::min(e.timesteps[0], full.timesteps[0]);
+    int k = (int)std::lround((float)totalSteps * denoise);
+    k = std::min(std::max(k, 0), totalSteps);
+    int start = totalSteps - k;
+    e.timesteps.assign(full.timesteps.begin() + start, full.timesteps.end());
+    e.sigmas.assign(full.sigmas.begin() + start, full.sigmas.end());
+    e.sigmas.back() = 0.0f;
+    if (zsnr && !e.timesteps.empty()) e.timesteps[0] = std::min(e.timesteps[0], full.timesteps[0]);
     return e;
 }
 
@@ -2912,18 +3414,41 @@ static uint64_t unetParamBytes(const GenParams& p) {
     if (gguf) {
         // A full-checkpoint GGUF also carries CLIP and the VAE. Sizing the arena from the file
         // would over-allocate by ~1.5 GB, which on an 8 GB card makes the AMD driver kill the
-        // process outright. Sum the UNet tensors instead.
+        // process outright. Sum the UNet tensors instead. K-quant files compress to ~4 bpw but
+        // are re-encoded as Q8_0 on load, so the file size alone underestimates them.
         GgufFile probe;
         std::string perr;
-        bool full = probe.open(p.models.unet, &perr) &&
-                    probe.find("model.diffusion_model.input_blocks.0.0.weight") != nullptr;
-        if (full && probe.open(p.models.unet, &perr, "model.diffusion_model.")) {
+        bool opened = probe.open(p.models.unet, &perr);
+        bool full = opened && probe.find("model.diffusion_model.input_blocks.0.0.weight") != nullptr;
+        if (full) opened = probe.open(p.models.unet, &perr, "model.diffusion_model.");
+        if (opened) {
             uint64_t need = 0;
             for (auto& t : probe.tensors()) {
                 uint64_t ne = t.nElems();
-                need += t.type == GgmlType::Q8_0 ? ne + (ne / 32) * 4 : ne * 4;
+                bool asQ8 = t.dims.size() > 1 &&
+                            (t.type == GgmlType::Q8_0 || ggmlTypeIsKQuant(t.type) ||
+                             (p.unetQ8 && t.type != GgmlType::Q8_0 && ne >= 1024 && ne % 32 == 0));
+                need += asQ8 ? ne + (ne / 32) * 4 : ne * 4;
             }
             mb = (need + (192ull << 20)) >> 20;
+        }
+    }
+    if (!gguf) {
+        // A single-file checkpoint also carries CLIP and the VAE. Sizing from the whole file
+        // doubles 4.3 GB into an impossible arena; sum only the UNet tensors (they are fp32 in
+        // the arena regardless of their on-disk half precision).
+        Safetensors st;
+        if (st.ensureOpen(p.models.unet)) {
+            uint64_t need = 0;
+            bool any = false;
+            for (auto& t : st.tensors()) {
+                if (t.name.rfind("model.diffusion_model.", 0) != 0) continue;
+                any = true;
+                uint64_t ne = st.numel(t);
+                bool q8able = p.unetQ8 && t.shape.size() >= 2 && ne >= 1024 && ne % 32 == 0;
+                need += q8able ? ne + (ne / 32) * 4 : ne * 4;
+            }
+            if (any) mb = (need + (192ull << 20)) >> 20;
         }
     }
     if (!gguf) mb = std::max<uint64_t>(mb, 512);
@@ -3092,7 +3617,8 @@ static bool inflateRaw(const uint8_t* src, size_t n, std::vector<uint8_t>& out) 
             for (uint8_t l : len) count[l]++;
             if (count[0] == len.size()) return true;
             std::vector<uint16_t> off(16, 0);
-            for (int i = 1; i < 16; i++) off[i] = off[i - 1] + count[i - 1];
+            // count[0] is the number of absent symbols; it must not shift the first length.
+            for (int i = 2; i < 16; i++) off[i] = off[i - 1] + count[i - 1];
             for (size_t i = 0; i < len.size(); i++)
                 if (len[i]) symbol[off[len[i]]++] = (uint16_t)i;
             return true;
@@ -3220,6 +3746,123 @@ static bool inflateRaw(const uint8_t* src, size_t n, std::vector<uint8_t>& out) 
     return true;
 }
 
+// zlib wrapper around the raw deflate reader; zTXt/iTXt compressed text uses this framing.
+static bool inflateZlib(const uint8_t* src, size_t n, std::vector<uint8_t>& out) {
+    if (n < 2 || (src[0] & 0x0F) != 8) return false;
+    size_t off = (src[1] & 0x20) ? 6 : 2;  // FDICT adds a four-byte dictionary id
+    if (off >= n) return false;
+    return inflateRaw(src + off, n - off, out);
+}
+
+int printPngMeta(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::printf("error: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (file.size() < 8 || be32(file.data()) != 0x89504E47) {
+        std::printf("error: not a PNG: %s\n", path.c_str());
+        return 1;
+    }
+    std::printf("file: %s\n", path.c_str());
+    size_t pos = 8;
+    int shown = 0;
+    auto nul = [](const uint8_t* p, size_t n) {
+        for (size_t i = 0; i < n; i++)
+            if (!p[i]) return i;
+        return n;
+    };
+    auto emit = [&](const std::string& key, const std::string& text) {
+        std::printf("--- %s ---\n", key.empty() ? "text" : key.c_str());
+        std::fwrite(text.data(), 1, text.size(), stdout);
+        if (text.empty() || text.back() != '\n') std::putchar('\n');
+        std::putchar('\n');
+        shown++;
+    };
+    while (pos + 12 <= file.size()) {
+        uint32_t len = be32(&file[pos]);
+        std::string type((const char*)&file[pos + 4], 4);
+        if (pos + 12 + len > file.size()) break;
+        const uint8_t* d = &file[pos + 8];
+        if (type == "tEXt") {
+            size_t z = nul(d, len);
+            if (z >= len) {
+                emit("", std::string((const char*)d, len));  // pre-keyword sdvk chunks
+            } else {
+                emit(std::string((const char*)d, z), std::string((const char*)d + z + 1, len - z - 1));
+            }
+        } else if (type == "zTXt") {
+            size_t z = nul(d, len);
+            if (z < len && z + 2 < len && d[z + 1] == 0) {
+                std::vector<uint8_t> out;
+                if (inflateZlib(d + z + 2, len - z - 2, out))
+                    emit(std::string((const char*)d, z), std::string(out.begin(), out.end()));
+            }
+        } else if (type == "iTXt") {
+            size_t z = nul(d, len);
+            if (z + 3 <= len) {
+                size_t p = z + 3;
+                size_t l1 = nul(d + p, len - p);
+                if (l1 < len - p) {
+                    p += l1 + 1;
+                    size_t l2 = nul(d + p, len - p);
+                    if (l2 < len - p) {
+                        p += l2 + 1;
+                        std::string key((const char*)d, z);
+                        uint8_t comp = d[z + 1], method = d[z + 2];
+                        if (comp == 0) {
+                            emit(key, std::string((const char*)d + p, len - p));
+                        } else if (comp == 1 && method == 0) {
+                            std::vector<uint8_t> out;
+                            if (inflateZlib(d + p, len - p, out)) emit(key, std::string(out.begin(), out.end()));
+                        }
+                    }
+                }
+            }
+        }
+        pos += 12 + len;
+        if (type == "IEND") break;
+    }
+    if (!shown) std::printf("no PNG text metadata\n");
+    return 0;
+}
+
+bool readPngMetaText(const std::string& path, std::string& text, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        err = "cannot open " + path;
+        return false;
+    }
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (file.size() < 8 || be32(file.data()) != 0x89504E47) {
+        err = "not a PNG: " + path;
+        return false;
+    }
+    size_t pos = 8;
+    while (pos + 12 <= file.size()) {
+        uint32_t len = be32(&file[pos]);
+        std::string type((const char*)&file[pos + 4], 4);
+        if (pos + 12 + len > file.size()) break;
+        const uint8_t* d = &file[pos + 8];
+        if (type == "tEXt") {
+            size_t z = 0;
+            while (z < len && d[z]) z++;
+            std::string key = z < len ? std::string((const char*)d, z) : std::string();
+            std::string body =
+                z < len ? std::string((const char*)d + z + 1, len - z - 1) : std::string((const char*)d, len);
+            if (key == "sdvk" || body.rfind("sdvk", 0) == 0) {
+                text = body;
+                return true;
+            }
+        }
+        pos += 12 + len;
+        if (type == "IEND") break;
+    }
+    err = "no sdvk metadata in " + path;
+    return false;
+}
+
 static bool readPng(const std::string& path, std::vector<uint8_t>& rgb, uint32_t& w, uint32_t& h) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -3251,7 +3894,7 @@ static bool readPng(const std::string& path, std::vector<uint8_t>& rgb, uint32_t
     int ch = colorType == 2 ? 3 : colorType == 6 ? 4 : colorType == 0 ? 1 : 0;
     if (!ch) return false;
     std::vector<uint8_t> raw;
-    if (!inflateRaw(idat.data(), idat.size(), raw)) return false;
+    if (!inflateZlib(idat.data(), idat.size(), raw)) return false;
     size_t stride = (size_t)width * ch;
     if (raw.size() < (stride + 1) * height) return false;
     std::vector<uint8_t> px(stride * height);
@@ -3397,7 +4040,18 @@ static std::vector<float> buildLatentMask(const std::string& path, uint32_t cw, 
 // Peek at the UNet file before any text encoding: the TE stage needs to know whether a CLIP-G
 // exists at all (SDXL) or not (SD1.5). loadUnet() re-detects from the loaded weights later.
 static void detectArch(const std::string& unetPath) {
-    if (unetPath.size() > 5 && unetPath.compare(unetPath.size() - 5, 5, ".gguf") == 0) return;
+    if (unetPath.size() > 5 && unetPath.compare(unetPath.size() - 5, 5, ".gguf") == 0) {
+        // A GGUF verdict used to be skipped entirely, which left gArch at its SD1.5 default and made
+        // the CLIP stage build a 768-wide context for an SDXL UNet. The tensor table is enough.
+        GgufFile gg;
+        std::string err;
+        if (!gg.open(unetPath, &err)) return;
+        bool sdxl = gg.find("model.diffusion_model.label_emb.0.0.weight") != nullptr ||
+                    gg.find("label_emb.0.0.weight") != nullptr;
+        gArch = sdxl ? 2 : 1;
+        std::printf("arch: %s\n", gArch == 1 ? "SD1.5" : "SDXL");
+        return;
+    }
     Safetensors st;
     if (!st.open(unetPath)) return;
     bool sdxl = containsPrefix(st, "model.diffusion_model.label_emb.0.0.") || containsPrefix(st, "label_emb.0.0.");
@@ -3481,18 +4135,28 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
 
             auto encodeOne = [&](int phase, const std::vector<int>& ids, std::vector<float>* pooled) {
                 if (ids.size() != 77) fail("token arrays must hold 77 ids");
+                if (std::getenv("SDVK_PRINT_IDS")) {
+                    std::printf("ids[%d]:", phase);
+                    for (int i = 0; i < 77; i++) std::printf(" %d", ids[i]);
+                    std::printf("\n");
+                }
                 bool wide = phase == 1;
-                uint32_t D = wide ? 1280 : 768, heads = wide ? 32 : 12, hd = wide ? 20 : 12, layers = wide ? 4 : 3;
+                uint32_t D = wide ? 1280 : 768, layers = wide ? 32 : 12, heads = wide ? 20 : 12,
+                         actMode = wide ? 4 : 3;  // CLIP-G uses a different GELU variant than CLIP-L
                 std::vector<float> out(77ull * D);
                 BufRef idx = G.scratchArena.alloc(77 * 4);
                 BufRef outB = G.scratchArena.alloc(77ull * D * 4);
                 BufRef outP = G.scratchArena.alloc(1280 * 4);
                 G.eng.uploadNow(idx, ids.data(), 77 * 4);
+                gTrace = p.unetdbg;
+                { const char* e = std::getenv("SDVK_TE_LAYER"); if (e) gTraceLayer = (uint32_t)std::atoi(e); }
                 G.eng.beginStep();
-                if (wide) clipEncode("te2.text_model.", "te2.text_projection", idx, ids, D, heads, hd, layers, outB, outP);
-                else clipEncode("te1.text_model.", "", idx, ids, D, heads, hd, layers, outB, outP);
+                if (wide) clipEncode("te2.text_model.", "te2.text_projection", idx, ids, D, layers, heads, actMode, outB, outP);
+                else clipEncode("te1.text_model.", "", idx, ids, D, layers, heads, actMode, outB, outP);
                 G.eng.endStep();
                 G.eng.waitStep();
+                if (gTrace) flushTrace();
+                gTrace = false;
                 G.eng.downloadNow(outB, out.data(), out.size() * 4);
                 if (pooled) G.eng.downloadNow(outP, pooled->data(), 1280 * 4);
                 return out;
@@ -3578,6 +4242,11 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 }
             }
             std::vector<float> img = resampleChw(crop, cw, chh, width, height);
+            if (std::getenv("OFC_INIT_DUMP")) {
+                FILE* df = std::fopen("dbg_init_plane.f32", "wb");
+                if (df) { std::fwrite(img.data(), 4, img.size(), df); std::fclose(df); }
+                std::printf("init plane: %ux%u (src %ux%u crop %ux%u)\n", width, height, iw, ih, cw, chh);
+            }
             report(onProgress, Progress::Kind::Load, 0, 1, 0.12, 0.0, "vae encode");
             prepareVaeArena(p);
             initLat = vaeEncodeChain(p, img, height, width);
@@ -3585,6 +4254,20 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             if (!p.maskImage.empty())
                 initMask = buildLatentMask(p.maskImage, width, height, Lh0, Lw0, p.maskFeather, p.maskInvert);
             if (p.roundtrip) {
+                // OFC_LATENT_DUMP=<file>: the encoder's output in the same OFCL layout as
+                // tools/refencode.py, so the two latents can be compared directly instead of
+                // inferring correctness from a decoded PSNR.
+                if (const char* latOut = std::getenv("OFC_LATENT_DUMP")) {
+                    if (FILE* lf = std::fopen(latOut, "wb")) {
+                        const char magic[4] = {'O', 'F', 'C', 'L'};
+                        uint32_t dims[3] = {4, Lh0, Lw0};
+                        std::fwrite(magic, 1, 4, lf);
+                        std::fwrite(dims, 4, 3, lf);
+                        std::fwrite(initLat.data(), 4, initLat.size(), lf);
+                        std::fclose(lf);
+                        std::printf("latent dumped: %s (%zu floats)\n", latOut, initLat.size());
+                    }
+                }
                 // encode -> decode with no sampling: the only check that proves the two halves
                 // agree. Report the PSNR against the resampled source instead of eyeballing it.
                 report(onProgress, Progress::Kind::Decode, 1, 1, 0.85, 0.0, "vae decode");
@@ -3715,9 +4398,17 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
                 std::normal_distribution<float> nd(0.0f, 1.0f);
                 for (auto& v : lat) v = nd(rng);
             }
+            if (std::getenv("OFC_CLEAR_STEP")) {
+                G.eng.beginStep();
+                G.eng.fill(BufRef{G.eng.stepArena().buffer(), 0, G.eng.stepArena().cap()}, 0u);
+                G.eng.fill(BufRef{G.eng.scratchArena().buffer(), 0, G.eng.scratchArena().cap()}, 0u);
+                G.eng.endStep();
+                G.eng.waitStep();
+            }
             G.eng.uploadNow(xLat, lat.data(), lat.size() * 4);
             auto te = timeEmbHost(p.probeT, 320);
             G.eng.uploadNow(embHost, te.data(), te.size() * 4);
+            gXKv.clear();
             G.eng.beginStep();
             BufRef temb = buildTemb(poolCB, addTimeB, embHost);
             gTrace = p.unetdbg;
@@ -3730,6 +4421,12 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             gTrace = false;
             std::vector<float> ep(latFloats);
             G.eng.downloadNow(eps, ep.data(), ep.size() * 4);
+            if (const char* pd = std::getenv("OFC_PROBE_DUMP")) {
+                if (FILE* pf = std::fopen(pd, "wb")) {
+                    std::fwrite(ep.data(), 4, ep.size(), pf);
+                    std::fclose(pf);
+                }
+            }
             double rms = 0;
             uint64_t bad = 0;
             for (float v : ep) {
@@ -3738,6 +4435,24 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             }
             std::printf("probe: t=%.1f %ux%u eps rms %.5f bad %llu\n", p.probeT, Lw, Lh,
                         std::sqrt(rms / (double)ep.size()), (unsigned long long)bad);
+            if (std::getenv("OFC_PROBE_HASH_INPUTS")) {
+                auto ih = [&](const char* nm, const BufRef& b, uint64_t n) {
+                    std::vector<float> v((size_t)n);
+                    G.eng.downloadNow(b, v.data(), n * 4);
+                    uint64_t h = 1469598103934665603ull;
+                    const uint8_t* q = (const uint8_t*)v.data();
+                    for (uint64_t i = 0; i < n * 4; i++) {
+                        h ^= q[i];
+                        h *= 1099511628211ull;
+                    }
+                    std::printf("ihash %s %016llx\n", nm, (unsigned long long)h);
+                };
+                ih("lat", xLat, lat.size());
+                ih("ctx", ctxC, embCond.size());
+                ih("pool", poolCB, poolC.size());
+                ih("emb", embHost, te.size());
+            }
+            G.eng.profileDump();
             res.ok = true;
             res.totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
             return res;
@@ -3748,12 +4463,12 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
         bool partial = p.useInit && p.denoise < 0.999f;
         int totalSteps = p.steps > 0 ? p.steps : 20;
         Euler full = buildEuler(totalSteps, sp, 1000, 1, p.zsnr);
-        Euler sch = partial ? buildPartial(full, std::max(1, (int)std::lround(totalSteps * p.denoise)), p.denoise, p.zsnr)
-                            : full;
+        Euler sch = partial ? buildPartial(full, totalSteps, p.denoise, p.zsnr) : full;
         int steps = (int)sch.timesteps.size();
         res.steps = steps;
-        std::printf("sampler %s: t0 %.1f  init_sigma %.5f  steps %d\n", ofc::sdxl::samplerName(p.sampler),
-                    sch.timesteps[0], sch.initNoiseSigma, steps);
+        std::printf("sampler %s: t0 %.1f  sigma0 %.4f  steps %d%s\n", ofc::sdxl::samplerName(p.sampler),
+                    steps ? sch.timesteps[0] : 0.0f, sch.sigmas.empty() ? 0.0f : sch.sigmas[0], steps,
+                    partial ? " (partial)" : "");
 
         std::mt19937 rng(p.seed);
         std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -3783,6 +4498,7 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             G.eng.downloadNow(eps, epsOut.data(), epsOut.size() * 4);
         };
 
+        gXKv.clear();  // new prompt/ctx: rebuild cross-attention K/V on the first step
         bool needCfg = p.cfg > 1.0001f;
         std::vector<float> epsU(latFloats), epsC(latFloats), scaled(latFloats), resv(latFloats), x0v(latFloats),
             x0b(latFloats), epsG(latFloats), epsG2(latFloats), xTmp(latFloats), xNext(latFloats), absv(latFloats);
@@ -4071,7 +4787,7 @@ RunResult run(EvalModel& m, const GenParams& in, const ProgressFn& onProgress) {
             rh = (rh + 7u) & ~7u;
             rw = (rw + 7u) & ~7u;
             std::vector<float> rlat = upscaleLatentBilinear(lat, Lh, Lw, rh, rw);
-            Euler rs = buildPartial(full, steps, p.hiresRefine, p.zsnr);
+            Euler rs = buildPartial(full, totalSteps, p.hiresRefine, p.zsnr);
             const int rn = (int)rs.timesteps.size();
             // The refine pass reuses the step arena that was sized for the base canvas, so a tile
             // must never be larger than the base latent (96 px of canvas at 768 -> ~1.5 GB already).
@@ -4211,6 +4927,25 @@ bool writePngFile(const std::string& path, const std::vector<float>& rgbChw, uin
     return writeImageFile(path, rgbChw, w, h, compress, info);
 }
 
+static std::string findVaeForDecode(const std::string& dir) {
+    std::error_code ec;
+    for (const char* rel : {"vae/model.safetensors", "vae/diffusion_pytorch_model.safetensors", "vae.safetensors",
+                            "vae_model.safetensors"}) {
+        std::filesystem::path p = std::filesystem::path(dir) / rel;
+        if (std::filesystem::is_regular_file(p, ec)) return p.string();
+    }
+    std::filesystem::path vd = std::filesystem::path(dir) / "vae";
+    std::vector<std::string> files;
+    for (auto& e : std::filesystem::directory_iterator(vd, ec)) {
+        if (!e.is_regular_file()) continue;
+        std::string ext = e.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (ext == ".safetensors") files.push_back(e.path().string());
+    }
+    std::sort(files.begin(), files.end());
+    return files.empty() ? std::string() : files.front();
+}
+
 RunResult decodeLatentFile(EvalModel& m, const GenParams& in, const std::string& latentPath,
                            const ProgressFn& onProgress) {
     RunResult res;
@@ -4219,18 +4954,21 @@ RunResult decodeLatentFile(EvalModel& m, const GenParams& in, const std::string&
     GenParams p = in;
     p.noVae = false;
     try {
-        // --decode never touches the UNet, but it still needs the VAE path filled in.
-        {
-            ModelSet set;
-            if (!ofc::sdxl::resolveModels(p, set, err)) fail(err);
-        }
+        // --decode only needs a VAE: no UNet, text encoders or tokenizers are touched.
+        if (p.models.vae.empty() && !p.models.modelDir.empty()) p.models.vae = findVaeForDecode(p.models.modelDir);
+        if (p.models.vae.empty())
+            fail("decode needs --vae <file.safetensors> (or -m <dir> containing vae/)");
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p.models.vae, ec)) fail("VAE not found: " + p.models.vae);
         if (!ensureDevice(p.spvDir, err, p.device)) fail(err);
+        m.deviceName = G.eng.deviceName();
         std::vector<float> lat;
         uint32_t lh = 0, lw = 0;
         if (!readLatent(latentPath, lat, lh, lw, err)) fail(err);
         report(onProgress, Progress::Kind::Load, 0, 1, 0.05, 0.0, "decoding latent " + latentPath);
         auto tv = std::chrono::steady_clock::now();
         std::vector<float> img = vaeDecode(p, lat, lh, lw);
+        G.eng.profileDump();
         uint32_t ow = lw * 8, oh = lh * 8;
         if (p.hires > 1.01f) upscaleImageBicubic(img, ow, oh, p.hires);
         res.vaeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
@@ -4239,7 +4977,14 @@ RunResult decodeLatentFile(EvalModel& m, const GenParams& in, const std::string&
         if (out.empty()) out = latentPath + ".png";
         p.width = ow;
         p.height = oh;
-        std::string info = p.infoOut ? infoText(p, "latent", m.deviceName) : std::string();
+        std::string info;
+        if (p.infoOut) {
+            char ib[1024];
+            std::snprintf(ib, sizeof ib, "sdvk latent decode\nsource: %s\ndevice: %s\nsize: %ux%u\nvae: %s",
+                          std::filesystem::path(latentPath).filename().string().c_str(), m.deviceName.c_str(), ow, oh,
+                          std::filesystem::path(p.models.vae).filename().string().c_str());
+            info = ib;
+        }
         if (!writeImageFile(out, img, ow, oh, p.pngCompress, info)) fail("cannot write " + out);
         res.image.width = ow;
         res.image.height = oh;

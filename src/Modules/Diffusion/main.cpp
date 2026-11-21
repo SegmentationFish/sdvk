@@ -8,6 +8,7 @@
 #include "Modules/Diffusion/ModelSet.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -39,7 +41,9 @@ static void usage() {
         "usage:\n"
         "  sdvkgen \"<prompt>\" [options]              generate an image\n"
         "  sdvkgen -m <model-dir> \"<prompt>\"          point at a model folder instead\n"
-        "  sdvkgen --decode <latent.bin> [--out f]    decode a saved latent\n"
+        "  sdvkgen --decode <latent.bin> --vae <vae>  decode a saved latent (VAE only)\n"
+        "  sdvkgen --meta <image.png>                 print embedded generation parameters\n"
+        "  sdvkgen --line <image.png> [-m <dir>]      print a runnable command from metadata\n"
         "  sdvkgen --models                           list what a model folder contains\n"
         "\n"
         "model:\n"
@@ -78,6 +82,7 @@ static void usage() {
         "  --denoise <f>           img2img strength, 0..1 (default 0.75 with --init)\n"
         "  --crop <x,y,w,h>        region of the seed image to use\n"
         "  --mask <image>          inpaint mask (white = repaint); needs --init\n"
+        "  --unet-q8               encode safetensors UNet weights to Q8_0 (fits fp32 SD1.5 on 8 GB)\n"
         "  --mask-feather <n>      mask edge feather in latent px (default 8, 0 = hard)\n"
         "  --mask-invert           black means repaint\n"
         "  --roundtrip             encode the seed image and decode it back, no sampling\n"
@@ -90,12 +95,14 @@ static void usage() {
         "  --latent-out <file>     latent path (default sdvkgen_latent.bin)\n"
         "  --no-latent             do not write the latent\n"
         "  --no-info               do not embed the parameters into the PNG\n"
+        "  --meta <image.png>      print the metadata embedded in a generated PNG (no GPU)\n"
+        "  --line <image.png>      print a runnable sdvk command from the PNG (pass -m to resolve the model)\n"
         "\n"
         "runtime:\n"
         "  --spv <dir>             shader (.spv) directory (default shaders)\n"
         "  --param-mb <n>          UNet weight arena in MB (default: from the file size)\n"
         "  --step-mb/--scratch-mb/--vstep-mb <n>   arena sizes in MB\n"
-        "  --vae-tile <n>          decode the VAE in n-latent-px tiles (0 = auto)\n"
+        "  --vae-tile <n>          decode the VAE in n-latent-px tiles (0 = auto: full up to 896²)\n"
         "  --vae-overlap <n>       tile overlap in latent px (default 8)\n"
         "  --hires <f>             post-decode bicubic upscale (1 = off, 2 = 2x output)\n"
         "  --hires-denoise <d>     with --hires: latent upscale + tiled image-to-image re-denoise\n"
@@ -125,6 +132,8 @@ struct Parsed {
     bool check = false, bench = false;
     std::string listDir;
     std::string decodeIn;
+    std::string metaIn;
+    std::string lineIn;
     int verbose = 0;
     std::string err;
 };
@@ -309,6 +318,8 @@ static Parsed parseArgs(int argc, char** argv) {
             if (!need(i, argc, a.c_str(), o)) break;
             p.maskFeather = (uint32_t)std::max(0, std::atoi(val().c_str()));
             i++;
+        } else if (a == "--unet-q8") {
+            p.unetQ8 = true;
         } else if (a == "--mask-invert") {
             p.maskInvert = true;
         } else if (a == "--roundtrip") {
@@ -344,6 +355,14 @@ static Parsed parseArgs(int argc, char** argv) {
         } else if (a == "--decode") {
             if (!need(i, argc, a.c_str(), o)) break;
             o.decodeIn = val();
+            i++;
+        } else if (a == "--meta") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            o.metaIn = val();
+            i++;
+        } else if (a == "--line" || a == "--cmd") {
+            if (!need(i, argc, a.c_str(), o)) break;
+            o.lineIn = val();
             i++;
         } else if (a == "--spv") {
             if (!need(i, argc, a.c_str(), o)) break;
@@ -435,6 +454,126 @@ static Parsed parseArgs(int argc, char** argv) {
     return o;
 }
 
+static std::string lowerCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+static std::string metaLine(const std::string& text, const std::string& key) {
+    const std::string pat = key + ": ";
+    size_t p = text.find(pat);
+    while (p != std::string::npos && p != 0 && text[p - 1] != '\n') p = text.find(pat, p + 1);
+    if (p == std::string::npos) return {};
+    size_t b = p + pat.size();
+    size_t e = text.find('\n', b);
+    return text.substr(b, e == std::string::npos ? std::string::npos : e - b);
+}
+
+static std::string metaBlock(const std::string& text, const std::string& key, const std::string& nextKey) {
+    const std::string pat = key + ": ";
+    size_t p = text.find(pat);
+    while (p != std::string::npos && p != 0 && text[p - 1] != '\n') p = text.find(pat, p + 1);
+    if (p == std::string::npos) return {};
+    size_t b = p + pat.size();
+    size_t e = std::string::npos;
+    if (!nextKey.empty()) e = text.find("\n" + nextKey + ": ", b);
+    std::string v = text.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    while (!v.empty() && (v.back() == '\n' || v.back() == '\r')) v.pop_back();
+    return v;
+}
+
+static std::string findModelFile(const std::string& dir, const std::string& name) {
+    std::error_code ec;
+    const std::string want = lowerCopy(name);
+    std::vector<std::string> hits;
+    for (auto it = fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file()) continue;
+        std::string ext = lowerCopy(it->path().extension().string());
+        if (ext != ".gguf" && ext != ".safetensors") continue;
+        if (lowerCopy(it->path().filename().string()) == want || lowerCopy(it->path().stem().string()) == want)
+            hits.push_back(it->path().string());
+    }
+    std::sort(hits.begin(), hits.end());
+    for (const auto& h : hits)
+        if (lowerCopy(fs::path(h).extension().string()) == ".gguf") return h;
+    return hits.empty() ? std::string() : hits.front();
+}
+
+static std::string shellArg(const std::string& s) {
+    std::string o = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\' || c == '$' || c == '`') o += '\\';
+        o += c;
+    }
+    o += '"';
+    return o;
+}
+
+static std::string commandFromMeta(const std::string& meta, const std::string& modelDir, const std::string& unetOverride,
+                                   std::string& err) {
+    const std::string model = metaLine(meta, "model");
+    const std::string size = metaLine(meta, "size");
+    const std::string steps = metaLine(meta, "steps");
+    const std::string samplerLine = metaLine(meta, "sampler");
+    const std::string prompt = metaBlock(meta, "prompt", "negative");
+    const std::string negative = metaBlock(meta, "negative", "");
+    unsigned w = 0, h = 0;
+    int nsteps = 0;
+    float cfg = 0;
+    unsigned seed = 0;
+    if (model.empty() || prompt.empty() || std::sscanf(size.c_str(), "%ux%u", &w, &h) != 2 ||
+        std::sscanf(steps.c_str(), "%d  cfg: %f  seed: %u", &nsteps, &cfg, &seed) != 3) {
+        err = "not a generation image (need model, size, steps/cfg/seed and prompt)";
+        return {};
+    }
+    std::string unet = unetOverride;
+    if (unet.empty()) {
+        if (modelDir.empty()) {
+            err = "pass -m <model-dir> to resolve model '" + model + "'";
+            return {};
+        }
+        unet = findModelFile(modelDir, model);
+        if (unet.empty()) {
+            err = "model '" + model + "' not found under " + modelDir;
+            return {};
+        }
+    }
+    std::error_code ec;
+    if (!fs::is_regular_file(unet, ec)) {
+        err = "UNet not found: " + unet;
+        return {};
+    }
+    std::istringstream ss(samplerLine);
+    std::string sampler, tok, spacing = "leading";
+    bool vpred = false, zsnr = false;
+    ss >> sampler;
+    while (ss >> tok) {
+        if (tok == "vpred") vpred = true;
+        else if (tok == "zsnr") zsnr = true;
+        else if (tok == "spacing:") ss >> spacing;
+    }
+    if (sampler.empty()) sampler = "euler";
+    char cfgbuf[32];
+    std::snprintf(cfgbuf, sizeof cfgbuf, "%.2f", cfg);
+    std::string cmd = "sdvk";
+    if (!modelDir.empty()) cmd += " -m " + shellArg(fs::path(modelDir).generic_string());
+    cmd += " --unet " + shellArg(fs::path(unet).generic_string());
+    cmd += " --prompt " + shellArg(prompt);
+    if (!negative.empty()) cmd += " --neg " + shellArg(negative);
+    cmd += " --width " + std::to_string(w) + " --height " + std::to_string(h);
+    cmd += " --steps " + std::to_string(nsteps) + " --cfg " + std::string(cfgbuf) + " --seed " + std::to_string(seed);
+    cmd += " --sampler " + sampler + " --spacing " + spacing;
+    if (vpred) cmd += " --vpred";
+    if (zsnr) cmd += " --zsnr";
+    if (vpred && lowerCopy(model).find("vpred") == std::string::npos &&
+        lowerCopy(model).find("v-pred") == std::string::npos)
+        std::fprintf(stderr, "note: metadata says vpred but model '%s' has no vpred marker; "
+                             "WAI/Illustrious are epsilon\n", model.c_str());
+    return cmd;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::signal(SIGINT, onSignal);
@@ -458,6 +597,21 @@ int main(int argc, char** argv) {
     if (!o.err.empty()) {
         std::printf("error: %s\n(run with --help)\n", o.err.c_str());
         return 1;
+    }
+    if (!o.metaIn.empty()) return printPngMeta(o.metaIn);
+    if (!o.lineIn.empty()) {
+        std::string meta, err;
+        if (!readPngMetaText(o.lineIn, meta, err)) {
+            std::printf("error: %s\n", err.c_str());
+            return 1;
+        }
+        std::string cmd = commandFromMeta(meta, o.p.models.modelDir, o.p.models.unet, err);
+        if (cmd.empty()) {
+            std::printf("error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("%s\n", cmd.c_str());
+        return 0;
     }
     GenParams& p = o.p;
 

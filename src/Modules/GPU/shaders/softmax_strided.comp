@@ -1,0 +1,33 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// rowwise softmax over `cols`, one workgroup per row. Unlike softmax_fwd this reads and writes
+// through the same linear buffer (x may be a slice of a bigger allocation).
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer X { float x[]; };
+layout(binding = 1) buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint rowsTotal; uint cols; uint pad; } pc;
+
+shared float red[256];
+
+void main(){
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.rowsTotal) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = r * pc.cols;
+    float mx = -1.0e30;
+    for (uint j = tid; j < pc.cols; j += 256) mx = max(mx, x[base + j]);
+    red[tid] = mx;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1) { if (tid < st) red[tid] = max(red[tid], red[tid + st]); barrier(); }
+    float m = red[0];
+    barrier();
+    float s = 0.0;
+    for (uint j = tid; j < pc.cols; j += 256) s += exp(x[base + j] - m);
+    red[tid] = s;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1) { if (tid < st) red[tid] += red[tid + st]; barrier(); }
+    float ir = 1.0 / max(red[0], 1.0e-30);
+    for (uint j = tid; j < pc.cols; j += 256) y[base + j] = exp(x[base + j] - m) * ir;
+}

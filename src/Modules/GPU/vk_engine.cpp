@@ -47,6 +47,7 @@ struct KernelDef {
     uint32_t nBindings;
     uint32_t pushSize;
     uint32_t writeMask;
+    bool optional = false;  // pipeline failure is tolerated; caller must check hasKernel()
 };
 static const KernelDef KERNELS[] = {
     {"gemm_nn", 3, 48, 0x4},
@@ -113,7 +114,7 @@ static const KernelDef KERNELS[] = {
     {"attn_softmax_fwd", 4, 20, 0x8},
     {"attn_softmax_bwd", 5, 20, 0x18},
     {"im2col", 2, 20, 0x2},
-    {"im2col_s2", 2, 24, 0x2},  // shader added int off at +20
+    {"im2col_s2", 2, 32, 0x2},  // C,H,W,OH,OW,off at +20, then row0/rows for banded dispatch
     {"layernorm_fwd", 4, 16, 0x8},
     {"causal_mask", 1, 12, 0x1},
     {"groupnorm", 4, 20, 0x8},
@@ -121,7 +122,11 @@ static const KernelDef KERNELS[] = {
     {"bias_add", 2, 8, 0x1},
     {"add2", 3, 4, 0x4},
     {"fused_attn", 4, 36, 0x8},
-    {"fused_attn_tiled", 4, 36, 0x8},
+    // 49,920 B of shared memory: some drivers report a lower limit but accept the pipeline,
+    // so load it opportunistically and fall back to fused_attn when creation fails.
+    {"fused_attn_tiled", 4, 36, 0x8, true},
+    {"mask_mul", 3, 8, 0x1},
+    {"softmax_strided", 2, 16, 0x3},
 };
 static const size_t NUM_KERNELS = sizeof(KERNELS) / sizeof(KERNELS[0]);
 
@@ -358,6 +363,19 @@ void Engine::init() {
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(phys_, &p);
     deviceName_ = p.deviceName;
+    {
+        VkPhysicalDeviceSubgroupProperties sp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &sp;
+        vkGetPhysicalDeviceProperties2(phys_, &p2);
+        subgroupSize_ = sp.subgroupSize;
+        subgroupCompute_ = (sp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        maxComputeSharedMemory_ = p.limits.maxComputeSharedMemorySize;
+        maxComputeWorkGroupInvocations_ = p.limits.maxComputeWorkGroupInvocations;
+        std::fprintf(stderr, "subgroup: size %u, compute %s; compute limits: shared %u B, wg invocations %u\n",
+                     subgroupSize_, subgroupCompute_ ? "yes" : "no", maxComputeSharedMemory_,
+                     maxComputeWorkGroupInvocations_);
+    }
     {
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
@@ -678,7 +696,16 @@ void Engine::loadKernels(const std::string& spvDir) {
         cpi.stage.pName = "main";
         cpi.layout = layout;
         Kernel k;
-        VK_CHECK(vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &k.pipe));
+        VkResult pres = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &k.pipe);
+        if (pres != VK_SUCCESS && kd.optional) {
+            std::fprintf(stderr, "[vk] optional kernel %s unavailable (VkResult %d), using fallback\n",
+                         kd.name, (int)pres);
+            vkDestroyPipelineLayout(dev_, layout, nullptr);
+            vkDestroyDescriptorSetLayout(dev_, dsl, nullptr);
+            vkDestroyShaderModule(dev_, mod, nullptr);
+            continue;
+        }
+        VK_CHECK(pres);
         k.layout = layout;
         k.nBindings = kd.nBindings;
         k.pushSize = kd.pushSize;
