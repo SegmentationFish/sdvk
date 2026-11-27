@@ -49,5 +49,8 @@ private:
     Impl* impl_ = nullptr;
 };
 
+// Diagnostic: read + dequantise one embed_tokens row (used by --lm-embed-test).
+void saLmEmbedTest(const std::string& ggufPath, int id, std::string& err);
+
 }  // namespace audio
 }  // namespace ofc

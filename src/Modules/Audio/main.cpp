@@ -64,6 +64,31 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    if (argc >= 4 && std::string(argv[1]) == "--lm-embed-test") {
+        ofc::GgufFile g;
+        std::string err;
+        if (!g.open(argv[2], &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        const ofc::GgufTensor* t = g.find("model.embed_tokens.weight");
+        if (!t) {
+            std::fprintf(stderr, "error: no embed tensor\n");
+            return 1;
+        }
+        int id = std::atoi(argv[3]);
+        uint64_t rowBytes = t->nbytes / (uint64_t)t->shape().first;
+        std::vector<uint8_t> row((size_t)rowBytes);
+        if (!g.readRange(*t, (uint64_t)id * rowBytes, row.data(), rowBytes)) {
+            std::fprintf(stderr, "error: readRange failed\n");
+            return 1;
+        }
+        std::printf("embed row %d: %llu bytes, type %u\n", id, (unsigned long long)rowBytes,
+                    (unsigned)t->type);
+        ofc::audio::saLmEmbedTest(argv[2], id, err);
+        if (!err.empty()) std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 0;
+    }
     if (argc >= 3 && std::string(argv[1]) == "--lm-test") {
         ofc::audio::SaLm lm;
         std::string err;

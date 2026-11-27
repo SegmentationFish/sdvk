@@ -122,7 +122,7 @@ struct SaLm::Impl {
     GgufFile gguf;
     std::string lastErr;
     int nLayers = 36, dim = 4096, kvDim = 1024, ffn = 12288, vocab = 200000;
-    int heads = 32, kvHeads = 8, hd = 128, maxSeq = 512;
+    int heads = 32, kvHeads = 8, hd = 128, maxSeq = 160;
     float eps = 1e-6f, theta = 1.0e6f;
 
     struct Layer {
@@ -207,6 +207,35 @@ struct SaLm::Impl {
         }
     }
 };
+
+// Diagnostic: reads and dequantises one embedding row, printing statistics.
+void saLmEmbedTest(const std::string& ggufPath, int id, std::string& err) {
+    GgufFile g;
+    if (!g.open(ggufPath, &err)) return;
+    const GgufTensor* t = g.find("model.embed_tokens.weight");
+    if (!t) {
+        err = "no embed tensor";
+        return;
+    }
+    const uint64_t rows = (uint64_t)t->shape().first;
+    const uint64_t rowBytes = t->nbytes / rows;
+    std::vector<uint8_t> row((size_t)rowBytes);
+    if (!g.readRange(*t, (uint64_t)id * rowBytes, row.data(), rowBytes)) {
+        err = "readRange failed";
+        return;
+    }
+    std::vector<float> out(4096);
+    dequantRow((uint32_t)t->type, row.data(), 4096, out.data());
+    double ss = 0;
+    float mn = out[0], mx = out[0];
+    for (float v : out) {
+        ss += (double)v * v;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
+    std::printf("embed[%d] type %u: rms %.5f min %.4f max %.4f first %.5f %.5f\n", id, (unsigned)t->type,
+                std::sqrt(ss / 4096.0), mn, mx, out[0], out[1]);
+}
 
 SaLm::~SaLm() { delete impl_; }
 
@@ -296,12 +325,12 @@ bool SaLm::load(const std::string& ggufPath, const std::string& spvDir, std::str
         G.paramBytes = 64ull << 20;
         ofc::gpu::gInit(spvDir);
     }
-    G.eng.initArenas(256ull << 20, 128ull << 20);
+    G.eng.initArenas(64ull << 20, 64ull << 20);
     // KV cache + weight staging live in the persistent scratch arena (gpu_ops owns it)
-    ofc::gpu::gResizeScratch(768ull << 20);
+    ofc::gpu::gResizeScratch(384ull << 20);
     gpu::Arena& pers = G.scratchArena;
     G.paramArena.destroy();
-    G.paramArena.init(G.eng.device(), G.eng.physDevice(), 256ull << 20, true, false);
+    G.paramArena.init(G.eng.device(), G.eng.physDevice(), 64ull << 20, true, false);
 
     gpu::Arena& arena = G.eng.stepArena();
     auto alloc = [&](uint64_t floats) { return arena.alloc(align256(floats * 4)); };
