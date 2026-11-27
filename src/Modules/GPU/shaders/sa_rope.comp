@@ -1,0 +1,37 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// Partial rotary embedding (MiniMax Music 3 DiT): GPT-NeoX half-split pairing over the first
+// `rot` dims of every `hd`-wide head, cos/sin tables precomputed on the host as [S, rot/2].
+// q and k live inside the fused qkv buffer, so the row stride is `rowStride` and the slice starts
+// at `base`.
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer X { float x[]; };
+layout(binding = 1) readonly buffer CS { float cosv[]; };
+layout(binding = 2) readonly buffer SN { float sinv[]; };
+layout(push_constant) uniform PC {
+    uint seq;        // rows
+    uint heads;
+    uint hd;         // head width (64)
+    uint rot;        // rotated dims (32)
+    uint rowStride;  // elements per row in x (6144)
+    uint base;       // element offset of q or k inside a row
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint halfR = pc.rot / 2u;
+    uint total = pc.seq * pc.heads * halfR;
+    if (i >= total) return;
+    uint p = i % halfR;          // frequency index
+    uint h = (i / halfR) % pc.heads;
+    uint s = i / (halfR * pc.heads);
+    uint rowOff = s * pc.rowStride + h * pc.hd + pc.base;
+    float c = cosv[s * halfR + p];
+    float sn = sinv[s * halfR + p];
+    float a = x[rowOff + p];          // first half
+    float b = x[rowOff + p + halfR];  // second half
+    x[rowOff + p] = a * c - b * sn;
+    x[rowOff + p + halfR] = b * c + a * sn;
+}

@@ -51,7 +51,7 @@ void main(){
             uint cc = e % BK;
             uint gr = bx*BN + r;
             uint gc = kBase + cc;
-            Bs[r][cc] = (gr < pc.N && gc < pc.K) ? b[bo + gr*pc.K + gc] : 0.0;
+            Bs[r][cc] = (gr < pc.N && gc < pc.K) ? b[bo + gr*ldb + gc] : 0.0;
         }
         barrier();
         for(uint k=0;k<BK;k++){

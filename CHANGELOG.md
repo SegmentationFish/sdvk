@@ -7,6 +7,46 @@ All notable changes to sdvk. The project is pre-1.0; the format follows
 
 ### Added
 
+- **MiniMax Music 3 synthesis stage 2: condition encoder + flow-matching DiT (2.4B).**
+  `sdvkaudio --dit <MiniMax-Music3-Q4_K_M.gguf> --dit-check <dir>` runs the condition encoder and
+  one DiT forward. The GGUF carries both components (`diffusion_transformer.*`,
+  `latent_conditioners.0.*`, `cond_layer_{logits,scale}`); 2-D weights go through the existing
+  Q8_0 re-encode path so the 2.4B model fits the card. Everything runs in a `[seq, channels]`
+  layout so a Linear is one GEMM; the 32-head attention is a batched `gemm_nt` + softmax +
+  `gemm_nn` over strided head slices, and partial NeoX-style RoPE (32 of 64 dims) plus the
+  timestep prefix token are handled by three new shaders (`sa_rope`, `sa_swiglu`, `sa_scale`,
+  `sa_bias_col`).
+  Verified against the official diffusers classes (`MiniMaxMusic3ConditionEncoder`,
+  `MiniMaxMusic3Transformer1DModel`, PR 14456) loaded from the published fp16 repack: condition
+  encoder corr 0.999997, block 0 and 1 hidden states rel 1.35e-2 / 1.09e-2, i.e. Q4_K quantisation
+  level. `--gemm-check` shows the fp32 and Q8 GEMMs at rel 7.5e-7 / 2.7e-4.
+- `--gguf-dump <gguf> <tensor> <out.f32>` dequantises one GGUF tensor for comparison against the
+  reference safetensors.
+
+### Fixed
+
+- **`gemm_nt` ignored `ldb`**: the B tile loaded `b[bo + gr*pc.K + gc]`, so a matrix whose row stride
+  differs from `K` (any batched per-head slice of a fused qkv buffer) was read with the wrong
+  stride. It now uses `ldb` like `gemm_nn` already did. Symptom: the DiT attention produced
+  correctly sized but decorrelated output (scores corr 0.46 against the reference, PV 0.67) while
+  the Q/K/V projections themselves matched.
+
+### Notes
+
+- **Q4_K is not free on the projections.** `project_out` is a small-magnitude matrix (rms 0.008)
+  whose product with 33-rms hidden states cancels ~30:1, so the 10% weight error Q4_K leaves on it
+  becomes a 17% error on the predicted velocity, even though every block matches at 1e-2. The
+  engine's own GEMM is exact (7e-7) and a python fp32 replay from the reference's own block output
+  matches the reference to corr 1.000000, so this is quantisation, not a port bug. Use the Q8_0
+  DiT GGUF (2.5 GB) when memory allows.
+- **This box cannot currently run the full 36-block model**: the 2.9 GB Q8 parameter arena fails to
+  allocate because the AMD driver mirrors device-local memory in system RAM and only ~3.1 GB of
+  commit is free (browser + desktop hold the rest). Closing background apps or a bigger machine is
+  required; the 2-block reference run works.
+
+
+### Added
+
 - **`sdvkaudio` (new target) + MiniMax Music 3 pipeline, stage 1: the flow-VAE decoder.**
   `sdvkaudio --vae <minimax dav.safetensors> --vae-decode <latent.f32> --frames <n> --out song.wav`
   decodes a raw `[frames, 128]` f32 latent to 44.1 kHz stereo. The DAC-style stack

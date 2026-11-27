@@ -1,0 +1,20 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// SwiGLU epilogue for the MiniMax Music 3 DiT feed-forward: the 16384-wide projection holds
+// (value, gate) halves; out[s, j] = value * silu(gate).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint half_; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows * pc.half_) return;
+    uint r = i / pc.half_;
+    uint j = i % pc.half_;
+    float v = x[r * 2u * pc.half_ + j];
+    float g = x[r * 2u * pc.half_ + pc.half_ + j];
+    y[i] = v * (g / (1.0 + exp(-g)));
+}
