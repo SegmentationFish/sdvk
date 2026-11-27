@@ -270,7 +270,9 @@ bool SaDit::load(const std::string& ggufPath, const std::string& spvDir, int max
     }
     G.eng.initArenas(768ull << 20, 256ull << 20);
     G.paramArena.destroy();
-    G.paramArena.init(G.eng.device(), G.eng.physDevice(), m->paramBytes, true, false);
+    // host-visible avoids the driver's RAM mirror of device-local memory (the box has little commit left)
+    bool hostW = std::getenv("OFC_AUDIO_HOSTWEIGHTS") != nullptr;
+    G.paramArena.init(G.eng.device(), G.eng.physDevice(), m->paramBytes, !hostW, hostW);
 
     auto P = [](int i, const char* rest) {
         return "diffusion_transformer.transformer.layers." + std::to_string(i) + "." + rest;
