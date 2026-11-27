@@ -240,6 +240,63 @@ void saSelfTestGemm(int M, int N, int K, float& e32, float& e8) {
     e8 = rel(o8);
 }
 
+// Validates the in-shader quantised dequant against the host path (GgufFile::readQ8, which is
+// verified against gguf-py): C = A[M,K] * W[N,K]^T computed both ways for one real tensor.
+void saCheckKqGemm(const std::string& ggufPath, const std::string& tensor, int M, std::string& err) {
+    GgufFile g;
+    if (!g.open(ggufPath, &err)) return;
+    const GgufTensor* t = g.find(tensor);
+    if (!t) {
+        err = "tensor not found: " + tensor;
+        return;
+    }
+    const uint32_t type = (uint32_t)t->type;
+    if (type != 12 && type != 13 && type != 14) {
+        err = "not a K-quant tensor";
+        return;
+    }
+    auto sh = t->shape();
+    const int N = (int)sh.first, K = (int)sh.second;
+    std::vector<float> w = g.readFloat(tensor, &err);
+    if (!err.empty()) return;
+    if ((int)w.size() != N * K) {
+        err = "unexpected dequant size";
+        return;
+    }
+    std::vector<uint8_t> raw;
+    if (!g.readRaw(*t, raw)) {
+        err = "raw read failed";
+        return;
+    }
+    std::vector<float> a((size_t)M * K);
+    for (size_t i = 0; i < a.size(); i++) a[i] = std::sin((float)i * 0.0011f) * 0.4f;
+
+    G.eng.beginStep();
+    BufRef A = G.eng.stepArena().alloc(align256(a.size() * 4));
+    BufRef Wf = G.eng.stepArena().alloc(align256(w.size() * 4));
+    BufRef Wq = G.eng.stepArena().alloc(align256(raw.size()));
+    BufRef Cf = G.eng.stepArena().alloc(align256((size_t)M * N * 4));
+    BufRef Cq = G.eng.stepArena().alloc(align256((size_t)M * N * 4));
+    G.eng.uploadNow(A, a.data(), a.size() * 4);
+    G.eng.uploadNow(Wf, w.data(), w.size() * 4);
+    G.eng.uploadNow(Wq, raw.data(), raw.size());
+    gemmF32(A, Wf, Cf, (uint32_t)M, (uint32_t)N, (uint32_t)K);
+    PushGemm pc{(uint32_t)M, (uint32_t)N, (uint32_t)K, 0, 0, 0, 0, 1, 0, 0, 0, type};
+    G.eng.dispatch("gemm_nt_q4k", {A, Wq, Cq}, &pc, ((uint32_t)N + 63) / 64, ((uint32_t)M + 63) / 64, 1);
+    G.eng.endStep();
+    G.eng.waitStep();
+    std::vector<float> of((size_t)M * N), oq((size_t)M * N);
+    G.eng.downloadNow(Cf, of.data(), of.size() * 4);
+    G.eng.downloadNow(Cq, oq.data(), oq.size() * 4);
+    double num = 0, den = 0;
+    for (size_t i = 0; i < of.size(); i++) {
+        num += (double)(oq[i] - of[i]) * (oq[i] - of[i]);
+        den += (double)of[i] * of[i];
+    }
+    std::printf("%s type %u [%d x %d]: shader vs host dequant rel %.3e\n", tensor.c_str(), type, N, K,
+                std::sqrt(num / std::max(1e-30, den)));
+}
+
 int SaDit::layers() const { return impl_ ? impl_->layers : 0; }
 
 SaDit::~SaDit() { delete impl_; }

@@ -4,6 +4,7 @@
 // sdvkaudio: Stable Audio Open Small (text -> 44.1 kHz stereo) on the sdvk engine.
 #include "SaGen.hpp"
 #include "SaDit.hpp"
+#include "SaLm.hpp"
 #include "Modules/Model/Gguf.hpp"
 #include "Modules/GPU/gpu_ops.hpp"
 #include "SaVae.hpp"
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <vector>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -59,6 +61,45 @@ int main(int argc, char** argv) {
         for (int N : {128, 2048}) {
             saSelfTestGemm(86, N, 2048, e32, e8);
             std::printf("gemm M86 N%d K2048: fp32 rel %.3e  q8 rel %.3e\\n", N, e32, e8);
+        }
+        return 0;
+    }
+    if (argc >= 3 && std::string(argv[1]) == "--lm-test") {
+        ofc::audio::SaLm lm;
+        std::string err;
+        if (!lm.load(argv[2], "build/shaders", err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        // structural prompt without the tokenizer: im_start caption_start <text> caption_end
+        // lyrics_start lyrics_end im_end audio_start
+        std::vector<int> prompt = {151644, 151671, 264, 151672, 151673, 151674, 151645, 151669};
+        std::vector<int> sem;
+        std::vector<float> hid;
+        int frames = argc > 3 ? std::atoi(argv[3]) : 1;
+        auto t0 = std::chrono::steady_clock::now();
+        if (!lm.generate(prompt, frames, 1234u, 1.5f, 50, sem, hid, err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("lm-test: %zu tokens in %.1f s (%.1f s/token)\n", sem.size(), sec,
+                    sec / std::max<size_t>(1, sem.size()));
+        for (size_t i = 0; i < sem.size() && i < 12; i++) std::printf("  frame %zu: %d\n", i, sem[i]);
+        return 0;
+    }
+    if (argc >= 4 && std::string(argv[1]) == "--kq-check") {
+        ofc::audio::SaDit probe;
+        ofc::gpu::G.allocGradArena = false;
+        ofc::gpu::G.stepBytes = 512ull << 20;
+        ofc::gpu::G.scratchBytes = 64ull << 20;
+        ofc::gpu::G.paramBytes = 64ull << 20;
+        ofc::gpu::gInit("build/shaders");
+        std::string err;
+        ofc::audio::saCheckKqGemm(argv[2], argv[3], 8, err);
+        if (!err.empty()) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
         }
         return 0;
     }

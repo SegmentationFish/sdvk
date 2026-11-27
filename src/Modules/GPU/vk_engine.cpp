@@ -130,6 +130,8 @@ static const KernelDef KERNELS[] = {
     {"sa_swiglu", 2, 8, 0x2},
     {"sa_scale", 2, 8, 0x2},
     {"sa_bias_col", 2, 8, 0x1},
+    {"sa_rmsnorm", 3, 12, 0x4},
+    {"sa_causal_mask", 1, 16, 0x1},
     {"fused_attn", 4, 36, 0x8},
     // 49,920 B of shared memory: some drivers report a lower limit but accept the pipeline,
     // so load it opportunistically and fall back to fused_attn when creation fails.

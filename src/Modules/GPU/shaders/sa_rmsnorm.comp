@@ -1,0 +1,28 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// RMSNorm over the last dim: y = x * rsqrt(mean(x^2)+eps) * w  (Qwen3/T5 style, no bias).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint d; float eps; } pc;
+
+shared float red[256];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = r * pc.d;
+    float s = 0.0;
+    for (uint j = tid; j < pc.d; j += 256) s += x[base + j] * x[base + j];
+    red[tid] = s;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        barrier();
+    }
+    float inv = 1.0 / sqrt(red[0] / float(pc.d) + pc.eps);
+    for (uint j = tid; j < pc.d; j += 256) y[base + j] = x[base + j] * inv * w[j];
+}

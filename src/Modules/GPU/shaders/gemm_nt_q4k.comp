@@ -22,10 +22,14 @@ shared float Bs[BN][BK + 1];
 
 float h2f(uint bits) { return unpackHalf2x16(bits).x; }
 
-// value at (row n, column k) of a Q4_K matrix stored row-major with K contiguous
-float q4kAt(uint n, uint k) {
-    uint rowBytes = (pc.K / QK_K) * BLOCK_BYTES;
-    uint base = n * rowBytes + (k / QK_K) * BLOCK_BYTES;
+// value at (row n, column k) of a quantised matrix stored row-major with K contiguous.
+// pc.pad carries the GGML type: 12 = Q4_K (144 B/block), 13 = Q5_K (176 B/block).
+float qAt(uint n, uint k) {
+    uint type = pc.pad;                       // 12 Q4_K, 13 Q5_K, 14 Q6_K
+    bool q5 = (type == 13u), q6 = (type == 14u);
+    uint blockBytes = q5 ? 176u : (q6 ? 210u : BLOCK_BYTES);
+    uint rowBytes = (pc.K / QK_K) * blockBytes;
+    uint base = n * rowBytes + (k / QK_K) * blockBytes;
     uint d = byteAt(base) | (byteAt(base + 1) << 8);
     uint dmin = byteAt(base + 2) | (byteAt(base + 3) << 8);
     uint within = k % QK_K;
@@ -43,8 +47,33 @@ float q4kAt(uint n, uint k) {
         sc = (byteAt(base + 4 + is + 4) & 0xFu) | ((byteAt(base + 4 + is - 4) >> 6) << 4);
         mn = (byteAt(base + 4 + is + 4) >> 4) | ((s0 >> 6) << 4);
     }
-    uint byte = byteAt(base + 16 + group * 32 + i);
-    float q = float((sub == 0u) ? (byte & 0xFu) : (byte >> 4));
+    if (q6) {
+        // Q6_K: ql at +0 (128 B), qh at +128 (64 B), 16 int8 scales at +192, fp16 d at +208
+        uint half_ = within / 128u;
+        uint rem = within % 128u;
+        uint quad = rem / 32u;
+        uint l = rem % 32u;
+        uint is = l / 16u;
+        uint ql2 = base + half_ * 64u;
+        uint qh2 = base + 128u + half_ * 32u;
+        uint scb = base + 192u + half_ * 8u;
+        uint q, sIdx;
+        if (quad == 0u)      { q = (byteAt(ql2 + l) & 0xFu) | (((byteAt(qh2 + l) >> 0u) & 3u) << 4); sIdx = is + 0u; }
+        else if (quad == 1u) { q = (byteAt(ql2 + l + 32u) & 0xFu) | (((byteAt(qh2 + l) >> 2u) & 3u) << 4); sIdx = is + 2u; }
+        else if (quad == 2u) { q = (byteAt(ql2 + l) >> 4u) | (((byteAt(qh2 + l) >> 4u) & 3u) << 4); sIdx = is + 4u; }
+        else                 { q = (byteAt(ql2 + l + 32u) >> 4u) | (((byteAt(qh2 + l) >> 6u) & 3u) << 4); sIdx = is + 6u; }
+        int sc6 = int(byteAt(scb + sIdx));
+        if (sc6 > 127) sc6 -= 256;
+        float dq = h2f(uint(byteAt(base + 208u)) | (uint(byteAt(base + 209u)) << 8));
+        return dq * float(sc6) * float(int(q) - 32);
+    }    // Q4_K: 128 bytes of nibbles at +16. Q5_K: 32 bytes of high bits at +16, nibbles at +48.
+    uint qsBase = q5 ? (base + 48u) : (base + 16u);
+    uint byte = byteAt(qsBase + group * 32u + i);
+    uint q = (sub == 0u) ? (byte & 0xFu) : (byte >> 4);
+    if (q5) {
+        uint hi = (byteAt(base + 16u + i) >> (2u * group + sub)) & 1u;
+        q |= hi << 4;
+    }
     return h2f(d) * float(sc) * q - h2f(dmin) * float(mn);
 }
 
@@ -73,7 +102,7 @@ void main() {
             uint e = l * 256 + ty * 16 + tx;
             uint r = e / BK, cc = e % BK;
             uint gr = bx * BN + r, gc = kBase + cc;
-            Bs[r][cc] = (gr < pc.N && gc < pc.K) ? q4kAt(gr, gc) : 0.0;
+            Bs[r][cc] = (gr < pc.N && gc < pc.K) ? qAt(gr, gc) : 0.0;
         }
         barrier();
         for (uint k = 0; k < BK; k++) {

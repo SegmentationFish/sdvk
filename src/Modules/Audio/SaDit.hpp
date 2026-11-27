@@ -43,5 +43,8 @@ private:
 // Diagnostic: checks the fp32 and Q8 GEMM against a host dot product (used by --gemm-check).
 void saSelfTestGemm(int M, int N, int K, float& e32, float& e8);
 
+// Diagnostic: compares the in-shader K-quant dequant against the host dequant for one tensor.
+void saCheckKqGemm(const std::string& ggufPath, const std::string& tensor, int M, std::string& err);
+
 }  // namespace audio
 }  // namespace ofc

@@ -30,7 +30,7 @@ foreach(SHADER vadd gemm gemm_nn gemm_nt gemm_tn copy_nd ew2 mul_grad rowdot col
         copy2 mul2 attn_softmax_fwd attn_softmax_bwd
         im2col groupnorm upsample2x bias_add add2 im2col_s2 layernorm_fwd causal_mask
         gemm_nt_q4k gemm_nt_q8 gemm_nt_q8_v gemm_nn_q8 gemm_nn_q8_v fused_attn fused_attn_tiled mask_mul softmax_strided
-        add_scaled sa_im2col1d sa_col2im1d sa_snake sa_rope sa_swiglu sa_scale sa_bias_col)
+        add_scaled sa_im2col1d sa_col2im1d sa_snake sa_rope sa_swiglu sa_scale sa_bias_col sa_rmsnorm sa_causal_mask)
     set(SPV ${VK_SHADER_DIR}/${SHADER}.spv)
     add_custom_command(OUTPUT ${SPV}
         COMMAND ${GLSLC} --target-env=vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/src/Modules/GPU/shaders/${SHADER}.comp -o ${SPV}
@@ -82,6 +82,7 @@ add_library(sdvkcore STATIC
     src/Modules/Audio/sa_gen.cpp
     src/Modules/Audio/SaVae.cpp
     src/Modules/Audio/SaDit.cpp
+    src/Modules/Audio/sa_lm.cpp
     src/Modules/Model/Gguf.cpp
     src/Modules/GPU/gpu_ops.cpp
     src/Modules/GPU/fused_attn.cpp

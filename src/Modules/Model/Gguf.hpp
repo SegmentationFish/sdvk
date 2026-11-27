@@ -113,6 +113,8 @@ public:
 
     // tensor data
     bool readRaw(const GgufTensor& t, std::vector<uint8_t>& out) const;
+    // Reads a byte range inside one tensor (e.g. a single embedding row) without materialising it.
+    bool readRange(const GgufTensor& t, uint64_t byteOff, void* dst, uint64_t bytes) const;
     // dequantize to f32 (row-major (rows, cols), matching shape())
     std::vector<float> readFloat(const std::string& name, std::string* err = nullptr) const;
     // raw Q8_0 export: int8 payload + fp32 scale (32 elements per block), file-flat order preserved

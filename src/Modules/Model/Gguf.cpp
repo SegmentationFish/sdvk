@@ -475,6 +475,15 @@ float GgufFile::archF32(const std::string& arch, const std::string& key, float d
     return getF32(arch + "." + key, def);
 }
 
+bool GgufFile::readRange(const GgufTensor& t, uint64_t byteOff, void* dst, uint64_t bytes) const {
+    if (byteOff + bytes > t.nbytes) return false;
+    f_.clear();
+    f_.seekg((std::streamoff)(dataOffset_ + t.offset + byteOff), std::ios::beg);
+    if (!f_) return false;
+    f_.read((char*)dst, (std::streamsize)bytes);
+    return (uint64_t)f_.gcount() == bytes;
+}
+
 bool GgufFile::readRaw(const GgufTensor& t, std::vector<uint8_t>& out) const {
     out.resize((size_t)t.nbytes);
     f_.clear();
