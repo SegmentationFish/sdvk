@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SegmentationFish
 // sdvk - see LICENSE at the repository root. No warranty.
 #include "SaLm.hpp"
+#include "SaDepth.hpp"
 
 #include "Modules/GPU/gpu_ops.hpp"
 #include "Modules/GPU/vk_engine.hpp"
@@ -376,7 +377,6 @@ bool SaLm::load(const std::string& ggufPath, const std::string& spvDir, std::str
     m->inNormDev[1] = persAlloc((size_t)D);
     m->postNormDev[0] = persAlloc((size_t)D);
     m->postNormDev[1] = persAlloc((size_t)D);
-
     std::fprintf(stderr, "lm: arenas step %.0f MB, scratch %.0f MB, param %.0f MB\n",
                 G.eng.stepArena().cap() / 1048576.0, G.scratchArena.cap() / 1048576.0,
                 G.paramArena.cap() / 1048576.0);
@@ -386,7 +386,8 @@ bool SaLm::load(const std::string& ggufPath, const std::string& spvDir, std::str
 }
 
 bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, float cfg, int topK,
-                    std::vector<int>& semantic, std::vector<float>& hidden, std::string& err) {
+                    SaDepth* depth, std::vector<int>& semantic, std::vector<int>& codes,
+                    std::vector<float>& states, std::string& err) {
     auto* m = impl_;
     if (!m) {
         err = "lm: not loaded";
@@ -414,7 +415,8 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
     std::vector<float> logitsHost((size_t)2 * m->vocab);
     std::vector<float> hiddenRow((size_t)D);
     semantic.clear();
-    hidden.clear();
+    codes.clear();
+    states.clear();
     std::mt19937 rng(seed);
 
     auto softmaxSample = [&](const float* cond, const float* uncond) -> int {
@@ -520,35 +522,46 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
             const int LEN = pos + 1;
             for (int s = 0; s < 2; s++) {
                 uint64_t kvBase = ((uint64_t)s * m->nLayers + l) * m->maxSeq * KV;
-                for (int g = 0; g < KHV; g++) {
-                    BufRef qs = BufRef{m->qb.buf, m->qb.offset + ((uint64_t)s * D + (uint64_t)g * 4 * HD) * 4,
-                                       m->qb.size - ((uint64_t)s * D + (uint64_t)g * 4 * HD) * 4};
-                    BufRef ks = BufRef{m->kCache.buf, m->kCache.offset + (kvBase + (uint64_t)g * HD) * 4,
-                                       m->kCache.size - (kvBase + (uint64_t)g * HD) * 4};
-                    BufRef sc = BufRef{m->scores.buf, m->scores.offset + (uint64_t)(g * 4) * LEN * 4,
-                                       m->scores.size - (uint64_t)(g * 4) * LEN * 4};
-                    gemmF32(qs, ks, sc, 1, (uint32_t)LEN, (uint32_t)HD, 4, (uint32_t)HD, 0, (uint32_t)LEN,
-                            (uint32_t)D, (uint32_t)KV, (uint32_t)LEN, true);
+                for (int h = 0; h < H; h++) {
+                    const int kvh = h / (H / KHV);
+                    BufRef qs = BufRef{m->qb.buf, m->qb.offset + ((uint64_t)s * D + (uint64_t)h * HD) * 4,
+                                       m->qb.size - ((uint64_t)s * D + (uint64_t)h * HD) * 4};
+                    BufRef ks = BufRef{m->kCache.buf, m->kCache.offset + (kvBase + (uint64_t)kvh * HD) * 4,
+                                       m->kCache.size - (kvBase + (uint64_t)kvh * HD) * 4};
+                    BufRef sc = BufRef{m->scores.buf, m->scores.offset + (uint64_t)h * LEN * 4,
+                                       m->scores.size - (uint64_t)h * LEN * 4};
+                    gemmF32(qs, ks, sc, 1, (uint32_t)LEN, (uint32_t)HD, 1, 0, 0, 0, (uint32_t)D,
+                            (uint32_t)KV, (uint32_t)LEN, true);
                 }
                 struct {
                     uint32_t n;
                     float s;
                 } pc{(uint32_t)(H * LEN), 1.0f / std::sqrt((float)HD)};
                 G.eng.dispatch("sa_scale", {m->scores, m->probs}, &pc, (uint32_t)((H * LEN + 255) / 256), 1, 1);
+                if (std::getenv("OFC_LM_DBG") && l == 0 && pos == 0) {
+                    std::vector<float> t1(4), t2(4);
+                    G.eng.endStep();
+                    G.eng.waitStep();
+                    G.eng.downloadNow(BufRef{m->scores.buf, m->scores.offset, 16}, t1.data(), 16);
+                    G.eng.downloadNow(BufRef{m->probs.buf, m->probs.offset, 16}, t2.data(), 16);
+                    std::fprintf(stderr, "  pre-softmax: scores %g %g  probs %g %g\n", t1[0], t1[1], t2[0],
+                                 t2[1]);
+                    G.eng.beginStep();
+                }
                 struct {
                     uint32_t rows, cols;
                 } sp{(uint32_t)H, (uint32_t)LEN};
                 G.eng.dispatch("softmax_fwd", {m->probs, m->scores}, &sp, (uint32_t)H, 1, 1);
-                for (int g = 0; g < KHV; g++) {
-                    BufRef ps = BufRef{m->scores.buf, m->scores.offset + (uint64_t)(g * 4) * LEN * 4,
-                                       m->scores.size - (uint64_t)(g * 4) * LEN * 4};
-                    BufRef vs = BufRef{m->vCache.buf, m->vCache.offset + (kvBase + (uint64_t)g * HD) * 4,
-                                       m->vCache.size - (kvBase + (uint64_t)g * HD) * 4};
-                    BufRef as = BufRef{m->attn.buf,
-                                       m->attn.offset + ((uint64_t)s * D + (uint64_t)g * 4 * HD) * 4,
-                                       m->attn.size - ((uint64_t)s * D + (uint64_t)g * 4 * HD) * 4};
-                    gemmF32(ps, vs, as, 1, (uint32_t)HD, (uint32_t)LEN, 4, (uint32_t)LEN, 0, (uint32_t)HD,
-                            (uint32_t)LEN, (uint32_t)KV, (uint32_t)D, false);
+                for (int h = 0; h < H; h++) {
+                    const int kvh = h / (H / KHV);
+                    BufRef ps = BufRef{m->scores.buf, m->scores.offset + (uint64_t)h * LEN * 4,
+                                       m->scores.size - (uint64_t)h * LEN * 4};
+                    BufRef vs = BufRef{m->vCache.buf, m->vCache.offset + (kvBase + (uint64_t)kvh * HD) * 4,
+                                       m->vCache.size - (kvBase + (uint64_t)kvh * HD) * 4};
+                    BufRef as = BufRef{m->attn.buf, m->attn.offset + ((uint64_t)s * D + (uint64_t)h * HD) * 4,
+                                       m->attn.size - ((uint64_t)s * D + (uint64_t)h * HD) * 4};
+                    gemmF32(ps, vs, as, 1, (uint32_t)HD, (uint32_t)LEN, 1, 0, 0, 0, (uint32_t)LEN,
+                            (uint32_t)KV, (uint32_t)D, false);
                 }
             }
             gemmKq(m->attn, m->slot[3], m->tmp, 2, (uint32_t)D, (uint32_t)D, type);
@@ -583,6 +596,37 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
                 } ap{(uint32_t)(2 * D), 0};
                 G.eng.dispatch("add2", {m->x, m->x, m->tmp}, &ap, (uint32_t)(((uint64_t)2 * D + 255) / 256), 1, 1);
             }
+            G.eng.endStep();
+            G.eng.waitStep();
+            if (std::getenv("OFC_LM_DBG") && l < 2) {
+                auto rmsOf = [&](const BufRef& b, int n, const char* tag) {
+                    std::vector<float> t((size_t)n);
+                    G.eng.downloadNow(b, t.data(), t.size() * 4);
+                    double s2 = 0;
+                    size_t bad = 0;
+                    for (float v : t) {
+                        if (!std::isfinite(v)) bad++;
+                        else s2 += (double)v * v;
+                    }
+                    std::fprintf(stderr, "  L%d %-7s rms %.4f nonfinite %zu\n", l, tag,
+                                 std::sqrt(s2 / std::max<size_t>(1, t.size() - bad)), bad);
+                };
+                rmsOf(m->x, 2 * D, "x");
+                rmsOf(m->xn, 2 * D, "norm");
+                rmsOf(m->qb, 2 * D, "q");
+                rmsOf(m->kb, 2 * KV, "k");
+                rmsOf(m->attn, 2 * D, "attn");
+                rmsOf(m->tmp, 2 * D, "oproj");
+                rmsOf(m->swiglu, 2 * F, "swiglu");
+                {
+                    std::vector<float> sc(8), pr(8);
+                    G.eng.downloadNow(BufRef{m->scores.buf, m->scores.offset, 8 * 4}, sc.data(), 8 * 4);
+                    G.eng.downloadNow(BufRef{m->probs.buf, m->probs.offset, 8 * 4}, pr.data(), 8 * 4);
+                    std::fprintf(stderr, "  L%d probs %g %g %g   scores %g %g %g\n", l, sc[0], sc[1], sc[2],
+                                 pr[0], pr[1], pr[2]);
+                }
+            }
+            G.eng.beginStep();
         }
         G.eng.dispatch("sa_rmsnorm", {m->x, m->fnDev, m->xn}, &rp, 2, 1, 1);
         {
@@ -602,6 +646,18 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
         G.eng.endStep();
         G.eng.waitStep();
         G.eng.downloadNow(m->logits, logitsHost.data(), logitsHost.size() * 4);
+        if (std::getenv("OFC_LM_DBG")) {
+            size_t bad = 0;
+            float mx = -1e30f;
+            int arg = 0;
+            for (int i = 0; i < m->vocab; i++) {
+                float v = logitsHost[(size_t)i];
+                if (!std::isfinite(v)) bad++;
+                if (v > mx) { mx = v; arg = i; }
+            }
+            std::fprintf(stderr, "[lm] logits pos %d: nonfinite %zu, max %.3f at %d (hidden rms %.4f)\n", pos,
+                         bad, mx, arg, [&] { double s2 = 0; for (float v : hiddenRow) s2 += (double)v * v; return std::sqrt(s2 / hiddenRow.size()); }());
+        }
         G.eng.downloadNow(BufRef{m->xn.buf, m->xn.offset, (uint64_t)D * 4}, hiddenRow.data(),
                           hiddenRow.size() * 4);
     };
@@ -613,14 +669,43 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
         runForward(i);
 
     }
-    // sampling loop: one semantic token per frame
+    // sampling loop: one semantic token per frame, then the depth decoder refines the frame
     for (int f = 0; f < frames; f++) {
         int tok = softmaxSample(logitsHost.data(), logitsHost.data() + m->vocab);
         if (tok == kTokAudioEnd) break;
-        semantic.push_back(tok - kTokSemanticBase);
-        hidden.insert(hidden.end(), hiddenRow.begin(), hiddenRow.end());
-        tokenEmb(tok, &emb[0], 1.0);
-        tokenEmb(tok, &emb[(size_t)D], 1.0);
+        const int sem = tok - kTokSemanticBase;
+        semantic.push_back(sem);
+        states.insert(states.end(), hiddenRow.begin(), hiddenRow.end());
+        std::vector<int> fcodes;
+        std::vector<float> fstates, feedback;
+        if (depth) {
+            std::string derr;
+            if (!depth->decodeFrame(hiddenRow, sem, seed + (uint32_t)f, 1.0f, fcodes, fstates, feedback,
+                                    derr)) {
+                err = derr;
+                return false;
+            }
+            for (int c = 0; c < kDepthCodebooks; c++) codes.push_back(fcodes[(size_t)c]);
+            states.insert(states.end(), fstates.begin() + (size_t)D, fstates.end());
+            // feedback = 8^-0.5 * (embedding(semantic) + sum of the seven acoustic embeddings)
+            std::vector<float> semEmb((size_t)D);
+            tokenEmb(tok, semEmb.data(), 1.0);
+            const float inv8 = 1.0f / std::sqrt(8.0f);
+            for (int i = 0; i < D; i++) {
+                float v = (semEmb[(size_t)i] + feedback[(size_t)i]) * inv8;
+                emb[(size_t)i] = v;
+                emb[(size_t)D + i] = v;
+            }
+            std::fprintf(stderr, "frame %d: sem %d codes %d %d %d %d %d %d %d\n", f, sem, fcodes[0],
+                         fcodes[1], fcodes[2], fcodes[3], fcodes[4], fcodes[5], fcodes[6]);
+        } else {
+            for (int c = 0; c < kDepthCodebooks; c++) {
+                codes.push_back(0);
+            }
+            states.insert(states.end(), (size_t)7 * D, 0.0f);
+            tokenEmb(tok, &emb[0], 1.0);
+            tokenEmb(tok, &emb[(size_t)D], 1.0);
+        }
         runForward(P + f);
     }
     return !semantic.empty();

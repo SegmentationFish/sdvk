@@ -83,6 +83,7 @@ add_library(sdvkcore STATIC
     src/Modules/Audio/SaVae.cpp
     src/Modules/Audio/SaDit.cpp
     src/Modules/Audio/sa_lm.cpp
+    src/Modules/Audio/sa_depth.cpp
     src/Modules/Model/Gguf.cpp
     src/Modules/GPU/gpu_ops.cpp
     src/Modules/GPU/fused_attn.cpp

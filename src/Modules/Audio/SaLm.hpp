@@ -29,6 +29,8 @@ constexpr int kTokSemanticBase = 151675;   // first semantic codebook entry
 constexpr int kSemanticVocab = 16384;
 constexpr int kTokAudioCfg = 151654;       // replacement for the cfg stream
 
+class SaDepth;
+
 class SaLm {
 public:
     ~SaLm();
@@ -37,8 +39,13 @@ public:
 
     // Runs `frames` decode steps after prefilling `prompt`; appends one semantic token per frame
     // and the per-frame hidden state ([frames][4096], the value the depth decoder conditions on).
+    // When `depth` is non-null each frame is decoded through the RVQ depth decoder, which supplies
+    // the feedback embedding and the 8 fused hidden states the condition encoder wants.
+    // semantic: [frames] codebook-0 codes; codes: [frames][7] acoustic codes;
+    // states: [frames][8][4096] (LM hidden first, then each depth step's hidden state).
     bool generate(const std::vector<int>& prompt, int frames, uint32_t seed, float cfg, int topK,
-                  std::vector<int>& semantic, std::vector<float>& hidden, std::string& err);
+                  SaDepth* depth, std::vector<int>& semantic, std::vector<int>& codes,
+                  std::vector<float>& states, std::string& err);
 
     // ---- tokenizer (Qwen2 byte-level BPE)
     std::vector<int> encode(const std::string& text) const;

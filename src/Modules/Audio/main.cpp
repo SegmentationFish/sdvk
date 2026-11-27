@@ -5,6 +5,7 @@
 #include "SaGen.hpp"
 #include "SaDit.hpp"
 #include "SaLm.hpp"
+#include "SaDepth.hpp"
 #include "Modules/Model/Gguf.hpp"
 #include "Modules/GPU/gpu_ops.hpp"
 #include "SaVae.hpp"
@@ -99,17 +100,26 @@ int main(int argc, char** argv) {
         // structural prompt without the tokenizer: im_start caption_start <text> caption_end
         // lyrics_start lyrics_end im_end audio_start
         std::vector<int> prompt = {151644, 151671, 264, 151672, 151673, 151674, 151645, 151669};
-        std::vector<int> sem;
-        std::vector<float> hid;
+        std::vector<int> sem, codes;
+        std::vector<float> states;
         int frames = argc > 3 ? std::atoi(argv[3]) : 1;
+        ofc::audio::SaDepth depth;
+        ofc::audio::SaDepth* depthPtr = nullptr;
+        if (argc > 4) {
+            if (!depth.load(argv[4], "build/shaders", err)) {
+                std::fprintf(stderr, "depth error: %s\n", err.c_str());
+                return 1;
+            }
+            depthPtr = &depth;
+        }
         auto t0 = std::chrono::steady_clock::now();
-        if (!lm.generate(prompt, frames, 1234u, 1.5f, 50, sem, hid, err)) {
+        if (!lm.generate(prompt, frames, 1234u, 1.5f, 50, depthPtr, sem, codes, states, err)) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
             return 1;
         }
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("lm-test: %zu tokens in %.1f s (%.1f s/token)\n", sem.size(), sec,
-                    sec / std::max<size_t>(1, sem.size()));
+        std::printf("lm-test: %zu tokens in %.1f s (%.1f s/token), states %zu floats\n", sem.size(), sec,
+                    sec / std::max<size_t>(1, sem.size()), states.size());
         for (size_t i = 0; i < sem.size() && i < 12; i++) std::printf("  frame %zu: %d\n", i, sem[i]);
         return 0;
     }
