@@ -1,0 +1,21 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// MiniMax Music 3 vocoder Snake activation, alpha only (no beta tensor in the checkpoint):
+//   y[c, i] = x[c, i] + sin(x[c, i] * a[c])^2 / (a[c] + 1e-9)
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer A { float alpha[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint C; uint L; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.C * pc.L) return;
+    uint c = i / pc.L;
+    float a = alpha[c];
+    float v = x[i];
+    float s = sin(a * v);
+    y[i] = v + (s * s) / (a + 1e-9);
+}

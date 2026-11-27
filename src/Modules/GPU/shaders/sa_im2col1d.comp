@@ -1,0 +1,30 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// im2col for 1-D convolution: col[(c*K + k), o] = x[c, o*stride + k - pad]
+// x is [C, L] row major, col is [(C*K), O] row major. Out-of-range taps read 0.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer COL { float col[]; };
+layout(push_constant) uniform PC {
+    uint C;      // input channels
+    uint L;      // input length
+    uint K;      // kernel width
+    uint O;      // output length
+    uint stride;
+    int pad;
+    uint dil;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = pc.C * pc.K * pc.O;
+    if (i >= total) return;
+    uint o = i % pc.O;
+    uint r = i / pc.O;   // c*K + k
+    uint k = r % pc.K;
+    uint c = r / pc.K;
+    int src = int(o * pc.stride + k * pc.dil) - pc.pad;
+    col[i] = (src >= 0 && src < int(pc.L)) ? x[c * pc.L + uint(src)] : 0.0;
+}

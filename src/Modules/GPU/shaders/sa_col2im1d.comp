@@ -1,0 +1,38 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// col2im (gather form) for a transposed 1-D convolution:
+//   out[co, o] = sum_k tmp[(co*K + k), i] with i = (o + pad - k) / stride when divisible.
+// tmp comes from a GEMM over the transposed weight, so no atomics are needed: every output
+// element gathers its own taps.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer TMP { float tmp[]; };
+layout(binding = 1) writeonly buffer OUT { float outv[]; };
+layout(push_constant) uniform PC {
+    uint CO;     // output channels
+    uint K;      // kernel width (2*stride)
+    uint I;      // input positions
+    uint O;      // output length
+    uint stride;
+    int pad;
+    uint pad2;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.CO * pc.O;
+    if (idx >= total) return;
+    uint o = idx % pc.O;
+    uint co = idx / pc.O;
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.K; ++k) {
+        int t = int(o) + pc.pad - int(k);
+        if (t < 0) continue;
+        if (t % int(pc.stride) != 0) continue;
+        uint i = uint(t) / pc.stride;
+        if (i >= pc.I) continue;
+        acc += tmp[(co * pc.K + k) * pc.I + i];
+    }
+    outv[idx] = acc;
+}

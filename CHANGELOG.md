@@ -3,6 +3,47 @@
 All notable changes to sdvk. The project is pre-1.0; the format follows
 [Keep a Changelog](https://keepachangelog.com/) and versions are approximate.
 
+## 2026-11-27
+
+### Added
+
+- **`sdvkaudio` (new target) + MiniMax Music 3 pipeline, stage 1: the flow-VAE decoder.**
+  `sdvkaudio --vae <minimax dav.safetensors> --vae-decode <latent.f32> --frames <n> --out song.wav`
+  decodes a raw `[frames, 128]` f32 latent to 44.1 kHz stereo. The DAC-style stack
+  (`dec_in_proj 64->1024` -> `conv_in k7` -> 4x (snake + transposed conv + 3 residual units) ->
+  `snake_out` -> `conv_out k7` -> tanh, two 64-channel tracks) runs on the Vulkan engine through
+  three new kernels: `sa_im2col1d`, `sa_col2im1d` (gather form, no atomics) and `sa_snake`
+  (MiniMax's alpha-only Snake). Convolutions are banded so the im2col block stays ~32 MB, which
+  matters at 44.1 kHz where `C*K*O` for a whole window would be ~1 GB.
+  Verified against a torch reference (`tools/mm3_vae_ref.py`) on a fixed latent: **corr 1.0000000,
+  max abs diff 2e-5** (16-bit WAV quantisation), and a 689-frame (8 s) window decodes in 0.8 s
+  including the 207 MB weight load.
+- **Stable Audio Open Small text stage** (groundwork for the earlier audio port): SentencePiece
+  Unigram tokenizer (`SaTokenizer`, `spiece.model` protobuf + Windows NFKC for T5's `nmt_nfkc`) and
+  the T5-base encoder on the CPU (`sa_t5.cpp`). Token ids match the HF tokenizer exactly.
+- `tools/sa_ref.py` (Stable Audio torch reference: T5/DiT/VAE/8-step pingpong dumps) and
+  `tools/mm3_vae_ref.py` (MiniMax VAE reference).
+- `sdvkaudio --t5check <dir>` dumps the tokenizer ids and T5 hidden state for comparison.
+
+### Fixed
+
+- **Weight-norm folding for transposed convolutions used the wrong axis.** A `ConvTranspose1d`
+  stores `weight_v` as `[cin, cout, k]` and its `weight_g` has one entry per *input* channel, while
+  a plain `Conv1d` stores `[cout, cin, k]` with `g` per output channel. Folding both with the
+  output-channel rule made every upsampling block ~4.6x too strong (VAE output rms 0.010 vs 0.075,
+  corr 0.38); with the per-layout rule the decoder matches torch to 1e-6 at every block.
+- Banded `gemm_nn` for the `im2col` path needs an explicit `ldc`: rows of a band are `O_total`
+  apart, not `band` apart, otherwise only the first band's columns land correctly.
+
+### Notes
+
+- **transformers 5.14.1's `T5EncoderModel` is missing the `1/sqrt(d_kv)` attention scaling**, so
+  its output disagrees with a canonical numpy T5 by corr 0.40. Our engine matches the canonical
+  version to 1.3e-6. Any golden produced with that version (including `stable_audio_tools`' T5
+  conditioner in `E:/sdvkmodel/audio/venv`) is unusable; pin `transformers<5` or use `tools/`.
+- The CMake cache in `build/` pointed at a dead CLion ninja path (`D:/JETBRA~2/...`); it was
+  rewritten to the long path, otherwise `cmake --build` cannot re-configure after a CMakeLists edit.
+
 ## 2026-11-21
 
 ### Added

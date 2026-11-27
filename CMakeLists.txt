@@ -30,7 +30,7 @@ foreach(SHADER vadd gemm gemm_nn gemm_nt gemm_tn copy_nd ew2 mul_grad rowdot col
         copy2 mul2 attn_softmax_fwd attn_softmax_bwd
         im2col groupnorm upsample2x bias_add add2 im2col_s2 layernorm_fwd causal_mask
         gemm_nt_q8 gemm_nt_q8_v gemm_nn_q8 gemm_nn_q8_v fused_attn fused_attn_tiled mask_mul softmax_strided
-        add_scaled)
+        add_scaled sa_im2col1d sa_col2im1d sa_snake)
     set(SPV ${VK_SHADER_DIR}/${SHADER}.spv)
     add_custom_command(OUTPUT ${SPV}
         COMMAND ${GLSLC} --target-env=vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/src/Modules/GPU/shaders/${SHADER}.comp -o ${SPV}
@@ -77,6 +77,10 @@ add_library(sdvkcore STATIC
     src/Modules/Diffusion/ModelSet.cpp
     src/Modules/Audio/Wav.cpp
     src/Modules/Audio/Dsp.cpp
+    src/Modules/Audio/SaTokenizer.cpp
+    src/Modules/Audio/sa_t5.cpp
+    src/Modules/Audio/sa_gen.cpp
+    src/Modules/Audio/SaVae.cpp
     src/Modules/Model/Gguf.cpp
     src/Modules/GPU/gpu_ops.cpp
     src/Modules/GPU/fused_attn.cpp
@@ -115,6 +119,15 @@ if(SDVK_BUILD_CLI)
         target_compile_options(sdvkgen PRIVATE /O2 /W3)
     else()
         target_compile_options(sdvkgen PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    endif()
+
+    # Stable Audio Open Small: text -> 44.1 kHz stereo
+    add_executable(sdvkaudio src/Modules/Audio/main.cpp)
+    target_link_libraries(sdvkaudio PRIVATE sdvkcore)
+    if(MSVC)
+        target_compile_options(sdvkaudio PRIVATE /O2 /W3)
+    else()
+        target_compile_options(sdvkaudio PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
     endif()
 endif()
 
