@@ -328,6 +328,10 @@ bool SaLm::load(const std::string& ggufPath, const std::string& spvDir, std::str
     G.eng.initArenas(64ull << 20, 64ull << 20);
     // KV cache + weight staging live in the persistent scratch arena (gpu_ops owns it)
     ofc::gpu::gResizeScratch(384ull << 20);
+    // The engine's in-step upload ring is 256 MB by default; the LM stages one layer's matrices
+    // (133 MB) plus the 48 MB vocab blocks inside a step, so give it room.
+    G.eng.stagingArena().destroy();
+    G.eng.stagingArena().init(G.eng.device(), G.eng.physDevice(), 640ull << 20, false, true);
     gpu::Arena& pers = G.scratchArena;
     G.paramArena.destroy();
     G.paramArena.init(G.eng.device(), G.eng.physDevice(), 64ull << 20, true, false);
@@ -406,7 +410,6 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
         G.eng.uploadNow(m->cosTab, cs.data(), cs.size() * 4);
         G.eng.uploadNow(m->sinTab, sn.data(), sn.size() * 4);
     }
-
     std::vector<float> emb((size_t)2 * D);
     std::vector<float> logitsHost((size_t)2 * m->vocab);
     std::vector<float> hiddenRow((size_t)D);
@@ -468,10 +471,13 @@ bool SaLm::generate(const std::vector<int>& prompt, int frames, uint32_t seed, f
             uint32_t rows, d;
             float eps;
         } rp{(uint32_t)2, (uint32_t)D, m->eps};
-        for (int l = 0; l < m->nLayers; l++) {
+        static int lim = -1;
+        if (lim < 0) {
+            const char* e = std::getenv("OFC_LM_LAYERS");
+            lim = e ? std::atoi(e) : m->nLayers;
+        }
+        for (int l = 0; l < lim; l++) {
             auto& L = m->layers[(size_t)l];
-            G.eng.endStep();
-            G.eng.waitStep();
             m->uploadLayerWeights(l);
             {
                 std::vector<float> w0 = m->gguf.readFloat(L.inNorm->name);
