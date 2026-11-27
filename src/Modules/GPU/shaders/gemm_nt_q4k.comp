@@ -1,0 +1,94 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 SegmentationFish
+// sdvk - see LICENSE at the repository root. No warranty.
+// C[M,N] = A[M,K] * B[N,K]^T where B is raw GGML Q4_K (144-byte super-blocks of 256 values).
+// Dequantising inside the tile load keeps the weights at their file size instead of the 2x that
+// the Q8_0 re-encode costs, which is what makes the 2.4B DiT fit this machine's memory.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer BQ { uint bq32[]; };  // raw bytes, 4 per word
+uint byteAt(uint i) { return (bq32[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu; }
+layout(binding = 2) writeonly buffer C { float c[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint mode;
+                                  uint sA; uint sB; uint sC; uint batch;
+                                  uint lda; uint ldb; uint ldc; uint pad; } pc;
+
+const uint BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+const uint QK_K = 256, BLOCK_BYTES = 144;
+
+shared float As[BM][BK + 1];
+shared float Bs[BN][BK + 1];
+
+float h2f(uint bits) { return unpackHalf2x16(bits).x; }
+
+// value at (row n, column k) of a Q4_K matrix stored row-major with K contiguous
+float q4kAt(uint n, uint k) {
+    uint rowBytes = (pc.K / QK_K) * BLOCK_BYTES;
+    uint base = n * rowBytes + (k / QK_K) * BLOCK_BYTES;
+    uint d = byteAt(base) | (byteAt(base + 1) << 8);
+    uint dmin = byteAt(base + 2) | (byteAt(base + 3) << 8);
+    uint within = k % QK_K;
+    uint group = within / 64;          // four 64-value groups per super-block
+    uint sub = (within % 64) / 32;     // low nibbles then high nibbles
+    uint i = within % 32;
+    uint is = group * 2 + sub;         // 0..7
+    uint s0 = byteAt(base + 4 + is);
+    uint sc, mn;
+    if (is < 4) {
+        sc = s0 & 63u;
+        mn = byteAt(base + 4 + is + 4) & 63u;
+    } else {
+        // ggml get_scale_min_k4: high nibbles live in scales[8..11], the 2-bit tops in 0..7
+        sc = (byteAt(base + 4 + is + 4) & 0xFu) | ((byteAt(base + 4 + is - 4) >> 6) << 4);
+        mn = (byteAt(base + 4 + is + 4) >> 4) | ((s0 >> 6) << 4);
+    }
+    uint byte = byteAt(base + 16 + group * 32 + i);
+    float q = float((sub == 0u) ? (byte & 0xFu) : (byte >> 4));
+    return h2f(d) * float(sc) * q - h2f(dmin) * float(mn);
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint bx = gl_WorkGroupID.x, by = gl_WorkGroupID.y, zo = gl_WorkGroupID.z;
+    uint ao = zo * pc.sA, bo = zo * pc.sB, co = zo * pc.sC;
+    uint lda = pc.lda == 0u ? pc.K : pc.lda;
+    uint ldc = pc.ldc == 0u ? pc.N : pc.ldc;
+
+    float acc[TM][TN];
+    for (uint i = 0; i < TM; i++)
+        for (uint j = 0; j < TN; j++) acc[i][j] = 0.0;
+
+    uint nTiles = (pc.K + BK - 1) / BK;
+    for (uint t = 0; t < nTiles; t++) {
+        uint kBase = t * BK;
+        for (uint l = 0; l < 4; l++) {
+            uint e = l * 256 + ty * 16 + tx;
+            uint r = e / BK, cc = e % BK;
+            uint gr = by * BM + r, gc = kBase + cc;
+            As[r][cc] = (gr < pc.M && gc < pc.K) ? a[ao + gr * lda + gc] : 0.0;
+        }
+        for (uint l = 0; l < 4; l++) {
+            uint e = l * 256 + ty * 16 + tx;
+            uint r = e / BK, cc = e % BK;
+            uint gr = bx * BN + r, gc = kBase + cc;
+            Bs[r][cc] = (gr < pc.N && gc < pc.K) ? q4kAt(gr, gc) : 0.0;
+        }
+        barrier();
+        for (uint k = 0; k < BK; k++) {
+            float av[TM], bv[TN];
+            for (uint i = 0; i < TM; i++) av[i] = As[ty * TM + i][k];
+            for (uint j = 0; j < TN; j++) bv[j] = Bs[tx * TN + j][k];
+            for (uint i = 0; i < TM; i++)
+                for (uint j = 0; j < TN; j++) acc[i][j] += av[i] * bv[j];
+        }
+        barrier();
+    }
+    for (uint i = 0; i < TM; i++)
+        for (uint j = 0; j < TN; j++) {
+            uint gr = by * BM + ty * TM + i;
+            uint gc = bx * BN + tx * TN + j;
+            if (gr < pc.M && gc < pc.N) c[co + gr * ldc + gc] = acc[i][j];
+        }
+}

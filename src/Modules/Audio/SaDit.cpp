@@ -47,6 +47,17 @@ void gemmQ8(const BufRef& a, const BufRef& wq, const BufRef& c, const BufRef& ws
         G.eng.dispatch("gemm_nt_q8_v", {a, wq, c, ws}, &pc, (N + 63) / 64, (M + 63) / 64, 1);
 }
 
+// Dispatches to the Q4_K-in-shader kernel when the weights are raw GGML Q4_K, else the Q8 path.
+void gemmW(const BufRef& a, const BufRef& wq, const BufRef& ws, bool q4k, const BufRef& c, uint32_t M,
+           uint32_t N, uint32_t K) {
+    if (q4k) {
+        PushGemm pc{M, N, K, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+        G.eng.dispatch("gemm_nt_q4k", {a, wq, c}, &pc, (N + 63) / 64, (M + 63) / 64, 1);
+        return;
+    }
+    gemmQ8(a, wq, c, ws, M, N, K);
+}
+
 void gemmF32(const BufRef& a, const BufRef& b, const BufRef& c, uint32_t M, uint32_t N, uint32_t K,
              uint32_t batch = 1, uint32_t sA = 0, uint32_t sB = 0, uint32_t sC = 0, uint32_t lda = 0,
              uint32_t ldb = 0, uint32_t ldc = 0, bool nt = true) {
@@ -69,8 +80,9 @@ struct SaDit::Impl {
     uint64_t paramBytes = 0;
 
     struct Q8 {
-        BufRef q, s;
+        BufRef q, s;   // q = Q8 payload, or the raw Q4_K bytes when q4k is set
         int rows = 0, cols = 0;
+        bool q4k = false;
     };
     struct Layer {
         Q8 qkv, out, ffIn, ffOut;
@@ -110,7 +122,18 @@ struct SaDit::Impl {
         w.rows = (int)sh.first;
         w.cols = (int)sh.second;
         uint64_t ne = (uint64_t)w.rows * w.cols;
-        if (t->type == (GgmlType)8 /* Q8_0 */) {
+        if (t->type == GgmlType::Q4_K && (w.cols % 256) == 0) {
+            std::vector<uint8_t> raw;
+            if (!gguf.readRaw(*t, raw)) {
+                std::fprintf(stderr, "dit: raw read %s failed\n", name.c_str());
+                std::abort();
+            }
+            w.q = G.paramArena.alloc(align256(raw.size()));
+            G.eng.uploadNow(w.q, raw.data(), raw.size());
+            w.q4k = true;
+            return w;
+        }
+        if (t->type == GgmlType::Q8_0) {
             if (!gguf.readQ8(name, q, sc, &err)) {
                 std::fprintf(stderr, "dit: readQ8 %s: %s\n", name.c_str(), err.c_str());
                 std::abort();
@@ -251,10 +274,13 @@ bool SaDit::load(const std::string& ggufPath, const std::string& spvDir, int max
         uint64_t ne = sh.first * sh.second;
         bool isLayer = t.name.rfind("diffusion_transformer.transformer.layers.", 0) == 0;
         if (isLayer) {
-            int idx = std::atoi(t.name.c_str() + 42);
+            static const std::string kPrefix = "diffusion_transformer.transformer.layers.";
+            int idx = std::atoi(t.name.c_str() + kPrefix.size());
             if (idx >= nLayers) continue;
         }
-        if (t.dims.size() >= 2 && ne >= 1024)
+        if (t.type == GgmlType::Q4_K && sh.second % 256 == 0)
+            bytes += (ne / 256) * 144;
+        else if (t.dims.size() >= 2 && ne >= 1024)
             bytes += ne + (ne / 32) * 4;
         else
             bytes += ne * 4;
@@ -408,13 +434,13 @@ bool SaDit::forward(const std::vector<float>& x, int T, float t, const std::vect
 
     // ---- preprocess conv (k=1) with residual, then proj_in
     BufRef pre = alloc((uint64_t)T * kConcat);
-    gemmQ8(inB, m->pre.q, pre, m->pre.s, (uint32_t)T, (uint32_t)kConcat, (uint32_t)kConcat);
+    gemmW(inB, m->pre.q, m->pre.s, m->pre.q4k, pre, (uint32_t)T, (uint32_t)kConcat, (uint32_t)kConcat);
     addInPlace(pre, inB, (uint64_t)T * kConcat);
 
     BufRef h = alloc((uint64_t)S * kDim);
     {
         BufRef hd = BufRef{h.buf, h.offset + (uint64_t)kDim * 4, h.size - (uint64_t)kDim * 4};  // row 0 reserved
-        gemmQ8(pre, m->projIn.q, hd, m->projIn.s, (uint32_t)T, (uint32_t)kDim, (uint32_t)kConcat);
+        gemmW(pre, m->projIn.q, m->projIn.s, m->projIn.q4k, hd, (uint32_t)T, (uint32_t)kDim, (uint32_t)kConcat);
     }
     // debug: replace the whole input path with a dumped [S,2048] state (isolates the blocks)
     if (const char* preFile = std::getenv("OFC_DIT_PRE")) {
@@ -470,7 +496,7 @@ bool SaDit::forward(const std::vector<float>& x, int T, float t, const std::vect
                 G.eng.dispatch("layernorm_fwd", {h, b.norm1g, b.norm1b, norm}, &pc, (uint32_t)S, 1, 1);
             }
             if (probe) dump(norm, S, kDim, 93);
-            gemmQ8(norm, b.qkv.q, qkv, b.qkv.s, (uint32_t)S, (uint32_t)kQkv, (uint32_t)kDim);
+            gemmW(norm, b.qkv.q, b.qkv.s, b.qkv.q4k, qkv, (uint32_t)S, (uint32_t)kQkv, (uint32_t)kDim);
 
             // rope on q (base 0) and k (base 2048)
             for (int half = 0; half < 2 && !std::getenv("OFC_DIT_NOROPE"); half++) {
@@ -512,7 +538,7 @@ bool SaDit::forward(const std::vector<float>& x, int T, float t, const std::vect
                         (uint32_t)kDim, false);
             }
             if (probe) dump(attn, S, kDim, 97);
-            gemmQ8(attn, b.out.q, tmp, b.out.s, (uint32_t)S, (uint32_t)kDim, (uint32_t)kDim);
+            gemmW(attn, b.out.q, b.out.s, b.out.q4k, tmp, (uint32_t)S, (uint32_t)kDim, (uint32_t)kDim);
             if (probe) dump(tmp, S, kDim, 91);
             addInPlace(h, tmp, (uint64_t)S * kDim);
             // norm2 -> ff_in -> swiglu -> ff_out
@@ -524,7 +550,7 @@ bool SaDit::forward(const std::vector<float>& x, int T, float t, const std::vect
                 } pc{(uint32_t)S, (uint32_t)kDim, 1e-5f, 1};
                 G.eng.dispatch("layernorm_fwd", {h, b.norm2g, b.norm2b, norm}, &pc, (uint32_t)S, 1, 1);
             }
-            gemmQ8(norm, b.ffIn.q, ff, b.ffIn.s, (uint32_t)S, (uint32_t)kFf, (uint32_t)kDim);
+            gemmW(norm, b.ffIn.q, b.ffIn.s, b.ffIn.q4k, ff, (uint32_t)S, (uint32_t)kFf, (uint32_t)kDim);
             {
                 struct {
                     uint32_t rows, cols;
@@ -539,7 +565,7 @@ bool SaDit::forward(const std::vector<float>& x, int T, float t, const std::vect
                 G.eng.dispatch("sa_swiglu", {ff, gate}, &pc, (uint32_t)(((uint64_t)S * kFfHalf + 255) / 256), 1,
                                1);
             }
-            gemmQ8(gate, b.ffOut.q, tmp, b.ffOut.s, (uint32_t)S, (uint32_t)kDim, (uint32_t)kFfHalf);
+            gemmW(gate, b.ffOut.q, b.ffOut.s, b.ffOut.q4k, tmp, (uint32_t)S, (uint32_t)kDim, (uint32_t)kFfHalf);
             {
                 struct {
                     uint32_t rows, cols;
@@ -555,10 +581,10 @@ bool SaDit::forward(const std::vector<float>& x, int T, float t, const std::vect
         // ---- drop the timestep token, proj_out, postprocess conv + residual, transpose
         BufRef body = BufRef{h.buf, h.offset + (uint64_t)kDim * 4, h.size - (uint64_t)kDim * 4};
         BufRef outT = alloc((uint64_t)T * kIn);
-        gemmQ8(body, m->projOut.q, outT, m->projOut.s, (uint32_t)T, (uint32_t)kIn, (uint32_t)kDim);
+        gemmW(body, m->projOut.q, m->projOut.s, m->projOut.q4k, outT, (uint32_t)T, (uint32_t)kIn, (uint32_t)kDim);
         BufRef post = alloc((uint64_t)T * kIn);
         if (dumpDir) dump(outT, T, kIn, 102);
-        gemmQ8(outT, m->post.q, post, m->post.s, (uint32_t)T, (uint32_t)kIn, (uint32_t)kIn);
+        gemmW(outT, m->post.q, m->post.s, m->post.q4k, post, (uint32_t)T, (uint32_t)kIn, (uint32_t)kIn);
         if (dumpDir) dump(post, T, kIn, 103);
         addInPlace(post, outT, (uint64_t)T * kIn);
         BufRef outB = alloc((uint64_t)kIn * T);

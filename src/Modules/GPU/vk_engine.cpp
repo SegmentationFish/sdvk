@@ -61,6 +61,7 @@ static const KernelDef KERNELS[] = {
     {"gemm_nt_q8_v_bm128_b", 5, 48, 0x4},
     {"gemm_nt_q8_v_bk32", 4, 48, 0x4},
     {"gemm_nt_q8_v_bm128_bk32", 4, 48, 0x4},
+    {"gemm_nt_q4k", 3, 48, 0x4},
     {"gemm_nn_q8", 4, 48, 0x4},
     {"copy_nd", 2, 60, 0x1},
     {"ew2", 3, 56, 0x1},

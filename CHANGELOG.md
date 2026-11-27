@@ -84,6 +84,25 @@ All notable changes to sdvk. The project is pre-1.0; the format follows
 - The CMake cache in `build/` pointed at a dead CLion ninja path (`D:/JETBRA~2/...`); it was
   rewritten to the long path, otherwise `cmake --build` cannot re-configure after a CMakeLists edit.
 
+
+### Added
+
+- **`gemm_nt_q4k`**: GEMM whose B operand is raw GGML Q4_K, dequantised inside the tile load
+  (super-block layout, `get_scale_min_k4` bit packing). Weights keep their on-disk size instead of
+  the 2x that the Q8_0 re-encode costs, which is what makes the 2.4B DiT fit this machine: the
+  36-block arena drops from 2894 MB to **1596 MB** and one 86-frame forward takes 4.45 s including
+  the load. `OFC_AUDIO_HOSTWEIGHTS=1` additionally keeps the arena host-visible.
+- **Generation driver**: `sdvkaudio --dit <gguf> --vae <dav> --cond <track.f32> --steps N --cfg F
+  --out song.wav` runs the reference Euler schedule (sigma = i/N .. 1.0), CFG on the velocity and
+  the vocoder decode. End to end on this box: 86 frames / 4 steps / cfg 1.7 (8 DiT forwards) plus
+  the VAE decode = 1.00 s of 44.1 kHz stereo in 7.5 s.
+
+### Notes
+
+- Remaining for the full model: the autoregressive stage (Qwen3-8B LM + RVQ depth decoder). At Q4
+  the 8B weights are ~4.3 GB and this machine has ~3.5 GB of free RAM, so it needs disk streaming
+  (a Q4_K GGUF of the LM) or a machine with more memory. The synthesis half (condition encoder,
+  DiT, vocoder) is complete and verified.
 ## 2026-11-21
 
 ### Added

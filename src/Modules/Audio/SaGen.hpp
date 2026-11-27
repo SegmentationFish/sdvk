@@ -11,6 +11,9 @@
 namespace ofc {
 namespace audio {
 
+constexpr int kCondWidth = 2048;       // condition track width (DiT channel 256..2303)
+constexpr int kLatentChannels = 128;   // Flow-VAE latent channels
+
 struct SaParams {
     std::string modelDir;   // .../stable-audio-small (holds model.safetensors, t5-base/, vae/)
     std::string prompt;
@@ -20,6 +23,11 @@ struct SaParams {
     int seed = 0;
     std::string outWav = "sdvk_audio.wav";
     std::string spvDir = "build/shaders";
+    std::string ditPath;    // MiniMax Music 3 DiT GGUF
+    std::string vaePath;    // MiniMax vocoder safetensors
+    std::string condPath;   // condition track [frames, 2048] f32 from the AR stage
+    int ditLayers = 0;      // 0 = all
+    float cfg = 1.7f;       // DiT classifier-free guidance
     int threads = 0;         // 0 = hardware_concurrency
     bool verbose = true;
     // streaming: emit the decoded audio as chunks instead of one buffer

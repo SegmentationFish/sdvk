@@ -124,6 +124,10 @@ int main(int argc, char** argv) {
             ditCheck = val();
         } else if (a == "--layers") {
             layers = std::atoi(val());
+        } else if (a == "--cond") {
+            p.condPath = val();
+        } else if (a == "--cfg") {
+            p.cfg = (float)std::atof(val());
         } else if (a == "-h" || a == "--help") {
             usage();
             return 0;
@@ -136,6 +140,9 @@ int main(int argc, char** argv) {
         }
     }
     p.prompt = prompt;
+    p.ditPath = ditPath;
+    p.vaePath = vaePath;
+    p.ditLayers = layers;
     if (!vaeDecode.empty()) {
         if (vaePath.empty() || frames <= 0) {
             std::fprintf(stderr, "error: --vae-decode needs --vae <file> and --frames <n>\n");
@@ -224,7 +231,7 @@ int main(int argc, char** argv) {
         std::printf("dit-check: cond %dx%d, latent %dx86 written to %s\n", latLen, 2048, 128, ditCheck.c_str());
         return 0;
     }
-    if (p.modelDir.empty()) {
+    if (p.modelDir.empty() && ditPath.empty()) {
         std::fprintf(stderr, "error: -m <model dir> is required\n");
         return 1;
     }
@@ -232,8 +239,8 @@ int main(int argc, char** argv) {
         saDumpT5(p, t5check);
         return 0;
     }
-    if (prompt.empty()) {
-        std::fprintf(stderr, "error: a prompt is required\n");
+    if (prompt.empty() && p.condPath.empty()) {
+        std::fprintf(stderr, "error: a prompt (or --cond) is required\n");
         return 1;
     }
     std::string err;
